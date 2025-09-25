@@ -97,7 +97,10 @@ namespace CAMDM
                 inputTensor["past_motion"] = pastMotion;
                 m_Worker.Execute(inputTensor);    
                 outputTensor = m_Worker.PeekOutput("output") as TensorFloat;
+                // x_0 takes ownership of a copy of the output; release the peeked tensor
+                x_0?.Dispose();
                 x_0 = m_Ops.Mul(1f, outputTensor);
+                outputTensor?.Dispose();
 
                 if (guidanceScale != 1f)
                 {
@@ -106,23 +109,48 @@ namespace CAMDM
                     inputTensor["past_motion"] = m_EmptyPastMotion;
                     m_Worker.Execute(inputTensor); 
                     outputTensorCFG = m_Worker.PeekOutput("output") as TensorFloat;
+                    x_0_uncond?.Dispose();
                     x_0_uncond = m_Ops.Mul(1f, outputTensorCFG);
-                    x_0 = m_Ops.Add(m_Ops.Mul(1f,x_0_uncond), m_Ops.Mul(guidanceScale, m_Ops.Sub(x_0, x_0_uncond)));
+                    outputTensorCFG?.Dispose();
+                    // Break down ops to dispose intermediates
+                    using var diff = m_Ops.Sub(x_0, x_0_uncond);
+                    using var scaled = m_Ops.Mul(guidanceScale, diff);
+                    using var baseUncond = m_Ops.Mul(1f, x_0_uncond);
+                    var combined = m_Ops.Add(baseUncond, scaled);
+                    x_0.Dispose();
+                    x_0 = combined;
+                    x_0_uncond.Dispose();
                 }
 
                 float model_log_variance = diffusionParams.posterior_log_variance_clipped[i];
                 float mean_coef1 = diffusionParams.posterior_mean_coef1[i];
                 float mean_coef2 = diffusionParams.posterior_mean_coef2[i];
-                model_mean = m_Ops.Add(m_Ops.Mul(mean_coef1, x_0), m_Ops.Mul(mean_coef2, x_t));
+                model_mean?.Dispose();
+                using var mm1 = m_Ops.Mul(mean_coef1, x_0);
+                using var mm2 = m_Ops.Mul(mean_coef2, x_t);
+                model_mean = m_Ops.Add(mm1, mm2);
 
                 if (i > 0)
                 {
+                    noise?.Dispose();
                     noise = m_Ops.RandomNormal(new TensorShape(1, diffusionParams.joint_num+1, 6, diffusionParams.future_points), 0f, 1f, null);
-                    x_t = m_Ops.Add(model_mean, m_Ops.Mul(Mathf.Exp(0.5f * model_log_variance), noise)); // x_{t-1}
+                    using var scaledNoise = m_Ops.Mul(Mathf.Exp(0.5f * model_log_variance), noise);
+                    var new_xt = m_Ops.Add(model_mean, scaledNoise); // x_{t-1}
+                    // replace x_t
+                    x_t.Dispose();
+                    x_t = new_xt;
+                    // model_mean and noise no longer needed in this branch
+                    model_mean.Dispose();
+                    noise.Dispose();
+                    model_mean = null;
+                    noise = null;
                 }
                 else
                 {
+                    // replace x_t with model_mean; do not dispose model_mean yet as it's now referenced by x_t
+                    x_t.Dispose();
                     x_t = model_mean;
+                    model_mean = null;
                 }
             }
             pastMotion.MakeReadable();
@@ -147,13 +175,22 @@ namespace CAMDM
                 m_Ops = null;
             }
             
-            m_EmptyPastMotion.Dispose();
-            outputTensor.Dispose();
-            outputTensorCFG.Dispose();
-            x_0.Dispose();
-            x_0_uncond.Dispose();
-            noise.Dispose();
-            model_mean.Dispose();
+            if(m_TimeStepTensor != null) {
+                for(int i=0; i<m_TimeStepTensor.Length; i++) {
+                    if(m_TimeStepTensor[i] != null) {
+                        m_TimeStepTensor[i].Dispose();
+                        m_TimeStepTensor[i] = null;
+                    }
+                }
+            }
+            
+            m_EmptyPastMotion?.Dispose();
+            outputTensor?.Dispose();
+            outputTensorCFG?.Dispose();
+            x_0?.Dispose();
+            x_0_uncond?.Dispose();
+            noise?.Dispose();
+            model_mean?.Dispose();
         }
         
         public void OnDestroy() {
