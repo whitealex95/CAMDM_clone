@@ -77,3 +77,9 @@ venv.bak/
 *.log
 *.bak
 *.swp
+
+
+## Git-Ignore after G1 Experiments ##
+**/save/
+**/data/
+**/checkpoints/
