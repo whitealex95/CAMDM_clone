@@ -1,3 +1,10 @@
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from network.models import MotionDiffusion
+    from diffusion.respace import SpacedDiffusion
+
+
+    
 import numpy as np
 import blobfile as bf
 import utils.common as common
@@ -15,7 +22,7 @@ from diffusion.gaussian_diffusion import *
 
 
 class BaseTrainingPortal:
-    def __init__(self, config, model, diffusion, dataloader, logger, tb_writer, prior_loader=None):
+    def __init__(self, config, model: "MotionDiffusion", diffusion: "SpacedDiffusion", dataloader, logger, tb_writer, prior_loader=None):
         
         self.model = model
         self.diffusion = diffusion
@@ -302,4 +309,107 @@ class MotionTrainingPortal(BaseTrainingPortal):
             T_pose_template.positions = np.zeros((rotations[samplie_idx].shape[0], T_pose_template.positions.shape[1], T_pose_template.positions.shape[2]))
             T_pose_template.positions[:, 0] = root_pos[samplie_idx]
             T_pose_template.export(f'{save_path}/motion_{samplie_idx}.{prefix}.bvh', save_ori_scal=True)  
+
+class HumanoidTrainingPortal(BaseTrainingPortal):
+    """
+    - Inherits full training loop, checkpointing, EMA, etc. from BaseTrainingPortal
+    - Implements only rotation MSE and velocity loss.
+    - [TODO: Add FK losses]
+    """
+    def __init__(self, config, model, diffusion, dataloader, logger, tb_writer, finetune_loader=None):
+        super().__init__(config, model, diffusion, dataloader, logger, tb_writer, finetune_loader)
         
+        #  No FK here unlike MotionTrainingPortal. We'll add it later.
+        # self.skel_offset = torch.from_numpy(self.dataloader.dataset.T_pose.offsets).to(self.device)
+        # self.skel_parents = self.dataloader.dataset.T_pose.parents
+        
+        self.use_velocity_loss = config.trainer.use_loss_vel
+        self.use_mse_loss = config.trainer.use_loss_mse
+    
+    # ----------------------------------------------------------------------
+    # Main forward diffusion + loss
+    # ----------------------------------------------------------------------
+    def diffuse(self, x_start, t, cond, noise=None, return_loss=False):
+        """
+        x_start: [bs, frame_num, joint_num, joint_feat]
+        """
+        batch_size, frame_num, joint_num, joint_feat = x_start.shape
+        
+        # Permute to [B, J, C, F]
+        x_start = x_start.permute(0, 2, 3, 1)
+        
+        if noise is None:
+            noise = th.randn_like(x_start)
+        
+        # Forward diffusion q(x_t | x_0)
+        x_t = self.diffusion.q_sample(x_start, t, noise=noise)
+        
+        # [bs, joint_num, joint_feat, future_frames]
+        cond['past_motion'] = cond['past_motion'].permute(0, 2, 3, 1) # [bs, joint_num, joint_feat, past_frames]
+        cond['traj_pose'] = cond['traj_pose'].permute(0, 2, 1) # [bs, 6, frame_num//2]
+        cond['traj_trans'] = cond['traj_trans'].permute(0, 2, 1) # [bs, 2, frame_num//2]
+        
+        model_output = self.model.interface(x_t, self.diffusion._scale_timesteps(t), cond)
+        
+        if not return_loss:
+            return model_output.permute(0, 3, 1, 2)
+
+        loss_terms = {}
+        if self.diffusion.model_var_type in [ModelVarType.LEARNED,  ModelVarType.LEARNED_RANGE]:
+            B, C = x_t.shape[:2]
+            assert model_output.shape == (B, C * 2, *x_t.shape[2:])
+            model_output, model_var_values = torch.split(model_output, C, dim=1)
+            frozen_out = torch.cat([model_output.detach(), model_var_values], dim=1)
+            loss_terms["vb"] = self.diffusion._vb_terms_bpd(model=lambda *args, r=frozen_out: r, x_start=x_start, x_t=x_t, t=t, clip_denoised=False)["output"]
+            if self.loss_type == LossType.RESCALED_MSE:
+                loss_terms["vb"] *= self.diffusion.num_timesteps / 1000.0
+        target = {
+            ModelMeanType.PREVIOUS_X: self.diffusion.q_posterior_mean_variance(x_start=x_start, x_t=x_t, t=t)[0],
+            ModelMeanType.START_X: x_start,
+            ModelMeanType.EPSILON: noise,
+        }[self.diffusion.model_mean_type]
+        assert model_output.shape == target.shape == x_start.shape
+        mask = cond['mask'].view(batch_size, 1, 1, -1)
+        
+        # 1. Diffusion data loss (default: predict \hat{x_0})
+        if self.config.trainer.use_loss_mse:
+            loss_terms['loss_data'] = self.diffusion.masked_l2(target, model_output, mask) # mean_flat(rot_mse)
+        
+        # 2. Diffusion velocity loss (predict \hat{x_0} velocity)
+        if self.config.trainer.use_loss_vel:
+            model_output_vel = model_output[..., 1:] - model_output[..., :-1]
+            target_vel = target[..., 1:] - target[..., :-1]
+            loss_terms['loss_data_vel'] = self.diffusion.masked_l2(target_vel[:, :-1], model_output_vel[:, :-1], mask[..., 1:])
+    
+        # [TODO: Add FK losses here later]
+        loss_terms["loss"] = loss_terms.get('vb', 0.) + \
+                        loss_terms.get('loss_data', 0.) + \
+                        loss_terms.get('loss_data_vel', 0.)# + \
+                        # loss_terms.get('loss_geo_xyz', 0) + \
+                        # loss_terms.get('loss_geo_xyz_vel', 0) + \
+                        # loss_terms.get('loss_foot_contact', 0)
+        
+        return model_output.permute(0, 3, 1, 2), loss_terms
+    
+    def evaluate_sampling(self, dataloader, save_folder_name):
+        self.model.eval()
+        self.model.training = False
+        save_path = f"{self.save_dir}/{save_folder_name}"
+        common.mkdir(save_path)
+        
+        datas = next(iter(dataloader)) 
+        datas = {key: val.to(self.device) if torch.is_tensor(val) else val for key, val in datas.items()}
+        cond = {key: val.to(self.device) if torch.is_tensor(val) else val for key, val in datas['conditions'].items()}
+        x_start = datas['data']
+        t, _ = self.schedule_sampler.sample(dataloader.batch_size, self.device)
+        with torch.no_grad():
+            model_output = self.diffuse(x_start, t, cond, noise=None, return_loss=False)
+        
+        # Save raw outputs instead of exporting BVH files
+        torch.save({
+            "gt": x_start.cpu(),
+            "pred": model_output.cpu(),
+            "past_motion": cond["past_motion"].cpu()
+        }, f"{save_path}/samples.pt")
+
+        self.logger.info(f"Sampling saved at epoch {self.epoch} → {save_path}")
