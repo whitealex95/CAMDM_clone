@@ -155,7 +155,7 @@ def extract_forward_hips(motion: Motion, frame_idx, left_hip_name, right_hip_nam
     forward = np.cross(across, np.array([[0, 1, 0]]))
     forward_angle = np.arctan2(forward[:, 2], forward[:, 0])
     if return_forward:
-        return forward_angle, forward
+        return forward_angle, forward  # (N,), (N, 3) where Y(up)-component is 0
     return forward_angle
 
 

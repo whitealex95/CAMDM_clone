@@ -5,6 +5,7 @@ from typing import Optional
 import torch.nn.functional as F
 
 def get_rotation(quaternions, rot_req):
+    """quaternions: (..., 4) in wxyz format"""
     target_req = rot_req.lower()
     if type(quaternions) == np.ndarray:
         quaternions = torch.tensor(quaternions)

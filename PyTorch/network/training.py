@@ -335,7 +335,7 @@ class HumanoidTrainingPortal(BaseTrainingPortal):
         """
         batch_size, frame_num, joint_num, joint_feat = x_start.shape
         
-        # Permute to [B, J, C, F]
+        # Permute to [bs, joint_num, joint_feat, frame_num]
         x_start = x_start.permute(0, 2, 3, 1)
         
         if noise is None:

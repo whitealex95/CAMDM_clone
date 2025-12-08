@@ -41,10 +41,12 @@ class MotionDataset(Dataset):
             if frame_num < window_size:
                 continue
             frame_nums.append([motion_item['style'], frame_num])
-            self.rotations_list.append(motion_item['local_joint_rotations'].astype(dtype))
-            self.root_pos_list.append(motion_item['global_root_positions'].astype(dtype))
+            self.rotations_list.append(motion_item['local_joint_rotations'].astype(dtype)) # (frame_num, joint_num, 4 quaternions)
+            self.root_pos_list.append(motion_item['global_root_positions'].astype(dtype)) # (frame_num, 3) including height
             
+            # (N, frame_num, 4)
             self.local_conds['traj_pose'].append(np.array([item for item in motion_item['traj_pose']], dtype=dtype))
+            # (N, frame_num, 2)
             self.local_conds['traj_trans'].append(np.array([item for item in motion_item['traj']], dtype=dtype))
             
             self.global_conds['style'].append(motion_item['style'])
@@ -116,14 +118,14 @@ class MotionDataset(Dataset):
         style_idx = float(self.style_set.index(self.global_conds['style'][motion_idx]))
         
         return {
-            'data': future_motion,
+            'data': future_motion, # (future_frame, joint_num, per_rot_feat)
             'conditions': {
-                'past_motion': past_motion,
-                'traj_pose': traj_rotation,
-                'traj_trans': traj_pos,
-                'style': self.global_conds['style'][motion_idx],
-                'style_idx': style_idx,
-                'mask': self.mask
+                'past_motion': past_motion, # (past_frame, joint_num, per_rot_feat)
+                'traj_pose': traj_rotation, # (future_frame, per_rot_feat)
+                'traj_trans': traj_pos, # (future_frame, 2)
+                'style': self.global_conds['style'][motion_idx], # '<style_name>'
+                'style_idx': style_idx, # float index of style
+                'mask': self.mask # (future_frame,) all True
             }
         }     
 

@@ -47,7 +47,7 @@ def extract_traj(root_positions, forwards, smooth_kernel=[5, 10]):
         between_wxyz = np.concatenate([w[...,np.newaxis], a], axis=-1)
         between = R.from_quat(between_wxyz[..., [1, 2, 3, 0]]).as_quat()[..., [3, 0, 1, 2]]
         
-        traj_poses.append(between)
+        traj_poses.append(between) # wxyz format
     
     return traj_trans, traj_angles, traj_poses
     
@@ -63,12 +63,12 @@ def process_motion(motion, use_scale=True):
     _, forwards = motion_modules.extract_forward_hips(motion, np.arange(motion.frame_num), style100.left_hip_name, style100.right_hip_name, return_forward=True)
     traj_trans, traj_angles, traj_poses = extract_traj(motion.global_positions[:, 0], forwards, smooth_kernel=[5, 10])
     return motion, {
-        'filepath': motion.filepath,
-        'local_joint_rotations': motion.rotations,
-        'global_root_positions': motion.global_positions[:, 0],
-        'traj': traj_trans,
-        'traj_angles': traj_angles,
-        'traj_pose': traj_poses
+        'filepath': motion.filepath, # Path of the source BVH or motion file
+        'local_joint_rotations': motion.rotations, # (T, J, 4) local joint rotations for all joints including root(hip, global).
+        'global_root_positions': motion.global_positions[:, 0], # (T, 3) world-space root(hip) translation per frame
+        'traj': traj_trans, # List containing 2 trajectories. Each element is a (T, 2) array of (x, z) ground-plane root(hip) positions smoothed differently.
+        'traj_angles': traj_angles, # List of smoothed yaw angles (T,) extracted from the forward direction. Represents facing direction over time.
+        'traj_pose': traj_poses # List containing 2 trajectories. Each element is a (T, 4) array of (w, x, y, z) ground-plane root(hip) orientations smoothed differently.
     }
 
 if __name__ == '__main__':

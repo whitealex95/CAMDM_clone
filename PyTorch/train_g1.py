@@ -13,6 +13,7 @@ from utils.logger import Logger
 from network.models import MotionDiffusion
 from network.training import HumanoidTrainingPortal
 from network.dataset import MotionDataset
+from network.dataset_g1 import HumanoidMotionDataset
 
 from diffusion.create_diffusion import create_gaussian_diffusion
 from config.option import add_model_args, add_train_args, add_diffusion_args, config_parse
@@ -23,11 +24,11 @@ def train(config, resume, logger, tb_writer):
     np_dtype = common.select_platform(32)
     
     print("Loading dataset..")
-    train_data = MotionDataset(config.data, config.arch.rot_req, 
+    train_data = HumanoidMotionDataset(config.data, config.arch.rot_req, 
                                   config.arch.offset_frame,  config.arch.past_frame, 
                                   config.arch.future_frame, dtype=np_dtype, limited_num=config.trainer.load_num)
     train_dataloader = DataLoader(train_data, batch_size=config.trainer.batch_size, shuffle=True, num_workers=config.trainer.workers, drop_last=False, pin_memory=True)
-    logger.info('\nTraining Dataset includins %d clip, with %d frame per clip;' % (len(train_data), config.arch.clip_len))
+    logger.info('\nTraining Dataset including %d clip, with %d frame per clip;' % (len(train_data), config.arch.clip_len))
     
     diffusion = create_gaussian_diffusion(config)
     
@@ -59,8 +60,8 @@ if __name__ == '__main__':
     
     # Runtime parameters
     parser.add_argument('-n', '--name', default='debug', type=str, help='The name of this training')
-    parser.add_argument('-c', '--config', default='./config/default.json', type=str, help='config file path (default: None)')
-    parser.add_argument('-i', '--data', default='data/pkls/100style.pkl', type=str)
+    parser.add_argument('-c', '--config', default='./config/default_g1.json', type=str, help='config file path (default: None)')
+    parser.add_argument('-i', '--data', default='data/pkls/lafan1_g1.pkl', type=str)
     parser.add_argument('-r', '--resume', default=None, type=str, help='path to latest checkpoint (default: None)')
     parser.add_argument('-s', '--save', default='./save', type=str, help='show the debug information')
     parser.add_argument('--cluster', action='store_true', help='train with GPU cluster')    
