@@ -1,0 +1,221 @@
+"""
+CAMDM Visualization System Architecture
+========================================
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                        VISUALIZATION PIPELINE                        │
+└─────────────────────────────────────────────────────────────────────┘
+
+STEP 1: TEST MUJOCO SETUP
+┌──────────────────────────┐
+│  step1_test_mujoco.py   │
+│                          │
+│  • Load scene.xml        │──> Verify robot loads correctly
+│  • Check joint order     │──> Confirm 36 DOF (7+29)
+│  • Display robot         │──> Visual inspection
+└──────────────────────────┘
+
+
+STEP 2: TEST DATA LOADING
+┌──────────────────────────┐      ┌──────────────────────┐
+│   test_loader.py         │      │  motion_loader.py    │
+│                          │─────>│                      │
+│  • Find .pkl files       │      │  MotionDataset       │
+│  • Load dataset          │      │  MotionData          │
+│  • Verify qpos format    │      │  get_qpos()          │
+└──────────────────────────┘      └──────────────────────┘
+
+
+STEP 3: VISUALIZE TRAINING DATA
+┌─────────────────────────────────────────────────────────────┐
+│              step2_visualize_data.py                        │
+│                                                             │
+│  ┌─────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│  │   Load      │    │   Motion     │    │   MuJoCo     │  │
+│  │  Dataset    │───>│   Player     │───>│   Viewer     │  │
+│  │  (.pkl)     │    │              │    │              │  │
+│  └─────────────┘    └──────────────┘    └──────────────┘  │
+│                            │                               │
+│                            v                               │
+│                     ┌──────────────┐                       │
+│                     │  Controls:   │                       │
+│                     │  SPACE/↑↓←→  │                       │
+│                     │  Speed 1-9   │                       │
+│                     └──────────────┘                       │
+└─────────────────────────────────────────────────────────────┘
+
+
+STEP 4: VISUALIZE GENERATED MOTIONS (TODO)
+┌─────────────────────────────────────────────────────────────┐
+│           step3_visualize_generated.py                      │
+│                                                             │
+│  ┌─────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│  │   Load      │    │   Generate   │    │   Compare    │  │
+│  │   Model     │───>│   Motions    │───>│   GT vs Gen  │  │
+│  │ (best.pt)   │    │   (Diffuse)  │    │              │  │
+│  └─────────────┘    └──────────────┘    └──────────────┘  │
+│         │                   │                              │
+│         │                   v                              │
+│         │            ┌──────────────┐                      │
+│         └───────────>│  Conditions: │                      │
+│                      │  • Trajectory│                      │
+│                      │  • Style     │                      │
+│                      └──────────────┘                      │
+└─────────────────────────────────────────────────────────────┘
+
+
+STEP 5: INTERACTIVE CONTROL (TODO)
+┌─────────────────────────────────────────────────────────────┐
+│           step4_interactive_control.py                      │
+│                                                             │
+│  ┌─────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│  │  Keyboard   │    │  Real-time   │    │   MuJoCo     │  │
+│  │   Input     │───>│  Generation  │───>│   Viewer     │  │
+│  │  (W/A/S/D)  │    │  (Diffusion) │    │  + Overlay   │  │
+│  └─────────────┘    └──────────────┘    └──────────────┘  │
+│         │                   │                              │
+│         │                   v                              │
+│         │            ┌──────────────┐                      │
+│         └───────────>│  Trajectory  │                      │
+│                      │  Prediction  │                      │
+│                      └──────────────┘                      │
+└─────────────────────────────────────────────────────────────┘
+
+
+DATA FLOW DIAGRAM
+═════════════════
+
+Training Data Path:
+data/Lafan1_g1/raw/*.csv
+         │
+         v
+[make_pose_data_g1.py]
+         │
+         v
+data/pkls/lafan1_g1.pkl ──> [MotionDataset] ──> [MotionData]
+         │                                              │
+         │                                              v
+         │                                    ┌──────────────────┐
+         │                                    │ qpos (36 DOF):   │
+         │                                    │  [0:3]   root xyz│
+         │                                    │  [3:7]   root quat
+         │                                    │  [7:36]  joints  │
+         │                                    └──────────────────┘
+         │                                              │
+         v                                              v
+  ┌────────────────┐                          ┌──────────────┐
+  │ Motion Data:   │                          │   MuJoCo     │
+  │ • positions    │                          │   Physics    │
+  │ • rotations    │                          │   Engine     │
+  │ • trajectory   │                          └──────────────┘
+  │ • style        │
+  └────────────────┘
+
+
+INTERACTIVE CONTROL FLOW
+═════════════════════════
+
+User Input (W/A/S/D) ──> Trajectory Planning ──> Model Inference
+                              │                         │
+                              │                         v
+                              │                  Motion Generation
+                              │                         │
+                              v                         │
+                        Future Frames            Generated Pose
+                              │                         │
+                              └─────────────────────────┘
+                                          │
+                                          v
+                                   MuJoCo Viewer
+                                   (with overlay)
+
+
+FILE ORGANIZATION
+═════════════════
+
+visualize/
+├── Core Scripts (Ready):
+│   ├── step1_test_mujoco.py      [Test setup]
+│   ├── test_loader.py             [Test data loading]
+│   └── step2_visualize_data.py   [View training data]
+│
+├── Utilities (Ready):
+│   ├── motion_loader.py           [Data loading classes]
+│   ├── __init__.py
+│   └── run_tests.py               [Automated testing]
+│
+├── Documentation (Ready):
+│   ├── QUICKSTART.md              [Getting started guide]
+│   ├── README.md                  [Full documentation]
+│   ├── CHECKLIST.md               [Verification steps]
+│   └── requirements.txt           [Dependencies]
+│
+├── Future Scripts (TODO):
+│   ├── step3_visualize_generated.py   [Generated motions]
+│   └── step4_interactive_control.py   [WASD control]
+│
+└── Assets (User provided):
+    ├── scene.xml                  [MuJoCo scene]
+    └── g1_29dof_rev_1_0.xml      [Robot model]
+
+
+COORDINATE SYSTEMS
+══════════════════
+
+G1 Robot Convention (Your Data):
+  X-axis: Forward direction
+  Y-axis: Left direction  
+  Z-axis: Up direction
+
+MuJoCo Convention:
+  Same as above (aligned correctly)
+
+Quaternion Format:
+  Data file:  XYZW (converted to WXYZ internally)
+  MuJoCo:     WXYZ
+  Conversion: Handled in motion_loader.py
+
+
+CONTROL SCHEME (Future Interactive Mode)
+═════════════════════════════════════════
+
+Keyboard Layout:
+  
+  Movement:              Speed:
+  ┌───┬───┬───┐         ┌───┬───┬───┐
+  │ Q │ W │ E │         │ 1 │ 2 │ 3 │ Speed 0.25x-0.75x
+  ├───┼───┼───┤         ├───┼───┼───┤
+  │ A │ S │ D │         │ 4 │ 5 │ 6 │ Speed 1x-1.5x
+  └───┴───┴───┘         └───┴───┴───┘
+                        │ 7 │ 8 │ 9 │ Speed 1.75x-2x
+  W: Forward            └───┴───┴───┘
+  S: Backward
+  A: Turn Left          Style Selection:
+  D: Turn Right         Number keys cycle through available styles
+
+
+RENDERING PIPELINE
+══════════════════
+
+┌─────────────┐
+│   Dataset   │
+└──────┬──────┘
+       │
+       v
+┌─────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Extract    │────>│  Convert to  │────>│   Set        │
+│  Frame Data │     │  qpos (36)   │     │  MuJoCo Pose │
+└─────────────┘     └──────────────┘     └──────┬───────┘
+                                                 │
+                                                 v
+                                          ┌──────────────┐
+                                          │  mj_forward  │
+                                          │  (FK)        │
+                                          └──────┬───────┘
+                                                 │
+                                                 v
+                                          ┌──────────────┐
+                                          │   Render     │
+                                          │   Frame      │
+                                          └──────────────┘
+"""

@@ -73,7 +73,8 @@ class HumanoidMotionDataset(Dataset):
 
         self.item_frame_indices = np.concatenate(item_indices, axis=0)
 
-        self.joint_num = self.rotations_list[0].shape[1]      # 30 joints
+        self.joint_names = data_source["motions"][0]["joint_names"]
+        self.joint_num = self.rotations_list[0].shape[1]      # 1(root)+29 joints
         self.per_rot_feat = self.rot_feat_dim[self.rot_req]   # padded length
 
         # Random traj augmentation restored
@@ -104,7 +105,7 @@ class HumanoidMotionDataset(Dataset):
         return out
 
 
-    def convert_root(self, quat_tensor):
+    def convert_rot(self, quat_tensor):
         """
         quat_tensor: (T,4) wxyz
         return (T, per_rot_feat)
@@ -151,9 +152,9 @@ class HumanoidMotionDataset(Dataset):
         rot_xyzw     = rotations[..., [1,2,3,0]] # (TW, 1+29, 4)
         trajrot_xyzw = traj_rot[...,     [1,2,3,0]] # (TF, 4)
 
-        # Random global rotation around Y axis
+        # Random global rotation around Up-axis (Z axis for G1, originally Y axis from Unity)
         theta = np.repeat(np.random.uniform(0,2*np.pi), rotations.shape[0])
-        rot_vec = R.from_rotvec(np.stack([0*theta, theta, 0*theta], axis=-1))
+        rot_vec = R.from_rotvec(np.stack([0*theta, 0*theta, theta], axis=-1))
 
         # Rotate first rotation(root)
         rotations[:,0] = (rot_vec * R.from_quat(rot_xyzw[:,0])) \
@@ -173,13 +174,13 @@ class HumanoidMotionDataset(Dataset):
         rotations = torch.from_numpy(rotations.astype(self.dtype))  # (TW,30,4)
         traj_pos  = torch.from_numpy(traj_pos.astype(self.dtype))   # (TF,2)
         traj_rot  = torch.from_numpy(traj_rot.astype(self.dtype))   # (TF,4) wxyz
-        traj_rot  = self.convert_root(traj_rot)                      # (TF,per_rot_feat)
+        traj_rot  = self.convert_rot(traj_rot)                      # (TF,per_rot_feat)
 
         # ---------------------------------------------------------
         # Convert ROOT to requested representation
         # ---------------------------------------------------------
         root_quat = rotations[:,0]    # (TW,4)
-        root_repr = self.convert_root(root_quat)   # (TW,per_rot_feat)
+        root_repr = self.convert_rot(root_quat)   # (TW,per_rot_feat)
 
         # ---------------------------------------------------------
         # Convert 1D joints to padded representation
@@ -196,7 +197,7 @@ class HumanoidMotionDataset(Dataset):
         # ---------------------------------------------------------
         root_pos_pad = torch.zeros((root_pos.shape[0], 1, self.per_rot_feat))
         root_pos_pad[..., :3] = torch.from_numpy(root_pos[:,None].astype(self.dtype))
-        rotations_w_root = torch.cat([rotations_full, root_pos_pad], dim=1) # (TW, 1+29+1, per_rot_feat)
+        rotations_w_root = torch.cat([rotations_full, root_pos_pad], dim=1) # (TW, 31=1+29+1, per_rot_feat)
 
         # Slice past/future
         future = rotations_w_root[self.reference_frame_idx:]
@@ -207,12 +208,12 @@ class HumanoidMotionDataset(Dataset):
         return {
             "data": future,
             "conditions": {
-                "past_motion": past, # (TP, 1+29+1, per_rot_feat)
-                "traj_pose": traj_rot, # (TF, per_rot_feat)
-                "traj_trans": traj_pos, # (TF, 2)
-                "style": self.global_conds["style"][motion_idx], # string
-                "style_idx": style_idx, # float index
-                "mask": self.mask # (TF,) boolean, all True(=no masking)
+                'past_motion': past, # (TP, 31=1+29+1, per_rot_feat)
+                'traj_pose': traj_rot, # (TF, per_rot_feat)
+                'traj_trans': traj_pos, # (TF, 2)
+                'style': self.global_conds["style"][motion_idx], # string
+                'style_idx': style_idx, # float index
+                'mask': self.mask # (TF,) boolean, all True(=no masking)
             }
         }
 
@@ -256,12 +257,12 @@ if __name__ == "__main__":
     print("\n=== Inspect one batch ===")
     batch = next(iter(loader))
     print("Future data shape:", batch["data"].shape)
-    print("Past motion shape:", batch["conditions"]["past_motion"].shape)
-    print("Traj pose shape:", batch["conditions"]["traj_pose"].shape)
-    print("Traj trans shape:", batch["conditions"]["traj_trans"].shape)
-    print("Mask shape:", batch["conditions"]["mask"].shape)
-    print("Style:", batch["conditions"]["style"][:5])
-    print("Style idx:", batch["conditions"]["style_idx"][:5])
+    print("Past motion shape:", batch["conditions"]['past_motion'].shape)
+    print("Traj pose shape:", batch["conditions"]['traj_pose'].shape)
+    print("Traj trans shape:", batch["conditions"]['traj_trans'].shape)
+    print("Mask shape:", batch["conditions"]['mask'].shape)
+    print("Style:", batch["conditions"]['style'][:5])
+    print("Style idx:", batch["conditions"]['style_idx'][:5])
 
     # Loop speed test
     print("\n=== Iteration speed test ===")

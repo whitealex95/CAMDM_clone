@@ -973,3 +973,34 @@ def matrix_to_rotation_6d(matrix: torch.Tensor) -> torch.Tensor:
     Retrieved from http://arxiv.org/abs/1812.07035
     """
     return matrix[..., :2, :].clone().reshape(*matrix.size()[:-2], 6)
+
+import torch
+import torch.nn.functional as F
+
+def rot6d_to_rotmat(x):
+    """
+    Converts 6D rotation representation to 3x3 rotation matrix.
+    Input: (B, 6)
+    Output: (B, 3, 3)
+    """
+    # Reshape to (B, 3, 2)
+    x = x.view(-1, 3, 2)
+    
+    # Extract vectors
+    a1 = x[:, :, 0]
+    a2 = x[:, :, 1]
+    
+    # Normalize the first vector
+    b1 = F.normalize(a1, dim=1)
+    
+    # Compute second vector: must be orthogonal to b1
+    # FIX: Use torch.cross instead of F.cross
+    b2 = torch.cross(b1, a2, dim=1)
+    b2 = F.normalize(b2, dim=1)
+    
+    # Compute third vector: orthogonal to both
+    # FIX: Use torch.cross instead of F.cross
+    b3 = torch.cross(b2, b1, dim=1)
+    
+    # Stack to form rotation matrix
+    return torch.stack((b1, b2, b3), dim=-1)

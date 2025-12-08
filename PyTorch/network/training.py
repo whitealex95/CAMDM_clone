@@ -407,9 +407,9 @@ class HumanoidTrainingPortal(BaseTrainingPortal):
         
         # Save raw outputs instead of exporting BVH files
         torch.save({
-            "gt": x_start.cpu(),
-            "pred": model_output.cpu(),
-            "past_motion": cond["past_motion"].cpu()
+            'gt': x_start.cpu(),
+            'pred': model_output.cpu(),
+            'past_motion': cond['past_motion'].cpu()
         }, f"{save_path}/samples.pt")
 
         self.logger.info(f"Sampling saved at epoch {self.epoch} → {save_path}")

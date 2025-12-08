@@ -1,0 +1,11 @@
+# Requirements for CAMDM MuJoCo Visualization
+
+# Core dependencies
+mujoco>=3.0.0
+numpy>=1.20.0
+scipy>=1.7.0
+
+# Optional: for video export (future feature)
+# opencv-python>=4.5.0
+# imageio>=2.9.0
+# imageio-ffmpeg>=0.4.0

@@ -104,6 +104,13 @@ camdm_100style.json: Store the meta information about the character and diffusio
 100style_conditions.json: Store all conditions
 ```
 
+## Motion Visualization (Added by JH)
+We're going to use mujoco for visualizing the data.
+```
+pip install mujoco==3.2.3
+```
+
+
 ## Acknowledgement
 
 Some of the code originates from the following projects. Please consider citing their work:
