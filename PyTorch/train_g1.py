@@ -82,7 +82,7 @@ if __name__ == '__main__':
     if 'debug' in args.name:
         config.arch.offset_frame = config.arch.clip_len
         config.trainer.workers = 1
-        config.trainer.load_num = -1
+        config.trainer.load_num = None
         config.trainer.batch_size = 256
 
 

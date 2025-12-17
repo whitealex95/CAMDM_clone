@@ -42,7 +42,7 @@ if __name__ == "__main__":
     
     train_data = HumanoidMotionDataset(config.data, config.arch.rot_req, 
                                   config.arch.offset_frame,  config.arch.past_frame, 
-                                  config.arch.future_frame, dtype=np.float32, limited_num=-1)
+                                  config.arch.future_frame, dtype=np.float32, limited_num=None)
     train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=1, shuffle=True, num_workers=1, drop_last=False)
     
     input_feats = (train_data.joint_num+1) * train_data.per_rot_feat

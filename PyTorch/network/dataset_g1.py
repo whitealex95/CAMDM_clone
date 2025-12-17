@@ -25,7 +25,7 @@ class HumanoidMotionDataset(Dataset):
     rot_feat_dim = {'q': 4, '6d': 6, 'euler': 3}
 
     def __init__(self, pkl_path, rot_req, offset_frame,
-                 past_frame, future_frame, dtype=np.float32, limited_num=-1):
+                 past_frame, future_frame, dtype=np.float32, limited_num=None):
 
         self.pkl_path = pkl_path
         self.rot_req = rot_req.lower()

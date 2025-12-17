@@ -70,7 +70,7 @@ def config_parse(args):
     config.trainer.use_loss_3d = True if loss_terms[1] == '1' else False
     config.trainer.use_loss_vel = True if loss_terms[2] == '1' else False
     config.trainer.use_loss_contact = True if loss_terms[3] == '1' else False
-    config.trainer.load_num = -1
+    config.trainer.load_num = None
     config.trainer.save_freq = int(config.trainer.epoch // 10)
 
     data_prefix = args.data.split('/')[-1].split('.')[0]
