@@ -88,7 +88,7 @@ if __name__ == '__main__':
 
     if not args.cluster:
         if os.path.exists(config.save) and 'debug' not in args.name and args.resume is None:
-            allow_cover = input('Model file detected, do you want to replace it? (Y/N)')
+            allow_cover = input(f'Model file({config.save}) detected, do you want to replace it? (Y/N)')
             allow_cover = allow_cover.lower()
             if allow_cover == 'n':
                 exit()
