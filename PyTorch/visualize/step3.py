@@ -201,6 +201,8 @@ class DemoPlayer:
         # Frame rate (from make_pose_data_g1.py)
         self.fps = 30
         self.frame_dt = 1.0 / self.fps
+        self.apply_frames = 15 # frames to apply per generation step (default: 15, meaning 2Hz generation)
+        self.apply_frame_counter = 0
 
         # Create a queue to store qpos history
         from collections import deque 
@@ -232,11 +234,11 @@ class DemoPlayer:
         print(f"Duration: {self.current_motion_data.num_frames / self.fps:.2f}s")
         print(f"{'='*60}\n")
         
-        self.load_pose()
+        self.init_pose()
         self.update_past_trajectory()
         self.update_future_trajectory()
         
-    def load_pose(self):
+    def init_pose(self):
         """Load current frame pose into MuJoCo data."""
         qpos = self.current_motion_data.get_qpos(self.current_frame)
         self.init_qpos_history(qpos.copy())
@@ -249,13 +251,19 @@ class DemoPlayer:
         past_qpos_dataset = self.current_motion_data.get_past_qpos(self.current_frame)
         return past_qpos_dataset
 
+    def load_future_qpos(self):
+        future_qpos_dataset = self.current_motion_data.get_future_qpos(self.current_frame)
+        return future_qpos_dataset
 
     def generate_motion(self):
         """Generate future poses using the motion generator."""
         past_qpos_dataset = self.load_past_qpos()
         if self.current_frame > 0:
             past_qpos = np.array(self.qpos_history)  # (past_frames, 36)
-            past_qpos[:, 7:] = past_qpos_dataset[:, 7:]  # Use dataset XYZ for past
+            if True:
+                """override with dataset past frames"""
+                # past_qpos[:, :7] = past_qpos_dataset[:, :7]  # Use dataset XYZ for past
+                # past_qpos[:, :2] = past_qpos_dataset[:, :2]  # Use dataset XYZ for past
         else:
             past_qpos = past_qpos_dataset
         style_idx = self.current_motion_data.style_idx
@@ -264,15 +272,27 @@ class DemoPlayer:
         #     past_qpos, self.future_traj_dataset[:, :2], self.future_orient_dataset, style_idx)
         generated_qpos = self.motion_generator.generate_motion(
             past_qpos, self.future_traj[:, :2], self.future_orient, style_idx)
+        
+        if True: # override with future frames
+            future_qpos_dataset = self.load_future_qpos()
+            # TODO: figure out why this is required. Shouldn't this be easily learned by the model?
+            generated_qpos[:, :2] = future_qpos_dataset[:, :2]
         return generated_qpos # (future_frames, 36)
 
     def update_pose(self):
         """Update MuJoCo model with current frame pose."""
-        self.generated_qpos = self.generate_motion()
-        qpos = self.generated_qpos[0]  # Take the first frame of generated future
+        self.update_past_trajectory()
+        if self.apply_frame_counter == 0:
+            self.update_future_trajectory()
+            self.generated_qpos = self.generate_motion()
+
+        qpos = self.generated_qpos[self.apply_frame_counter]
+
         self.update_qpos_history(qpos.copy())
         self.data.qpos[:] = qpos
         mujoco.mj_forward(self.model, self.data)
+
+        self.apply_frame_counter = (self.apply_frame_counter + 1) % self.apply_frames
 
     def init_qpos_history(self, qpos):
         """Initialize qpos history deque."""
@@ -285,7 +305,6 @@ class DemoPlayer:
 
     def update_past_trajectory(self):
         """Update past trajectory based on qpos history."""
-        # breakpoint()
         qpos_history = np.array(self.qpos_history)
         past_xyz = qpos_history[-self.past_frames:, :3]
         past_quat = qpos_history[-self.past_frames:, 3:7] # wxyz
@@ -303,7 +322,7 @@ class DemoPlayer:
     def update_future_trajectory(self):
         # Load future trajectory from dataset
         self.load_future_trajectory()
-        if self.generated_qpos is not None:
+        if False and self.generated_qpos is not None:
             self.generated_future_traj = self.generated_qpos[:, :3] # XYZ
             self.generated_future_orient = self.generated_qpos[:, 3:7] # wxyz
             
@@ -313,6 +332,7 @@ class DemoPlayer:
         else:
             self.future_traj = self.future_traj_dataset
             self.future_orient = self.future_orient_dataset
+
     def step(self):
         """Step the animation forward."""
         if not self.playing:
@@ -320,7 +340,7 @@ class DemoPlayer:
         
         current_time = time.time()
         dt = current_time - self.last_update_time
-        
+
         # Check if enough time has passed for next frame
         if dt >= self.frame_dt / self.playback_speed:
             self.current_frame += 1
@@ -330,8 +350,6 @@ class DemoPlayer:
                 self.current_frame = 0
             
             self.update_pose()
-            self.update_past_trajectory()
-            self.update_future_trajectory()
             self.last_update_time = current_time
             
     def next_motion(self):
@@ -395,7 +413,8 @@ class DemoPlayer:
             if len(self.future_traj_dataset) > 0:
                 draw_trajectory(viewer, self.future_traj_dataset, self.future_orient_dataset, color=[1.0, 0.2, 0.2, 1.0])
                 draw_trajectory(viewer, self.future_traj, self.future_orient, color=[0.2, 1.0, 0.2, 1.0])
-                draw_trajectory(viewer, self.generated_future_traj, self.generated_future_orient, color=[0.2, 0.2, 0.2, 0.5])
+                if self.generated_future_traj is not None:
+                    draw_trajectory(viewer, self.generated_future_traj, self.generated_future_orient, color=[0.2, 0.2, 0.2, 0.5])
 
     def toggle_trajectory(self):
         """Toggle trajectory visualization."""
@@ -580,7 +599,7 @@ def main():
             if True:
                 viewer.user_scn.ngeom = 0
                 player.render_trajectory(viewer)
-                viewer.cam.lookat[:] = mj_data.qpos[:3]
+                # viewer.cam.lookat[:] = mj_data.qpos[:3]
                 viewer.sync()
             time.sleep(0.001)
 if __name__ == "__main__":

@@ -124,6 +124,28 @@ class MotionData:
             past_qpos.insert(0, self.get_qpos(start_idx))
         
         return np.array(past_qpos)
+
+    def get_future_qpos(self, frame_idx, future_frames=45):
+        """
+        Get future qpos sequence starting from a specific frame.
+        
+        Args:
+            frame_idx: Current frame index
+            future_frames: Number of future frames to include
+            
+        Returns:
+            future_qpos: (future_frames, 36) array
+        """
+        start_idx = max(0, frame_idx)
+        future_qpos = []
+        for t in range(start_idx, min(self.num_frames, frame_idx + future_frames)):
+            future_qpos.append(self.get_qpos(t))
+        
+        # If not enough future frames, pad with the last frame
+        while len(future_qpos) < future_frames:
+            future_qpos.append(self.get_qpos(self.num_frames - 1))
+        
+        return np.array(future_qpos)
     
     def get_trajectory(self, frame_idx, past_frames=10, future_frames=45, kernel_idx=0, append_z=False):
         """
