@@ -40,6 +40,7 @@ from diffusion.create_diffusion import create_gaussian_diffusion
 
 from visualize.motion_loader import MotionDataset
 from visualize.utils.geometry import draw_trajectory
+from visualize.utils.trajectory import blend_trajectories
 
 import torch
 from visualize.utils.rotations import rot_from_wxyz
@@ -179,44 +180,6 @@ def model_format_to_qpos(model_output):
         qpos_seq[t, 7:] = joint_angles
     return qpos_seq  # (T, 36)        
 
-def blend_trajectories(gen_qpos, target_trans, target_pose, blend=0.5):
-    """Blend generated future trajectory with dataset trajectory."""
-    blended_qpos = gen_qpos.copy()
-    T = len(gen_qpos)
-    
-    for t in range(T):
-        # 1. Position Blend (XY only, preserve Z from generation (physics))
-        gen_pos = gen_qpos[t, :3]
-        tgt_pos_2d = target_trans[t]
-        
-        # Linear Interpolate XY
-        blend_weight = (t/(T-1)) ** blend
-        new_x = (1 - blend_weight) * gen_pos[0] + blend_weight * tgt_pos_2d[0]
-        new_y = (1 - blend_weight) * gen_pos[1] + blend_weight * tgt_pos_2d[1]
-        blended_qpos[t, 0] = new_x
-        blended_qpos[t, 1] = new_y
-        
-        # 2. Rotation Blend (Slerp)
-        gen_quat = gen_qpos[t, 3:7] # wxyz
-        tgt_quat = target_pose[t]   # wxyz
-        
-        # Scipy uses xyzw
-        r_gen = R.from_quat([gen_quat[1], gen_quat[2], gen_quat[3], gen_quat[0]])
-        r_tgt = R.from_quat([tgt_quat[1], tgt_quat[2], tgt_quat[3], tgt_quat[0]])
-        
-        # Slerp
-        slerp = Slerp([0, 1], R.from_matrix(np.stack([r_gen.as_matrix(), r_tgt.as_matrix()])))
-        r_blended = slerp([blend_weight])[0]
-        
-        # Back to wxyz
-        b_q = r_blended.as_quat()
-        blended_qpos[t, 3] = b_q[3] # w
-        blended_qpos[t, 4] = b_q[0] # x
-        blended_qpos[t, 5] = b_q[1] # y
-        blended_qpos[t, 6] = b_q[2] # z
-        
-    return blended_qpos
-
 class DemoPlayer:
     def __init__(self, model, data, dataset, motion_generator: MotionGenerator,
                  show_trajectory=True, past_frames=10, future_frames=45, blend=0.5):
@@ -248,8 +211,8 @@ class DemoPlayer:
         self.generated_qpos = None
         self.generated_future_traj = None
         self.generated_future_orient = None
-        # Blending factor
-        self.blend = 0.5
+        # Blending factor (1-t^blend) predicted + t^blend target, t ∈ [0, 1]
+        self.blend = 0.5 # (0: pure target, not using generated prediction)
         
         # Load first motion
         self.load_motion(0)
@@ -292,7 +255,7 @@ class DemoPlayer:
         past_qpos_dataset = self.load_past_qpos()
         if self.current_frame > 0:
             past_qpos = np.array(self.qpos_history)  # (past_frames, 36)
-            past_qpos[:, :] = past_qpos_dataset[:, :]  # Use dataset XYZ for past
+            past_qpos[:, 7:] = past_qpos_dataset[:, 7:]  # Use dataset XYZ for past
         else:
             past_qpos = past_qpos_dataset
         style_idx = self.current_motion_data.style_idx

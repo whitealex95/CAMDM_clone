@@ -60,3 +60,17 @@ def draw_trajectory(viewer: Handle, traj_pos, traj_orient, color=[0.2, 0.5, 1.0,
     traj_orient = np.ascontiguousarray(traj_orient, dtype=np.float64)
     draw_trajectory_lines(viewer, traj_pos, color)
     draw_trajectory_arrows(viewer, traj_pos, traj_orient, color)
+
+def draw_label(viewer, position: np.ndarray, label: str, size: float = 0.2):
+    # create an invisibale geom and add label on it
+    geom = viewer.user_scn.geoms[viewer.user_scn.ngeom]
+    mujoco.mjv_initGeom(
+        geom,
+        type=mujoco.mjtGeom.mjGEOM_LABEL,
+        size=np.array([0, 0, 0]),  # size doesnt matter because it is invisible
+        pos=position,  # label position
+        mat=np.eye(3).flatten(),  # label orientation, here is no rotation
+        rgba=np.array([0, 0, 0, 0])  # invisible
+    )
+    geom.label = label  # receive string input only
+    viewer.user_scn.ngeom += 1
