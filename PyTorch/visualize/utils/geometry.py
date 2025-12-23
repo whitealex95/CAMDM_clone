@@ -55,6 +55,8 @@ def draw_trajectory_arrows(viewer: Handle, traj_pos, traj_orient, color=[0.2, 0.
 
 def draw_trajectory(viewer: Handle, traj_pos, traj_orient, color=[0.2, 0.5, 1.0, 1.0]):
     """Draws both lines and orientation arrows for a trajectory."""
+    if traj_pos.shape[1] != 3:
+        traj_pos = np.hstack([traj_pos, np.zeros((traj_pos.shape[0], 1))])  # Add Z=0 plane
     # Ensure data is contiguous float64 arrays
     traj_pos = np.ascontiguousarray(traj_pos, dtype=np.float64)
     traj_orient = np.ascontiguousarray(traj_orient, dtype=np.float64)

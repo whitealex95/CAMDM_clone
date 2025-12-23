@@ -40,7 +40,7 @@ from diffusion.create_diffusion import create_gaussian_diffusion
 
 from visualize.motion_loader import MotionDataset
 from visualize.utils.geometry import draw_trajectory
-from visualize.utils.trajectory import blend_trajectories
+from visualize.utils.trajectory import blend_trajectory, extend_future_traj_heusristic
 
 import torch
 from visualize.utils.rotations import rot_from_wxyz
@@ -201,8 +201,8 @@ class DemoPlayer:
         # Frame rate (from make_pose_data_g1.py)
         self.fps = 30
         self.frame_dt = 1.0 / self.fps
-        self.apply_frames = 15 # frames to apply per generation step (default: 15, meaning 2Hz generation)
-        self.apply_frame_counter = 0
+        self.apply_generated_frames = 15 # frames to apply per generation step (default: 15, meaning 2Hz generation)
+        self.generated_frame_idx = 0
 
         # Create a queue to store qpos history
         from collections import deque 
@@ -260,39 +260,34 @@ class DemoPlayer:
         past_qpos_dataset = self.load_past_qpos()
         if self.current_frame > 0:
             past_qpos = np.array(self.qpos_history)  # (past_frames, 36)
-            if True:
-                """override with dataset past frames"""
-                # past_qpos[:, :7] = past_qpos_dataset[:, :7]  # Use dataset XYZ for past
-                # past_qpos[:, :2] = past_qpos_dataset[:, :2]  # Use dataset XYZ for past
         else:
             past_qpos = past_qpos_dataset
         style_idx = self.current_motion_data.style_idx
 
         # generated_qpos = self.motion_generator.generate_motion(
         #     past_qpos, self.future_traj_dataset[:, :2], self.future_orient_dataset, style_idx)
-        generated_qpos = self.motion_generator.generate_motion(
-            past_qpos, self.future_traj[:, :2], self.future_orient, style_idx)
-        
+        self.raw_generated_qpos = self.motion_generator.generate_motion(past_qpos, self.future_traj, self.future_orient, style_idx)
+        generated_qpos = self.raw_generated_qpos.copy()
         if True: # override with future frames
             future_qpos_dataset = self.load_future_qpos()
             # TODO: figure out why this is required. Shouldn't this be easily learned by the model?
-            generated_qpos[:, :2] = future_qpos_dataset[:, :2]
+            # generated_qpos[:, :2] = self.future_traj[:, :2]
         return generated_qpos # (future_frames, 36)
 
     def update_pose(self):
         """Update MuJoCo model with current frame pose."""
-        self.update_past_trajectory()
-        if self.apply_frame_counter == 0:
-            self.update_future_trajectory()
+        if self.generated_frame_idx == 0:
             self.generated_qpos = self.generate_motion()
 
-        qpos = self.generated_qpos[self.apply_frame_counter]
+        qpos = self.generated_qpos[self.generated_frame_idx]
 
         self.update_qpos_history(qpos.copy())
+        self.update_past_trajectory()
+        self.update_future_trajectory()
         self.data.qpos[:] = qpos
         mujoco.mj_forward(self.model, self.data)
 
-        self.apply_frame_counter = (self.apply_frame_counter + 1) % self.apply_frames
+        self.generated_frame_idx = (self.generated_frame_idx + 1) % self.apply_generated_frames
 
     def init_qpos_history(self, qpos):
         """Initialize qpos history deque."""
@@ -304,7 +299,9 @@ class DemoPlayer:
         self.qpos_history.append(qpos) # most recent at the end
 
     def update_past_trajectory(self):
-        """Update past trajectory based on qpos history."""
+        """Update past trajectory based on qpos history.
+        The resulting past trajectory is fed into the motion generator.
+        """
         qpos_history = np.array(self.qpos_history)
         past_xyz = qpos_history[-self.past_frames:, :3]
         past_quat = qpos_history[-self.past_frames:, 3:7] # wxyz
@@ -320,15 +317,27 @@ class DemoPlayer:
 
 
     def update_future_trajectory(self):
+        """Update future trajectory based on target future and predicted future
+        target future: self.future_traj_dataset and self.future_orient_dataset
+        predicted future: self.generated_qpos
+        """
         # Load future trajectory from dataset
         self.load_future_trajectory()
-        if False and self.generated_qpos is not None:
+
+        if self.generated_qpos is not None:
             self.generated_future_traj = self.generated_qpos[:, :3] # XYZ
             self.generated_future_orient = self.generated_qpos[:, 3:7] # wxyz
+            t_cur = self.generated_frame_idx
+            t_total = self.future_frames
+            model_pred_future_traj = self.generated_future_traj[t_cur+1:, :2] # XY only
+            model_pred_future_orient = self.generated_future_orient[t_cur+1:]
+            extended_future_traj, extended_future_orient = extend_future_traj_heusristic(
+                model_pred_future_traj, model_pred_future_orient, t_total, K=1)
             
-            blended_qpos = blend_trajectories(self.generated_qpos, self.future_traj_dataset, self.future_orient_dataset, self.blend)
-            self.future_traj = blended_qpos[:, :3]
-            self.future_orient = blended_qpos[:, 3:7] # wxyz
+            blended_future_traj, blended_future_orient = blend_trajectory(extended_future_traj, extended_future_orient,
+                                                                          self.future_traj_dataset, self.future_orient_dataset, self.blend)
+            self.future_traj = blended_future_traj # XY only
+            self.future_orient = blended_future_orient # wxyz
         else:
             self.future_traj = self.future_traj_dataset
             self.future_orient = self.future_orient_dataset
@@ -387,8 +396,13 @@ class DemoPlayer:
         print(f"Playback speed: {speed}x")
     
     def _load_trajectory_from_dataset(self):
-        """Update trajectory visualization markers."""
-        # Get trajectory data for current frame
+        """Get trajectory data for current frame.
+        Returns:
+            past_traj_dataset: (past_frames, 2) numpy array
+            future_traj_dataset: (future_frames, 2) numpy array
+            past_orient_dataset: (past_frames, 4) numpy array
+            future_orient_dataset: (future_frames, 4) numpy array
+        """
         past_traj_dataset, future_traj_dataset, past_orient_dataset, future_orient_dataset = \
             self.current_motion_data.get_trajectory(
                 self.current_frame, 
@@ -397,7 +411,7 @@ class DemoPlayer:
                 kernel_idx=0  # Use first smoothing kernel, choose from 0 or 1
             )
         
-        return past_traj_dataset, future_traj_dataset, past_orient_dataset, future_orient_dataset
+        return past_traj_dataset[:, :2], future_traj_dataset[:, :2], past_orient_dataset, future_orient_dataset
     
     def render_trajectory(self, viewer: mujoco.viewer.Handle):
         if not self.show_trajectory:

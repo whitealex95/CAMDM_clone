@@ -34,6 +34,7 @@ def blend_trajectory(pred_trans, pred_pose, target_trans, target_pose, blend=0.5
         blended_pose (np.ndarray): [T, 4] blended orientation (wxyz)
     """
     blended_trans = pred_trans.copy()
+    assert pred_trans.shape == target_trans.shape, "Trajectory shape mismatch"
     blended_pose = pred_pose.copy()
     T = len(pred_trans)
 
