@@ -46,7 +46,7 @@ sys.path.append(VISUALIZE_DIR)
 sys.path.append(PYTORCH_DIR)
 
 from visualize.utils.geometry import draw_trajectory
-from visualize.utils.trajectory import blend_trajectories
+from visualize.utils.trajectory import blend_qpos
 from visualize.utils.geometry import draw_label
 
 
@@ -123,7 +123,7 @@ class InteractiveTrajectoryBlender:
         """Regenerate all trajectories based on current parameters."""
         self.gen_qpos = self.generate_gen_qpos()
         self.target_trans, self.target_pose = self.generate_target_trajectory()
-        self.blended_qpos = blend_trajectories(
+        self.blended_qpos = blend_qpos(
             self.gen_qpos, self.target_trans, self.target_pose, self.blend
         )
         
