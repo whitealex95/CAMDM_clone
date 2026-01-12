@@ -17,7 +17,7 @@ def init_geom(geom, color):
         rgba=color
     )
 
-def draw_orientation_arrow(viewer: Handle, pos, quat, color=[0, 1, 0, 1]):
+def draw_orientation_arrow(scene, pos, quat, color=[0, 1, 0, 1]):
     """Draws a single Forward (X-axis) arrow for the orientation"""
     rot = rot_from_wxyz(quat)
 
@@ -25,47 +25,47 @@ def draw_orientation_arrow(viewer: Handle, pos, quat, color=[0, 1, 0, 1]):
     forward_vec = rot[:, 0] 
     endpoint = pos + forward_vec * 0.3 # 0.3m length
 
-    init_geom(viewer.user_scn.geoms[viewer.user_scn.ngeom], color)
+    init_geom(scene.geoms[scene.ngeom], color)
     mujoco.mjv_connector(
-        viewer.user_scn.geoms[viewer.user_scn.ngeom],
+        scene.geoms[scene.ngeom],
         mujoco.mjtGeom.mjGEOM_ARROW, # Use ARROW instead of LINE
         0.03,                        # Arrow thickness
         pos,
         endpoint
     )
-    viewer.user_scn.ngeom += 1
+    scene.ngeom += 1
 
-def draw_trajectory_lines(viewer: Handle, traj_pos, color=[0.2, 0.5, 1.0, 1.0]):
+def draw_trajectory_lines(scene, traj_pos, color=[0.2, 0.5, 1.0, 1.0]):
     """Draws lines connecting trajectory points."""
     for i in range(len(traj_pos) - 1):
-        if viewer.user_scn.ngeom >= viewer.user_scn.maxgeom: break
-        init_geom(viewer.user_scn.geoms[viewer.user_scn.ngeom], color)
+        if scene.ngeom >= scene.maxgeom: break
+        init_geom(scene.geoms[scene.ngeom], color)
         mujoco.mjv_connector(
-            viewer.user_scn.geoms[viewer.user_scn.ngeom],
+            scene.geoms[scene.ngeom],
             mujoco.mjtGeom.mjGEOM_LINE, 10.0,
             traj_pos[i], traj_pos[i+1],
         )
-        viewer.user_scn.ngeom += 1
+        scene.ngeom += 1
 
-def draw_trajectory_arrows(viewer: Handle, traj_pos, traj_orient, color=[0.2, 0.5, 1.0, 1.0]):
+def draw_trajectory_arrows(scene, traj_pos, traj_orient, color=[0.2, 0.5, 1.0, 1.0]):
     """Draws orientation arrows along the trajectory."""
     for i in range(0, len(traj_pos), 5):  # Every 5th frame
-        if viewer.user_scn.ngeom >= viewer.user_scn.maxgeom: break
-        draw_orientation_arrow(viewer, traj_pos[i], traj_orient[i], color)
+        if scene.ngeom >= scene.maxgeom: break
+        draw_orientation_arrow(scene, traj_pos[i], traj_orient[i], color)
 
-def draw_trajectory(viewer: Handle, traj_pos, traj_orient, color=[0.2, 0.5, 1.0, 1.0]):
+def draw_trajectory(scene, traj_pos, traj_orient, color=[0.2, 0.5, 1.0, 1.0]):
     """Draws both lines and orientation arrows for a trajectory."""
     if traj_pos.shape[1] != 3:
         traj_pos = np.hstack([traj_pos, np.zeros((traj_pos.shape[0], 1))])  # Add Z=0 plane
     # Ensure data is contiguous float64 arrays
     traj_pos = np.ascontiguousarray(traj_pos, dtype=np.float64)
     traj_orient = np.ascontiguousarray(traj_orient, dtype=np.float64)
-    draw_trajectory_lines(viewer, traj_pos, color)
-    draw_trajectory_arrows(viewer, traj_pos, traj_orient, color)
+    draw_trajectory_lines(scene, traj_pos, color)
+    draw_trajectory_arrows(scene, traj_pos, traj_orient, color)
 
-def draw_label(viewer, position: np.ndarray, label: str, size: float = 0.2):
+def draw_label(scene, position: np.ndarray, label: str, size: float = 0.2):
     # create an invisibale geom and add label on it
-    geom = viewer.user_scn.geoms[viewer.user_scn.ngeom]
+    geom = scene.geoms[scene.ngeom]
     mujoco.mjv_initGeom(
         geom,
         type=mujoco.mjtGeom.mjGEOM_LABEL,
@@ -75,4 +75,4 @@ def draw_label(viewer, position: np.ndarray, label: str, size: float = 0.2):
         rgba=np.array([0, 0, 0, 0])  # invisible
     )
     geom.label = label  # receive string input only
-    viewer.user_scn.ngeom += 1
+    scene.ngeom += 1

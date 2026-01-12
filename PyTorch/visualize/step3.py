@@ -406,22 +406,21 @@ class DemoPlayer:
         
         return past_traj_dataset[:, :2], future_traj_dataset[:, :2], past_orient_dataset, future_orient_dataset
     
-    def render_trajectory(self, viewer: mujoco.viewer.Handle):
+    def render_trajectory(self, scene):
         if not self.show_trajectory:
             return
         assert hasattr(self, 'past_traj') and hasattr(self, 'future_traj'), \
             "Trajectory data not available for visualization."
         if True:
-            viewer.user_scn.ngeom = 0
             # --- DRAW PAST (Blue) ---
             if len(self.past_traj) > 0:
-                draw_trajectory(viewer, self.past_traj, self.past_orient, color=[0.2, 0.5, 1.0, 1.0])
+                draw_trajectory(scene, self.past_traj, self.past_orient, color=[0.2, 0.5, 1.0, 1.0])
             # --- DRAW FUTURE (Red) ---
             if len(self.future_traj_dataset) > 0:
-                draw_trajectory(viewer, self.future_traj_dataset, self.future_orient_dataset, color=[1.0, 0.2, 0.2, 1.0])
-                draw_trajectory(viewer, self.future_traj, self.future_orient, color=[0.2, 1.0, 0.2, 1.0])
+                draw_trajectory(scene, self.future_traj_dataset, self.future_orient_dataset, color=[1.0, 0.2, 0.2, 1.0])
+                draw_trajectory(scene, self.future_traj, self.future_orient, color=[0.2, 1.0, 0.2, 1.0])
                 if self.generated_future_traj is not None:
-                    draw_trajectory(viewer, self.generated_future_traj, self.generated_future_orient, color=[0.2, 0.2, 0.2, 0.5])
+                    draw_trajectory(scene, self.generated_future_traj, self.generated_future_orient, color=[0.2, 0.2, 0.2, 0.5])
 
     def toggle_trajectory(self):
         """Toggle trajectory visualization."""
@@ -606,18 +605,13 @@ def main():
     print_instruction()
     with mujoco.viewer.launch_passive(mj_model, mj_data, key_callback=lambda keycode: key_callback(player, keycode)) as viewer:
         W, H = 640, 320
-        OUT = "demo.mp4"
+        OUT = "videos/demo.mp4"
         FPS = 30
         writer = imageio.get_writer(OUT, fps=FPS, codec="libx264", pixelformat="yuv420p")
         renderer = mujoco.Renderer(mj_model, height=H, width=W)
+        frame_last_time = -np.inf
 
         viewer.sync()
-        #############
-        # Debugging #
-        frame_buffer = []
-        start_time = time.time()
-        frame_last_time = -np.inf
-        #############
         try:
             while viewer.is_running():
 
@@ -625,26 +619,26 @@ def main():
                 # with viewer.lock():
                 if True:
                     viewer.user_scn.ngeom = 0
-                    player.render_trajectory(viewer)
+                    player.render_trajectory(viewer.user_scn)
                     if player.camera_follow:
                         viewer.cam.lookat[:] = mj_data.qpos[:3]
-                    
                     viewer.sync()
-                    # --- RECORD THIS FRAME (3 lines) ---
+
+                    # --- Render frame to video---
                     if time.time() - frame_last_time > 1/FPS:
                         renderer.update_scene(
                             mj_data, 
                             camera=viewer.cam # Use the viewer's active camera
                         )
+                        player.render_trajectory(renderer.scene)
                         frame = renderer.render()
                         writer.append_data(frame)
-                        frame_buffer.append(frame)
                         frame_last_time = time.time()
                     else:
                         continue
         except KeyboardInterrupt:
             writer.close()
-            print("num frames:", len(frame_buffer), "duration:", time.time() - start_time, "FPS:", len(frame_buffer)/(time.time() - start_time))
+            print("Video saved to", OUT)
         finally:
             print("Exiting viewer...")
 if __name__ == "__main__":
