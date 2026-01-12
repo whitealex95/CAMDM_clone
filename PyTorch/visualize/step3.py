@@ -41,7 +41,7 @@ from diffusion.create_diffusion import create_gaussian_diffusion
 from visualize.motion_loader import MotionDataset
 from visualize.utils.geometry import draw_trajectory
 from visualize.utils.intertializer import Inertializer
-from visualize.utils.trajectory import blend_trajectory, extend_future_traj_heusristic
+from visualize.utils.trajectory import blend_trajectory, extend_future_traj_heusristic, align_trajectory_to_pose
 
 import torch
 from visualize.utils.rotations import rot_from_wxyz
@@ -380,13 +380,29 @@ class DemoPlayer:
         self.past_traj = past_xyz
         self.past_orient = past_quat
     
-        
-    def load_future_trajectory(self):
-        # Load future trajectory from dataset
+    def load_future_trajectory(self, align_to_robot=True):
+        # Load raw global trajectory from dataset
         _, future_traj_dataset, _, future_orient_dataset = self._load_trajectory_from_dataset()
-        self.future_traj_dataset = future_traj_dataset
-        self.future_orient_dataset = future_orient_dataset
+        
+        if align_to_robot:
+            # Get Reference (Dataset) and Current (Robot) states
+            ref_qpos = self.current_motion_data.get_qpos(self.current_frame)
+            curr_qpos = self.data.qpos.copy()
 
+            # Align trajectory to match the robot's current specific state
+            aligned_traj, aligned_orient = align_trajectory_to_pose(
+                future_traj_dataset, 
+                future_orient_dataset, 
+                ref_qpos, 
+                curr_qpos
+            )
+
+            self.future_traj_dataset = aligned_traj
+            self.future_orient_dataset = aligned_orient
+        else:
+            # Use raw global data directly
+            self.future_traj_dataset = future_traj_dataset
+            self.future_orient_dataset = future_orient_dataset
 
     def update_future_trajectory(self):
         """Update future trajectory based on target future and predicted future

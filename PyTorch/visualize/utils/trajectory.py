@@ -110,7 +110,54 @@ def extend_future_traj_heusristic(model_pred_future_traj, model_pred_future_orie
     
     return extended_future_traj, extended_future_orient
     
+def align_trajectory_to_pose(future_traj, future_orient, ref_qpos, curr_qpos):
+    """
+    Aligns a global trajectory from the dataset to match the robot's current pose.
+    The output is still in WORLD coordinates, but shifted/rotated so it starts
+    at the robot's current position.
     
+    Args:
+        future_traj: (T, 2) XY positions from dataset (Global)
+        future_orient: (T, 4) wxyz quaternions from dataset (Global)
+        ref_qpos: (7,) Reference pose (dataset state at t=0)
+        curr_qpos: (7,) Current robot pose (simulation state)
+        
+    Returns:
+        aligned_traj: (T, 2) Aligned XY positions (Global)
+        aligned_orient: (T, 4) Aligned wxyz quaternions (Global)
+    """
+    # Extract states
+    ref_pos_xy = ref_qpos[:2]
+    curr_pos_xy = curr_qpos[:2]
+    
+    # Calculate Yaw Difference
+    # Scipy expects (x, y, z, w), input is (w, x, y, z)
+    r_ref = R.from_quat(ref_qpos[3:7][[1, 2, 3, 0]]) 
+    r_curr = R.from_quat(curr_qpos[3:7][[1, 2, 3, 0]])
+    
+    yaw_ref = r_ref.as_euler('zyx')[0]
+    yaw_curr = r_curr.as_euler('zyx')[0]
+    delta_yaw = yaw_curr - yaw_ref
+
+    # --- 1. Align Positions (XY) ---
+    c, s = np.cos(delta_yaw), np.sin(delta_yaw)
+    rot_mat = np.array([[c, -s], [s, c]])
+    
+    # Formula: P_aligned = P_current + R_delta * (P_dataset - P_ref)
+    rel_pos = future_traj - ref_pos_xy
+    aligned_traj = (rot_mat @ rel_pos.T).T + curr_pos_xy
+
+    # --- 2. Align Orientations (Quaternions) ---
+    # Formula: Q_aligned = Q_delta * Q_dataset
+    r_delta = R.from_euler('z', delta_yaw)
+    future_quats_scipy = R.from_quat(future_orient[:, [1, 2, 3, 0]]) # to xyzw
+    
+    aligned_quats_scipy = r_delta * future_quats_scipy
+    
+    # Convert back to wxyz
+    aligned_orient = aligned_quats_scipy.as_quat()[:, [3, 0, 1, 2]]
+
+    return aligned_traj, aligned_orient
 
 if __name__ == "__main__":
     # Simple test gen_qpos trajectory of 45 steps
