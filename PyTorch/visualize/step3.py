@@ -188,6 +188,7 @@ class DemoPlayer:
         self.dataset = dataset
         self.motion_generator = motion_generator
         self.show_trajectory = show_trajectory
+        self.camera_follow = True
         self.past_frames = past_frames
         self.future_frames = future_frames
         
@@ -201,7 +202,7 @@ class DemoPlayer:
         # Frame rate (from make_pose_data_g1.py)
         self.fps = 30
         self.frame_dt = 1.0 / self.fps
-        self.apply_generated_frames = 15 # frames to apply per generation step (default: 15, meaning 2Hz generation)
+        self.apply_generated_frames = 10 # frames to apply per generation step (default: 15, meaning 2Hz generation)
         self.generated_frame_idx = 0
 
         # Create a queue to store qpos history
@@ -214,10 +215,10 @@ class DemoPlayer:
         self.generated_future_traj = None
         self.generated_future_orient = None
         # Blending factor (1-t^blend) predicted + t^blend target, t ∈ [0, 1]
-        self.blend = 0.5 # (0: pure target, not using generated prediction)
+        self.blend = 1.0 # (0: pure target, not using generated prediction)
         
         # Load first motion
-        self.load_motion(0)
+        self.load_motion(motion_idx=27)
         
         
 
@@ -266,7 +267,8 @@ class DemoPlayer:
 
         # generated_qpos = self.motion_generator.generate_motion(
         #     past_qpos, self.future_traj_dataset[:, :2], self.future_orient_dataset, style_idx)
-        self.raw_generated_qpos = self.motion_generator.generate_motion(past_qpos, self.future_traj, self.future_orient, style_idx)
+        self.raw_generated_qpos = self.motion_generator.generate_motion(past_qpos,
+                                self.future_traj, self.future_orient, style_idx)
         generated_qpos = self.raw_generated_qpos.copy()
         if True: # override with future frames
             future_qpos_dataset = self.load_future_qpos()
@@ -369,16 +371,6 @@ class DemoPlayer:
         """Load previous motion clip."""
         self.load_motion(self.current_motion_idx - 1)
     
-    def next_frame(self):
-        """Advance one frame."""
-        self.current_frame = (self.current_frame + 1) % self.current_motion_data.num_frames
-        self.update_pose()
-    
-    def prev_frame(self):
-        """Go back one frame."""
-        self.current_frame = (self.current_frame - 1) % self.current_motion_data.num_frames
-        self.update_pose()
-    
     def toggle_pause(self):
         """Toggle play/pause."""
         self.playing = not self.playing
@@ -387,6 +379,7 @@ class DemoPlayer:
     def reset(self):
         """Reset to first frame."""
         self.current_frame = 0
+        self.load_motion(self.current_motion_idx)
         self.update_pose()
         print("Reset to first frame")
     
@@ -435,6 +428,11 @@ class DemoPlayer:
         self.show_trajectory = not self.show_trajectory
         print(f"Trajectory visualization: {'ON' if self.show_trajectory else 'OFF'}")
     
+    def toggle_camera_follow(self):
+        """Toggle camera follow mode."""
+        self.camera_follow = not self.camera_follow
+        print(f"Camera follow mode: {'ON' if self.camera_follow else 'OFF'}")
+
     def print_status(self):
         """Print current status."""
         status = (
@@ -455,7 +453,7 @@ def get_args():
         default="lafan1_g1",
         help="Dataset name (lafan1_g1 or 100style)"
     )
-    parser.add_argument("--checkpoint", type=str, default="save/camdm_g1_lafan1_g1/best.pt")
+    parser.add_argument("--checkpoint", type=str, default="save/camdm_g1_lafan1_g1_epoch500_diff8/best.pt")
     parser.add_argument("--blend", type=float, default=0.3, help="0.0 = Pure AI, 1.0 = Pure GT Trajectory")    
 
     parser.add_argument(
@@ -502,14 +500,12 @@ def key_callback(player: DemoPlayer, keycode):
         player.next_motion()
     elif keycode == 264:  # DOWN
         player.prev_motion()
-    elif keycode == 263:  # LEFT
-        player.prev_frame()
-    elif keycode == 262:  # RIGHT
-        player.next_frame()
     elif keycode == ord('r') or keycode == ord('R'):
         player.reset()
     elif keycode == ord('t') or keycode == ord('T'):
         player.toggle_trajectory()
+    elif keycode == ord('c') or keycode == ord('C'):
+        player.toggle_camera_follow()
     elif keycode == ord('s') or keycode == ord('S'):
         player.print_status()
     elif ord('1') <= keycode <= ord('9'):
@@ -603,18 +599,53 @@ def main():
     # Start from specified motion
     if args.motion > 0:
         player.load_motion(args.motion)
-    
+        
+    import imageio.v2 as imageio
+
+
     print_instruction()
     with mujoco.viewer.launch_passive(mj_model, mj_data, key_callback=lambda keycode: key_callback(player, keycode)) as viewer:
+        W, H = 640, 320
+        OUT = "demo.mp4"
+        FPS = 30
+        writer = imageio.get_writer(OUT, fps=FPS, codec="libx264", pixelformat="yuv420p")
+        renderer = mujoco.Renderer(mj_model, height=H, width=W)
+
         viewer.sync()
-        while viewer.is_running():
-            player.step()
-            # with viewer.lock():
-            if True:
-                viewer.user_scn.ngeom = 0
-                player.render_trajectory(viewer)
-                # viewer.cam.lookat[:] = mj_data.qpos[:3]
-                viewer.sync()
-            time.sleep(0.001)
+        #############
+        # Debugging #
+        frame_buffer = []
+        start_time = time.time()
+        frame_last_time = -np.inf
+        #############
+        try:
+            while viewer.is_running():
+
+                player.step()
+                # with viewer.lock():
+                if True:
+                    viewer.user_scn.ngeom = 0
+                    player.render_trajectory(viewer)
+                    if player.camera_follow:
+                        viewer.cam.lookat[:] = mj_data.qpos[:3]
+                    
+                    viewer.sync()
+                    # --- RECORD THIS FRAME (3 lines) ---
+                    if time.time() - frame_last_time > 1/FPS:
+                        renderer.update_scene(
+                            mj_data, 
+                            camera=viewer.cam # Use the viewer's active camera
+                        )
+                        frame = renderer.render()
+                        writer.append_data(frame)
+                        frame_buffer.append(frame)
+                        frame_last_time = time.time()
+                    else:
+                        continue
+        except KeyboardInterrupt:
+            writer.close()
+            print("num frames:", len(frame_buffer), "duration:", time.time() - start_time, "FPS:", len(frame_buffer)/(time.time() - start_time))
+        finally:
+            print("Exiting viewer...")
 if __name__ == "__main__":
     main()
