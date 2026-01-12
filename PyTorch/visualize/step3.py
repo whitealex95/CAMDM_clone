@@ -40,6 +40,7 @@ from diffusion.create_diffusion import create_gaussian_diffusion
 
 from visualize.motion_loader import MotionDataset
 from visualize.utils.geometry import draw_trajectory
+from visualize.utils.intertializer import Inertializer
 from visualize.utils.trajectory import blend_trajectory, extend_future_traj_heusristic
 
 import torch
@@ -216,6 +217,9 @@ class DemoPlayer:
         self.generated_future_orient = None
         # Blending factor (1-t^blend) predicted + t^blend target, t ∈ [0, 1]
         self.blend = 1.0 # (0: pure target, not using generated prediction)
+
+        # Inertializer for smooth transitions
+        self.inertializer = None # Inertializer(dim=36, halflife=0.1) # 
         
         # Load first motion
         self.load_motion(motion_idx=27)
@@ -277,6 +281,12 @@ class DemoPlayer:
         return generated_qpos # (future_frames, 36)
 
     def update_pose(self):
+        if self.inertializer is None:
+            self.update_pose_raw()
+        else:
+            self.update_pose_inertialized()
+
+    def update_pose_raw(self):
         """Update MuJoCo model with current frame pose."""
         if self.generated_frame_idx == 0:
             self.generated_qpos = self.generate_motion()
@@ -290,6 +300,66 @@ class DemoPlayer:
         mujoco.mj_forward(self.model, self.data)
 
         self.generated_frame_idx = (self.generated_frame_idx + 1) % self.apply_generated_frames
+
+    def update_pose_inertialized(self):
+            """Update MuJoCo model with current frame pose using Inertialization."""
+            
+            # 1. Estimate current velocity from history (Finite Difference)
+            #    Needed to ensure C1 continuity (smooth velocity)
+            if len(self.qpos_history) >= 2:
+                # Velocity = (Current - Prev) / dt
+                curr_vel = (np.array(self.qpos_history[-1]) - np.array(self.qpos_history[-2])) / self.frame_dt
+            else:
+                curr_vel = np.zeros_like(self.data.qpos)
+
+            # 2. Check if we need to generate new frames (The Transition Point)
+            if self.generated_frame_idx == 0:
+                # Capture the state BEFORE we overwrite the plan
+                source_qpos = np.array(self.qpos_history[-1]) if len(self.qpos_history) > 0 else self.data.qpos.copy()
+                source_vel = curr_vel
+                
+                # Generate the NEW trajectory
+                self.generated_qpos = self.generate_motion()
+
+                # Identify where the new trajectory starts
+                target_start_qpos = self.generated_qpos[0]
+                
+                # Estimate velocity of the new trajectory start
+                # (Use next frame if available, otherwise 0)
+                if len(self.generated_qpos) > 1:
+                    target_start_vel = (self.generated_qpos[1] - self.generated_qpos[0]) / self.frame_dt
+                else:
+                    target_start_vel = np.zeros_like(target_start_qpos)
+
+                # >>> TRIGGER INERTIALIZATION <<<
+                # This calculates the gap so we can bridge it
+                self.inertializer.transition(source_qpos, source_vel, target_start_qpos, target_start_vel)
+
+            # 3. Get the raw target pose for the current frame
+            raw_target_qpos = self.generated_qpos[self.generated_frame_idx]
+
+            # 4. Calculate the smooth offset for this frame
+            current_offset = self.inertializer.update(self.frame_dt)
+            
+            # 5. Apply offset to target
+            final_qpos = raw_target_qpos + current_offset
+
+            # 6. Post-process: Normalize Quaternion (indices 3,4,5,6)
+            #    Linear inertialization distorts rotation scaling, normalization fixes it.
+            #    Assumes layout: [x, y, z, w, x, y, z, ...joints]
+            quat = final_qpos[3:7]
+            if np.linalg.norm(quat) > 1e-6:
+                final_qpos[3:7] = quat / np.linalg.norm(quat)
+
+            # 7. Standard Updates
+            self.update_qpos_history(final_qpos.copy()) # Store the SMOOTHED pose
+            self.update_past_trajectory()
+            self.update_future_trajectory()
+            
+            self.data.qpos[:] = final_qpos
+            mujoco.mj_forward(self.model, self.data)
+
+            self.generated_frame_idx = (self.generated_frame_idx + 1) % self.apply_generated_frames
 
     def init_qpos_history(self, qpos):
         """Initialize qpos history deque."""
