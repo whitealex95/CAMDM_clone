@@ -180,6 +180,7 @@ python visualize/visualize_fk_contact.py --dataset lafan1_g1_motion27 --motion 0
 - `UP/DOWN`: Previous/Next motion clip
 - `F`: Toggle FK joint visualization (spheres)
 - `K`: Toggle FK skeleton visualization (wireframe)
+- `P`: Toggle keypoints (hands, head, heel, toe)
 - `C`: Toggle foot contact visualization
 - `1-9`: Set playback speed
 - `S`: Print status
@@ -191,8 +192,6 @@ python visualize/visualize_fk_contact.py --dataset lafan1_g1_motion27 --motion 0
 - **Blue spheres**: FK computed joint positions (legs)
 - **Purple spheres**: FK computed joint positions (waist)
 - **Orange spheres**: FK computed joint positions (arms)
-- **Bright green sphere**: Left hand position (highlighted)
-- **Bright orange sphere**: Right hand position (highlighted)
 
 **FK Skeleton Wireframe (toggle with K):**
 - **Cyan lines**: Left leg connections
@@ -200,6 +199,13 @@ python visualize/visualize_fk_contact.py --dataset lafan1_g1_motion27 --motion 0
 - **Yellow lines**: Torso connections
 - **Green lines**: Left arm connections
 - **Orange lines**: Right arm connections
+
+**Keypoints (toggle with P):**
+- **Bright green**: Left hand
+- **Bright orange**: Right hand
+- **Yellow**: Head
+- **Cyan/Pink**: Left/Right heel
+- **Light cyan/pink**: Left/Right toe
 
 **Foot Contact (toggle with C):**
 - **Red marker + cylinder**: Foot in contact with ground

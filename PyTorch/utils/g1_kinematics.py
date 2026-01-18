@@ -285,7 +285,7 @@ def axis_angle_to_rotmat(axis, angle):
     return R
 
 
-def forward_kinematics_g1(qpos, parents=None, offsets=None, axes=None, init_quats=None):
+def forward_kinematics_g1(qpos, parents=None, offsets=None, axes=None, init_quats=None, return_rotations=False):
     """
     Batched Forward Kinematics for G1 humanoid robot.
 
@@ -300,9 +300,11 @@ def forward_kinematics_g1(qpos, parents=None, offsets=None, axes=None, init_quat
         offsets: [30, 3] joint offsets (optional, uses default if None)
         axes: [30, 3] joint rotation axes (optional, uses default if None)
         init_quats: [30, 4] initial body orientations (optional, uses default if None)
+        return_rotations: If True, return (positions, rotations) tuple
 
     Returns:
         positions: [..., 30, 3] global 3D positions of all joints
+        rotations (optional): [..., 30, 3, 3] global rotation matrices
     """
     # Handle different input shapes
     original_shape = qpos.shape
@@ -380,7 +382,11 @@ def forward_kinematics_g1(qpos, parents=None, offsets=None, axes=None, init_quat
     # Remove time dimension if it was added
     if squeeze_time:
         positions = positions.squeeze(1)  # [B, 30, 3]
+        if return_rotations:
+            rotations = rotations.squeeze(1)  # [B, 30, 3, 3]
 
+    if return_rotations:
+        return positions, rotations
     return positions
 
 

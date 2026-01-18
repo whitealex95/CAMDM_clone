@@ -1,0 +1,143 @@
+# G1 Humanoid Robot Configuration
+# This file defines robot-specific parameters for FK, keypoints, and visualization
+
+robot:
+  name: "Unitree G1"
+  mjcf_path: "visualize/assets/scene.xml"  # Path to MuJoCo XML file
+
+  # Root body configuration
+  root:
+    body_name: "pelvis"  # Name of root body in MuJoCo XML
+    default_height: 0.793  # Default standing height (m)
+
+  # Joint configuration (29 actuated joints for G1)
+  # These will be auto-extracted from MuJoCo XML, but can override here
+  joints:
+    # Joint names in order (excluding root free joint)
+    names:
+      - "left_hip_pitch_joint"
+      - "left_hip_roll_joint"
+      - "left_hip_yaw_joint"
+      - "left_knee_joint"
+      - "left_ankle_pitch_joint"
+      - "left_ankle_roll_joint"
+      - "right_hip_pitch_joint"
+      - "right_hip_roll_joint"
+      - "right_hip_yaw_joint"
+      - "right_knee_joint"
+      - "right_ankle_pitch_joint"
+      - "right_ankle_roll_joint"
+      - "waist_yaw_joint"
+      - "waist_roll_joint"
+      - "waist_pitch_joint"
+      - "left_shoulder_pitch_joint"
+      - "left_shoulder_roll_joint"
+      - "left_shoulder_yaw_joint"
+      - "left_elbow_joint"
+      - "left_wrist_roll_joint"
+      - "left_wrist_pitch_joint"
+      - "left_wrist_yaw_joint"
+      - "right_shoulder_pitch_joint"
+      - "right_shoulder_roll_joint"
+      - "right_shoulder_yaw_joint"
+      - "right_elbow_joint"
+      - "right_wrist_roll_joint"
+      - "right_wrist_pitch_joint"
+      - "right_wrist_yaw_joint"
+
+# Virtual keypoints (computed from FK, not in MuJoCo XML)
+# These are additional points computed relative to existing joints
+keypoints:
+  # Foot keypoints for contact detection and visualization
+  left_heel:
+    parent_joint: "left_ankle_roll_joint"  # Joint index 6
+    offset: [-0.065841, 0.000051, -0.034624]  # Offset in parent frame (m)
+    type: "foot_contact"
+
+  left_toe:
+    parent_joint: "left_ankle_roll_joint"
+    offset: [0.142362, 0.000048, -0.034586]  # Forward offset for toe
+    type: "foot_contact"
+
+  right_heel:
+    parent_joint: "right_ankle_roll_joint"  # Joint index 12
+    offset: [-0.065841, -0.000051, -0.034624]
+    type: "foot_contact"
+
+  right_toe:
+    parent_joint: "right_ankle_roll_joint"
+    offset: [0.142362, -0.000048, -0.034586]
+    type: "foot_contact"
+
+  # Hand keypoints for manipulation tasks
+  left_hand:
+    parent_joint: "left_wrist_yaw_joint"  # Joint index 22
+    offset: [0.05, 0.0, 0.0]  # Offset to palm center
+    type: "end_effector"
+
+  right_hand:
+    parent_joint: "right_wrist_yaw_joint"  # Joint index 29
+    offset: [0.05, 0.0, 0.0]
+    type: "end_effector"
+
+  # Head keypoint (if needed for tasks)
+  head:
+    parent_joint: "waist_pitch_joint"  # Joint index 15 (torso)
+    offset: [0.0, 0.0, 0.35]  # Approximate head position
+    type: "tracking"
+
+# Visualization settings
+visualization:
+  # Joint sphere colors by body part
+  joint_colors:
+    legs: [0.2, 0.7, 1.0, 0.4]      # Blue, semi-transparent
+    torso: [0.7, 0.2, 1.0, 0.4]     # Purple, semi-transparent
+    arms: [1.0, 0.7, 0.2, 0.4]      # Orange, semi-transparent
+
+  # Keypoint visualization
+  keypoint_colors:
+    left_hand: [0.0, 1.0, 0.0, 0.9]   # Bright green
+    right_hand: [1.0, 0.5, 0.0, 0.9]  # Bright orange
+    left_heel: [0.0, 0.5, 1.0, 0.8]   # Cyan
+    right_heel: [1.0, 0.0, 0.5, 0.8]  # Pink
+    left_toe: [0.0, 0.8, 1.0, 0.8]    # Light cyan
+    right_toe: [1.0, 0.3, 0.8, 0.8]   # Light pink
+    head: [1.0, 1.0, 0.0, 0.9]        # Yellow
+
+  # Skeleton wireframe colors
+  skeleton_colors:
+    left_leg: [0.3, 0.8, 1.0, 0.8]    # Cyan
+    right_leg: [1.0, 0.3, 0.8, 0.8]   # Pink
+    torso: [0.8, 0.8, 0.3, 0.8]       # Yellow
+    left_arm: [0.3, 1.0, 0.5, 0.8]    # Green
+    right_arm: [1.0, 0.5, 0.3, 0.8]   # Orange
+
+  # Joint ranges for coloring (indices)
+  joint_ranges:
+    legs: [0, 12]      # Joints 0-12
+    torso: [13, 15]    # Joints 13-15
+    arms: [16, 29]     # Joints 16-29
+
+# Contact detection settings
+contact:
+  # Which keypoints to use for foot contact detection
+  foot_keypoints: ["left_heel", "left_toe", "right_heel", "right_toe"]
+
+  # Foot contact detection parameters
+  velocity_threshold: 0.02  # m/s - below this is considered contact
+  height_threshold: 0.05    # m - below this height is potential contact
+
+  # For visualization
+  contact_color: [1.0, 0.0, 0.0, 0.8]      # Red
+  no_contact_color: [0.2, 1.0, 0.2, 0.3]   # Faint green
+
+# Geometric loss settings
+losses:
+  # Weights for different geometric losses
+  position_weight: 1.0
+  foot_contact_weight: 0.5
+  velocity_weight: 0.1
+
+  # Which keypoints to use for different losses
+  position_keypoints: "all"  # Use all joints for position loss
+  contact_keypoints: ["left_heel", "left_toe", "right_heel", "right_toe"]

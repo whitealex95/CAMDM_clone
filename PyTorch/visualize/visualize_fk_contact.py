@@ -25,6 +25,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from visualize.motion_loader import MotionDataset
 from visualize.utils.geometry import draw_trajectory
 import utils.g1_kinematics as g1_kin
+from utils.robot_config import load_robot_config
+from utils.keypoints import compute_keypoints_from_qpos
 
 
 class FKContactVisualizer:
@@ -34,6 +36,9 @@ class FKContactVisualizer:
         self.model = model
         self.data = data
         self.dataset = dataset
+
+        # Load robot configuration
+        self.robot_config = load_robot_config("g1")
 
         # Playback state
         self.current_motion_idx = 0
@@ -46,6 +51,7 @@ class FKContactVisualizer:
         self.show_fk_joints = True
         self.show_fk_skeleton = False  # Show skeleton connections
         self.show_foot_contact = True
+        self.show_keypoints = True  # Show config-based keypoints
         self.show_trajectory = False
 
         # Frame rate
@@ -75,7 +81,7 @@ class FKContactVisualizer:
 
     def compute_fk_and_contact(self):
         """Compute FK and foot contact for entire current motion."""
-        print("Computing FK and foot contact...")
+        print("Computing FK, keypoints, and foot contact...")
 
         # Get all qpos for current motion
         all_qpos = []
@@ -93,14 +99,23 @@ class FKContactVisualizer:
             foot_positions = g1_kin.extract_foot_positions(joint_positions)  # [1, T, 2, 3]
             contact_mask = g1_kin.compute_foot_contact_mask(foot_positions, threshold=0.02)  # [1, T-1, 2]
 
+            # Compute keypoints
+            keypoints = compute_keypoints_from_qpos(qpos_tensor)  # Dict of [1, T, 3]
+
         # Store results
         self.fk_joint_positions = joint_positions.squeeze(0).numpy()  # [T, 30, 3]
         self.fk_foot_positions = foot_positions.squeeze(0).numpy()    # [T, 2, 3]
         self.foot_contact_mask = contact_mask.squeeze(0).numpy()      # [T-1, 2]
 
+        # Store keypoints
+        self.keypoint_positions = {}
+        for kp_name, kp_pos in keypoints.items():
+            self.keypoint_positions[kp_name] = kp_pos.squeeze(0).numpy()  # [T, 3]
+
         print(f"FK computed: {self.fk_joint_positions.shape}")
         print(f"Foot positions: {self.fk_foot_positions.shape}")
         print(f"Contact mask: {self.foot_contact_mask.shape}")
+        print(f"Keypoints computed: {list(self.keypoint_positions.keys())}")
 
         # Print contact statistics
         left_contact_ratio = self.foot_contact_mask[:, 0].mean()
@@ -146,7 +161,7 @@ class FKContactVisualizer:
         for i, pos in enumerate(joint_pos):
             # Color: different colors for different body parts (more transparent)
             if i <= 12:  # Root and legs
-                color = [0.2, 0.7, 1.0, 0.4]  # Light blue, semi-transparent
+                color = [0.2, 0.7, 1.0, 1.0]  # Light blue, semi-transparent
                 size = 0.03
             elif i <= 15:  # Waist
                 color = [0.7, 0.2, 1.0, 0.4]  # Purple, semi-transparent
@@ -297,31 +312,24 @@ class FKContactVisualizer:
             if scene.ngeom >= scene.maxgeom:
                 break
 
-    def render_hand_positions(self, scene):
-        """Render hand positions as highlighted spheres."""
-        if not self.show_fk_joints:
+    def render_keypoints(self, scene):
+        """Render config-defined keypoints."""
+        if not self.show_keypoints:
             return
 
-        # Get FK positions for current frame
-        joint_pos = self.fk_joint_positions[self.current_frame]  # [30, 3]
+        # Render each keypoint
+        for kp_name, kp_config in self.robot_config.keypoints.items():
+            if kp_name not in self.keypoint_positions:
+                continue
 
-        # Hand joint indices (from g1_kinematics.py)
-        # Left hand: joint 22 (left_wrist_yaw)
-        # Right hand: joint 29 (right_wrist_yaw)
-        hand_indices = [22, 29]
-        hand_colors = [
-            [0.0, 1.0, 0.0, 0.9],  # Left hand: bright green
-            [1.0, 0.5, 0.0, 0.9]   # Right hand: bright orange
-        ]
+            pos = self.keypoint_positions[kp_name][self.current_frame]
+            color = self.robot_config.viz_keypoint_colors.get(kp_name, [1.0, 1.0, 1.0, 0.8])
+            size = 0.035
 
-        for hand_idx, color in zip(hand_indices, hand_colors):
-            pos = joint_pos[hand_idx]
-
-            # Render hand as larger, brighter sphere
             mujoco.mjv_initGeom(
                 scene.geoms[scene.ngeom],
                 type=mujoco.mjtGeom.mjGEOM_SPHERE,
-                size=[0.04, 0, 0],  # Larger than joint spheres
+                size=[size, 0, 0],
                 pos=pos,
                 mat=np.eye(3).flatten(),
                 rgba=color
@@ -342,8 +350,8 @@ class FKContactVisualizer:
         # Render FK joints (spheres at joint positions)
         self.render_fk_joints(scene)
 
-        # Render hand positions (highlighted)
-        self.render_hand_positions(scene)
+        # Render config-based keypoints (hands, head, heel, toe)
+        self.render_keypoints(scene)
 
         # Render foot contact
         self.render_foot_contact(scene)
@@ -377,6 +385,11 @@ class FKContactVisualizer:
         """Toggle foot contact visualization."""
         self.show_foot_contact = not self.show_foot_contact
         print(f"Foot contact: {'ON' if self.show_foot_contact else 'OFF'}")
+
+    def toggle_keypoints(self):
+        """Toggle keypoint visualization."""
+        self.show_keypoints = not self.show_keypoints
+        print(f"Keypoints: {'ON' if self.show_keypoints else 'OFF'}")
 
     def set_speed(self, speed):
         """Set playback speed multiplier."""
@@ -416,6 +429,8 @@ def key_callback(visualizer: FKContactVisualizer, keycode):
         visualizer.toggle_fk_skeleton()
     elif keycode == ord('c') or keycode == ord('C'):
         visualizer.toggle_foot_contact()
+    elif keycode == ord('p') or keycode == ord('P'):
+        visualizer.toggle_keypoints()
     elif keycode == ord('s') or keycode == ord('S'):
         visualizer.print_status()
     elif ord('1') <= keycode <= ord('9'):
@@ -441,6 +456,7 @@ def print_instruction():
     print("  UP/DOWN     : Previous/Next motion clip")
     print("  F           : Toggle FK joint visualization (spheres)")
     print("  K           : Toggle FK skeleton visualization (wireframe)")
+    print("  P           : Toggle keypoints (hands, head, heel, toe)")
     print("  C           : Toggle foot contact visualization")
     print("  1-9         : Set playback speed (1=0.25x, 5=1x, 9=2x)")
     print("  S           : Print status")
@@ -448,17 +464,21 @@ def print_instruction():
     print("=" * 60)
     print("\nVisualization Legend:")
     print("  FK Joint Spheres (toggle with F):")
-    print("    - Blue spheres       : FK computed joint positions (legs)")
-    print("    - Purple spheres     : FK computed joint positions (waist)")
-    print("    - Orange spheres     : FK computed joint positions (arms)")
-    print("    - Bright green sphere: Left hand position (highlighted)")
-    print("    - Bright orange sphere: Right hand position (highlighted)")
+    print("    - Blue spheres    : FK computed joint positions (legs)")
+    print("    - Purple spheres  : FK computed joint positions (waist)")
+    print("    - Orange spheres  : FK computed joint positions (arms)")
     print("  FK Skeleton Wireframe (toggle with K):")
     print("    - Cyan lines      : Left leg connections")
     print("    - Pink lines      : Right leg connections")
     print("    - Yellow lines    : Torso connections")
     print("    - Green lines     : Left arm connections")
     print("    - Orange lines    : Right arm connections")
+    print("  Keypoints (toggle with P):")
+    print("    - Bright green    : Left hand")
+    print("    - Bright orange   : Right hand")
+    print("    - Yellow          : Head")
+    print("    - Cyan/Pink       : Left/Right heel")
+    print("    - Light cyan/pink : Left/Right toe")
     print("  Foot Contact (toggle with C):")
     print("    - Red marker      : Foot in contact with ground")
     print("    - Green marker    : Foot not in contact")
