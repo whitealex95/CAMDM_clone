@@ -19,6 +19,7 @@ from torch_ema import ExponentialMovingAverage
 
 from diffusion.resample import create_named_schedule_sampler
 from diffusion.gaussian_diffusion import *
+from network.geometric_losses import compute_geometric_losses
 
 
 class BaseTrainingPortal:
@@ -312,19 +313,30 @@ class MotionTrainingPortal(BaseTrainingPortal):
 
 class HumanoidTrainingPortal(BaseTrainingPortal):
     """
-    - Inherits full training loop, checkpointing, EMA, etc. from BaseTrainingPortal
-    - Implements only rotation MSE and velocity loss.
-    - [TODO: Add FK losses]
+    G1 Humanoid Training Portal with Geometric Losses
+
+    Includes:
+    - Rotation MSE loss (vanilla diffusion)
+    - Velocity loss (temporal consistency)
+    - Geometric losses (FK-based position, foot contact, velocity)
     """
     def __init__(self, config, model, diffusion, dataloader, logger, tb_writer, finetune_loader=None):
         super().__init__(config, model, diffusion, dataloader, logger, tb_writer, finetune_loader)
-        
-        #  No FK here unlike MotionTrainingPortal. We'll add it later.
-        # self.skel_offset = torch.from_numpy(self.dataloader.dataset.T_pose.offsets).to(self.device)
-        # self.skel_parents = self.dataloader.dataset.T_pose.parents
-        
+
         self.use_velocity_loss = config.trainer.use_loss_vel
         self.use_mse_loss = config.trainer.use_loss_mse
+
+        # Geometric loss settings
+        self.use_geometric_losses = getattr(config.trainer, 'use_geometric_losses', False)
+        if self.use_geometric_losses:
+            self.geo_loss_weights = {
+                'pos': getattr(config.trainer, 'geo_loss_weight_pos', 1.0),
+                'foot': getattr(config.trainer, 'geo_loss_weight_foot', 0.5),
+                'vel': getattr(config.trainer, 'geo_loss_weight_vel', 0.1),
+            }
+            self.logger.info(f"Geometric losses enabled with weights: {self.geo_loss_weights}")
+        else:
+            self.logger.info("Geometric losses disabled")
     
     # ----------------------------------------------------------------------
     # Main forward diffusion + loss
@@ -380,14 +392,35 @@ class HumanoidTrainingPortal(BaseTrainingPortal):
             model_output_vel = model_output[..., 1:] - model_output[..., :-1]
             target_vel = target[..., 1:] - target[..., :-1]
             loss_terms['loss_data_vel'] = self.diffusion.masked_l2(target_vel[:, :-1], model_output_vel[:, :-1], mask[..., 1:])
-    
-        # [TODO: Add FK losses here later]
+
+        # 3. Geometric losses (FK-based)
+        if self.use_geometric_losses:
+            # Prepare mask for geometric losses: [B, T]
+            geo_mask = mask.squeeze(1).squeeze(1)  # [B, 1, 1, T] -> [B, T]
+
+            # Compute geometric losses
+            geo_losses = compute_geometric_losses(
+                x_true=target,       # [B, J, feat, T]
+                x_pred=model_output,  # [B, J, feat, T]
+                rot_req=self.config.arch.rot_req,
+                mask=geo_mask,
+                weights=self.geo_loss_weights,
+                threshold=0.02,  # 2cm/s velocity threshold for foot contact
+                fps=30
+            )
+
+            # Add geometric losses to loss_terms
+            loss_terms['loss_geo_pos'] = geo_losses['loss_pos']
+            loss_terms['loss_geo_foot'] = geo_losses['loss_foot']
+            loss_terms['loss_geo_vel'] = geo_losses['loss_vel']
+
+        # Total loss
         loss_terms["loss"] = loss_terms.get('vb', 0.) + \
                         loss_terms.get('loss_data', 0.) + \
-                        loss_terms.get('loss_data_vel', 0.)# + \
-                        # loss_terms.get('loss_geo_xyz', 0) + \
-                        # loss_terms.get('loss_geo_xyz_vel', 0) + \
-                        # loss_terms.get('loss_foot_contact', 0)
+                        loss_terms.get('loss_data_vel', 0.) + \
+                        loss_terms.get('loss_geo_pos', 0.) + \
+                        loss_terms.get('loss_geo_foot', 0.) + \
+                        loss_terms.get('loss_geo_vel', 0.)
         
         return model_output.permute(0, 3, 1, 2), loss_terms
     
