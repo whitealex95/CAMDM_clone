@@ -113,62 +113,74 @@ def compute_position_loss(x_true, x_pred, rot_req='6d', mask=None):
     return loss
 
 
-def compute_foot_contact_loss(x_pred, rot_req='6d', mask=None, threshold=0.02, fps=30):
+
+def compute_foot_contact_loss(x_pred, x_gt, rot_req='6d', mask=None, vel_threshold=0.02, fps=30):
     """
-    Foot Contact Loss (L_foot): Penalizes foot sliding during contact.
+    Foot Contact Loss (L_foot): Penalizes foot sliding during contact phases.
+
+    This loss identifies contact frames using the Ground Truth (x_gt) motion,
+    and then penalizes the velocity of the Predicted (x_pred) motion during those frames.
 
     Formula:
-        L_foot = Mean over (N-1) frames of || (FK(x_pred[i+1]) - FK(x_pred[i])) * f_i ||^2
-
-    Where f_i is the binary foot contact mask (1 = contact, 0 = no contact).
+        L_foot = Mean( || Vel_pred[t] ||^2 * Mask_gt[t] )
 
     Args:
-        x_pred: [B, J, feat, T] or [B, T, J, feat] prediction
+        x_pred: [B, J, feat, T] or [B, T, J, feat] predicted motion
+        x_gt: [B, J, feat, T] or [B, T, J, feat] ground truth motion (used for mask)
         rot_req: rotation representation type
-        mask: [B, T] optional binary mask (1 = valid frame)
-        threshold: velocity threshold for contact detection (m/s)
+        mask: [B, T] optional binary validity mask (1 = valid frame)
+        vel_threshold: velocity threshold for contact detection (m/s)
         fps: frames per second
 
     Returns:
-        loss: scalar tensor
+        loss: scalar tensor representing average sliding velocity squared
     """
-    # Convert to qpos format
-    qpos_pred = model_format_to_qpos(x_pred, rot_req)  # [B, T, 36]
+    # -----------------------------------------------------------
+    # 1. Process Prediction (to get the velocity we want to penalize)
+    # -----------------------------------------------------------
+    qpos_pred = model_format_to_qpos(x_pred, rot_req)
+    pos_pred = g1_kin.forward_kinematics_g1(qpos_pred)    # [B, T, J, 3]
+    foot_pos_pred = g1_kin.extract_foot_positions(pos_pred) # [B, T, 2, 3]
 
-    # Compute FK
-    pos_pred = g1_kin.forward_kinematics_g1(qpos_pred)  # [B, T, 30, 3]
+    # Compute predicted velocity
+    # [B, T-1, 2, 3]
+    pred_velocity = (foot_pos_pred[:, 1:] - foot_pos_pred[:, :-1]) * fps
 
-    # Extract foot positions
-    foot_positions = g1_kin.extract_foot_positions(pos_pred)  # [B, T, 2, 3]
-
-    # Compute foot contact mask based on GT velocity
-    # Use GT to determine contact, but apply to prediction velocity
+    # -----------------------------------------------------------
+    # 2. Process Ground Truth (to determine WHEN we should penalize)
+    # -----------------------------------------------------------
     with torch.no_grad():
-        contact_mask = g1_kin.compute_foot_contact_mask(
-            foot_positions, threshold=threshold, fps=fps
-        )  # [B, T-1, 2]
+        qpos_gt = model_format_to_qpos(x_gt, rot_req)
+        pos_gt = g1_kin.forward_kinematics_g1(qpos_gt)
+        foot_pos_gt = g1_kin.extract_foot_positions(pos_gt)
 
-    # Compute foot velocity (predicted)
-    foot_velocity = (foot_positions[:, 1:] - foot_positions[:, :-1]) * fps  # [B, T-1, 2, 3]
+        # Compute mask based on GT stability
+        # [B, T-1, 2]
+        gt_contact_mask = g1_kin.compute_foot_contact_mask(
+            foot_pos_gt, 
+            vel_threshold=vel_threshold, 
+            fps=fps
+        )
 
-    # Apply contact mask: zero velocity when in contact
-    # contact_mask: [B, T-1, 2] -> [B, T-1, 2, 1]
-    masked_velocity = foot_velocity * contact_mask.unsqueeze(-1)  # [B, T-1, 2, 3]
+    # -----------------------------------------------------------
+    # 3. Compute Loss
+    # -----------------------------------------------------------
+    # Zero out velocity when GT says there is no contact
+    # gt_contact_mask: [B, T-1, 2] -> [B, T-1, 2, 1]
+    masked_velocity = pred_velocity * gt_contact_mask.unsqueeze(-1)
 
-    # Compute L2 loss (penalize any velocity during contact)
+    # Sum squared error over x,y,z and both feet
     loss_per_frame = (masked_velocity ** 2).sum(dim=[2, 3])  # [B, T-1]
 
-    # Apply temporal mask if provided
+    # Apply global temporal mask if provided
     if mask is not None:
-        # Mask should be [B, T], take [B, :-1] for velocity mask
-        temporal_mask = mask[:, :-1]  # [B, T-1]
+        temporal_mask = mask[:, :-1]  # Align length [B, T] -> [B, T-1]
         loss_per_frame = loss_per_frame * temporal_mask
         loss = loss_per_frame.sum() / (temporal_mask.sum() + 1e-8)
     else:
         loss = loss_per_frame.mean()
 
     return loss
-
 
 def compute_velocity_loss(x_true, x_pred, rot_req='6d', mask=None):
     """

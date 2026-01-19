@@ -124,7 +124,7 @@ contact:
   foot_keypoints: ["left_heel", "left_toe", "right_heel", "right_toe"]
 
   # Foot contact detection parameters
-  velocity_threshold: 0.02  # m/s - below this is considered contact
+  velocity_threshold: 10000  # m/s - below this is considered contact
   height_threshold: 0.05    # m - below this height is potential contact
 
   # For visualization

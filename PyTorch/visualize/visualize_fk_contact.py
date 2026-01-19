@@ -24,9 +24,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from visualize.motion_loader import MotionDataset
 from visualize.utils.geometry import draw_trajectory
-import utils.g1_kinematics as g1_kin
-from utils.robot_config import load_robot_config
-from utils.keypoints import compute_keypoints_from_qpos
+from utils.g1_kinematics import G1Kinematics
 
 
 class FKContactVisualizer:
@@ -37,8 +35,9 @@ class FKContactVisualizer:
         self.data = data
         self.dataset = dataset
 
-        # Load robot configuration
-        self.robot_config = load_robot_config("g1")
+        # Load robot kinematics (includes config)
+        self.g1_kin = G1Kinematics()
+        self.robot_config = self.g1_kin.config
 
         # Playback state
         self.current_motion_idx = 0
@@ -93,14 +92,18 @@ class FKContactVisualizer:
         qpos_sequence = np.stack(all_qpos, axis=0)
         qpos_tensor = torch.from_numpy(qpos_sequence).float().unsqueeze(0)  # [1, T, 36]
 
-        # Compute FK
+        # Compute FK, keypoints, and foot contact all in one go
         with torch.no_grad():
-            joint_positions = g1_kin.forward_kinematics_g1(qpos_tensor)  # [1, T, 30, 3]
-            foot_positions = g1_kin.extract_foot_positions(joint_positions)  # [1, T, 2, 3]
-            contact_mask = g1_kin.compute_foot_contact_mask(foot_positions, threshold=0.02)  # [1, T-1, 2]
+            # FK and keypoints
+            joint_positions, keypoints = self.g1_kin.forward_kinematics_with_keypoints(qpos_tensor)  # [1, T, 30, 3], Dict
 
-            # Compute keypoints
-            keypoints = compute_keypoints_from_qpos(qpos_tensor)  # Dict of [1, T, 3]
+            # Foot contact (uses both velocity and height thresholds from config)
+            contact_mask = self.g1_kin.compute_foot_contact(qpos_tensor, fps=self.fps)  # [1, T-1, 2]
+
+            # Extract foot positions for visualization
+            left_foot = joint_positions[..., 6, :]   # left_ankle_roll_link
+            right_foot = joint_positions[..., 12, :]  # right_ankle_roll_link
+            foot_positions = torch.stack([left_foot, right_foot], dim=-2)  # [1, T, 2, 3]
 
         # Store results
         self.fk_joint_positions = joint_positions.squeeze(0).numpy()  # [T, 30, 3]
@@ -159,16 +162,13 @@ class FKContactVisualizer:
 
         # Render each joint as a sphere
         for i, pos in enumerate(joint_pos):
-            # Color: different colors for different body parts (more transparent)
-            if i <= 12:  # Root and legs
-                color = [0.2, 0.7, 1.0, 1.0]  # Light blue, semi-transparent
-                size = 0.03
-            elif i <= 15:  # Waist
-                color = [0.7, 0.2, 1.0, 0.4]  # Purple, semi-transparent
-                size = 0.03
-            else:  # Arms
-                color = [1.0, 0.7, 0.2, 0.4]  # Orange, semi-transparent
-                size = 0.025
+            # Emphasize root, make all others subtle and uniform
+            if i == 0:  # Root
+                color = [1.0, 1.0, 0.0, 0.9]  # Bright yellow for root
+                size = 0.04
+            else:  # All other joints - subtle and uniform
+                color = [0.5, 0.5, 0.5, 0.2]  # Gray, very transparent
+                size = 0.02
 
             mujoco.mjv_initGeom(
                 scene.geoms[scene.ngeom],
@@ -192,11 +192,8 @@ class FKContactVisualizer:
         # Get FK positions for current frame
         joint_pos = self.fk_joint_positions[self.current_frame]  # [30, 3]
 
-        # Define parent indices (from g1_kinematics.py)
-        parents = [
-            -1, 0, 1, 2, 3, 4, 5, 0, 7, 8, 9, 10, 11, 0, 13, 14,
-            15, 16, 17, 18, 19, 20, 21, 15, 23, 24, 25, 26, 27, 28
-        ]
+        # Get parent indices from config
+        parents = self.g1_kin.parents
 
         # Draw lines from each joint to its parent
         for i in range(1, len(joint_pos)):
@@ -208,17 +205,8 @@ class FKContactVisualizer:
             pos_child = joint_pos[i]
             pos_parent = joint_pos[parent_idx]
 
-            # Line color based on body part
-            if i <= 6:  # Left leg
-                color = [0.3, 0.8, 1.0, 0.8]
-            elif i <= 12:  # Right leg
-                color = [1.0, 0.3, 0.8, 0.8]
-            elif i <= 15:  # Torso
-                color = [0.8, 0.8, 0.3, 0.8]
-            elif i <= 22:  # Left arm
-                color = [0.3, 1.0, 0.5, 0.8]
-            else:  # Right arm
-                color = [1.0, 0.5, 0.3, 0.8]
+            # Uniform subtle color for all skeleton lines
+            color = [0.5, 0.5, 0.5, 0.3]  # Gray, semi-transparent
 
             # Compute line direction and length
             direction = pos_child - pos_parent
@@ -245,7 +233,7 @@ class FKContactVisualizer:
             mujoco.mjv_initGeom(
                 scene.geoms[scene.ngeom],
                 type=mujoco.mjtGeom.mjGEOM_CAPSULE,
-                size=[0.008, length/2, 0],  # radius, half-length
+                size=[0.006, length/2, 0],  # radius, half-length (thinner)
                 pos=midpoint,
                 mat=rot_mat.flatten(),
                 rgba=color
@@ -464,16 +452,11 @@ def print_instruction():
     print("=" * 60)
     print("\nVisualization Legend:")
     print("  FK Joint Spheres (toggle with F):")
-    print("    - Blue spheres    : FK computed joint positions (legs)")
-    print("    - Purple spheres  : FK computed joint positions (waist)")
-    print("    - Orange spheres  : FK computed joint positions (arms)")
+    print("    - Yellow sphere   : Root joint (pelvis)")
+    print("    - Gray spheres    : All other joints (subtle)")
     print("  FK Skeleton Wireframe (toggle with K):")
-    print("    - Cyan lines      : Left leg connections")
-    print("    - Pink lines      : Right leg connections")
-    print("    - Yellow lines    : Torso connections")
-    print("    - Green lines     : Left arm connections")
-    print("    - Orange lines    : Right arm connections")
-    print("  Keypoints (toggle with P):")
+    print("    - Gray lines      : Skeleton connections (subtle)")
+    print("  Keypoints (toggle with P) - EMPHASIZED:")
     print("    - Bright green    : Left hand")
     print("    - Bright orange   : Right hand")
     print("    - Yellow          : Head")
