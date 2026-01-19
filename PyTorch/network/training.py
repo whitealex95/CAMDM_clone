@@ -405,7 +405,7 @@ class HumanoidTrainingPortal(BaseTrainingPortal):
                 rot_req=self.config.arch.rot_req,
                 mask=geo_mask,
                 weights=self.geo_loss_weights,
-                threshold=0.02,  # 2cm/s velocity threshold for foot contact
+                vel_threshold=0.05,  # 5cm/s velocity threshold for foot contact
                 fps=30
             )
 
