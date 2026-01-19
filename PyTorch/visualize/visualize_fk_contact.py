@@ -94,11 +94,32 @@ class FKContactVisualizer:
 
         # Compute FK, keypoints, and foot contact all in one go
         with torch.no_grad():
-            # FK and keypoints
-            joint_positions, keypoints = self.g1_kin.forward_kinematics_with_keypoints(qpos_tensor)  # [1, T, 30, 3], Dict
+            # FK with rotations (needed for keypoints)
+            joint_positions, joint_rotations = self.g1_kin.forward_kinematics(qpos_tensor, return_rotations=True)
 
-            # Foot contact (uses both velocity and height thresholds from config)
-            contact_mask = self.g1_kin.compute_foot_contact(qpos_tensor, fps=self.fps)  # [1, T-1, 2]
+            # Keypoints using pre-computed FK
+            keypoints = self.g1_kin.compute_keypoints(joint_positions, joint_rotations)
+
+            # Foot contact: use OR logic (contact if either ankle OR heel is in contact)
+            # Ankle positions from joint positions
+            ankle_pos = torch.stack([joint_positions[..., 6, :], joint_positions[..., 12, :]], dim=-2)
+            contact_ankle = self.g1_kin.compute_contact_from_positions(
+                ankle_pos, vel_threshold=0.5, fps=self.fps
+            )  # [1, T-1, 2]
+            
+            toe_pos = torch.stack([keypoints["left_toe"], keypoints["right_toe"]], dim=-2)
+            contact_toe = self.g1_kin.compute_contact_from_positions(
+                toe_pos, vel_threshold=0.5, fps=self.fps
+            )  # [1, T-1, 2]
+            
+            # Heel positions from keypoints
+            heel_pos = torch.stack([keypoints["left_heel"], keypoints["right_heel"]], dim=-2)
+            contact_heel = self.g1_kin.compute_contact_from_positions(
+                heel_pos, vel_threshold=0.5, fps=self.fps
+            )  # [1, T-1, 2]
+
+            # OR logic: contact if either ankle, toe, or heel is in contact
+            contact_mask = torch.clamp(contact_ankle + contact_toe + contact_heel, 0, 1)  # [1, T-1, 2]
 
             # Extract foot positions for visualization
             left_foot = joint_positions[..., 6, :]   # left_ankle_roll_link
@@ -150,6 +171,7 @@ class FKContactVisualizer:
                 self.current_frame = 0
 
             self.update_pose()
+            print(self.foot_contact_mask[self.current_frame])
             self.last_update_time = current_time
 
     def render_fk_joints(self, scene):

@@ -188,57 +188,63 @@ class G1Kinematics:
         keypoints = self.compute_keypoints(positions, rotations, keypoint_names)
         return positions, keypoints
 
-    def compute_foot_contact(self, qpos, vel_threshold=None, height_threshold=None, fps=30):
+    @staticmethod
+    def compute_contact_from_positions(positions, vel_threshold, height_threshold=None, fps=30):
         """
-        Compute foot contact mask from qpos using velocity and/or height thresholds.
+        Compute contact mask from point positions using velocity and/or height thresholds.
+
+        This is the core contact detection function. Pre-compute positions (from FK or keypoints)
+        and pass them directly for optimal performance.
 
         Args:
-            qpos: [B, T, 36] or [T, 36] joint configuration over time
-            vel_threshold: Velocity threshold in m/s (None = use config default)
-            height_threshold: Height threshold in m (None = use config default)
+            positions: [B, T, N, 3] or [T, N, 3] point positions over time
+                       where N is the number of points to track
+            vel_threshold: Velocity threshold in m/s (use np.inf to disable)
+            height_threshold: Height threshold in m (use np.inf or None to disable)
             fps: Frames per second for velocity computation
 
         Returns:
-            contact_mask: [..., T-1, 2] binary mask (1 = contact) for [left_foot, right_foot]
+            contact_mask: [..., T-1, N] binary mask (1 = contact)
+
+        Example usage:
+            # Compute FK and keypoints once
+            positions, rotations = g1_kin.forward_kinematics(qpos, return_rotations=True)
+            keypoints = g1_kin.compute_keypoints(positions, rotations)
+
+            # Ankle contact from joint positions
+            ankle_pos = torch.stack([positions[..., 6, :], positions[..., 12, :]], dim=-2)
+            contact_ankle = G1Kinematics.compute_contact_from_positions(ankle_pos, vel_threshold=0.2)
+
+            # Heel contact from keypoints
+            heel_pos = torch.stack([keypoints["left_heel"], keypoints["right_heel"]], dim=-2)
+            contact_heel = G1Kinematics.compute_contact_from_positions(heel_pos, vel_threshold=0.2)
+
+            # Combined contact (OR logic)
+            contact = torch.clamp(contact_ankle + contact_heel, 0, 1)
         """
-        # Use config defaults if not specified
-        if vel_threshold is None:
-            vel_threshold = self.config.contact_velocity_threshold
-        if height_threshold is None:
-            height_threshold = self.config.contact_height_threshold
-
         # Handle different input shapes
-        original_ndim = qpos.ndim
-        if qpos.ndim == 2:
-            qpos = qpos.unsqueeze(0)  # [T, 36] -> [1, T, 36]
+        original_ndim = positions.ndim
+        if positions.ndim == 3:
+            positions = positions.unsqueeze(0)  # [T, N, 3] -> [1, T, N, 3]
 
-        # Compute FK to get joint positions
-        joint_positions = self.forward_kinematics(qpos)  # [B, T, 30, 3]
-
-        # Extract foot positions (left_ankle_roll=6, right_ankle_roll=12)
-        left_foot = joint_positions[..., 6, :]   # [B, T, 3]
-        right_foot = joint_positions[..., 12, :]  # [B, T, 3]
-        foot_positions = torch.stack([left_foot, right_foot], dim=-2)  # [B, T, 2, 3]
-
-        # Initialize contact mask
-        B, T = foot_positions.shape[0], foot_positions.shape[1]
-        contact_mask = torch.ones(B, T-1, 2, device=qpos.device, dtype=torch.float32)
+        B, T, N, _ = positions.shape
+        contact_mask = torch.ones(B, T-1, N, device=positions.device, dtype=torch.float32)
 
         # Apply velocity threshold if specified
         if vel_threshold is not None and vel_threshold > 0:
-            velocity = (foot_positions[:, 1:] - foot_positions[:, :-1]) * fps  # [B, T-1, 2, 3]
-            vel_magnitude = torch.norm(velocity, dim=-1)  # [B, T-1, 2]
+            velocity = (positions[:, 1:] - positions[:, :-1]) * fps  # [B, T-1, N, 3]
+            vel_magnitude = torch.norm(velocity, dim=-1)  # [B, T-1, N]
             vel_contact = (vel_magnitude < vel_threshold).float()
             contact_mask = contact_mask * vel_contact
 
         # Apply height threshold if specified
         if height_threshold is not None and height_threshold > 0:
-            foot_heights = foot_positions[:, 1:, :, 2]  # [B, T-1, 2] (z coordinate)
-            height_contact = (foot_heights < height_threshold).float()
+            heights = positions[:, 1:, :, 2]  # [B, T-1, N] (z coordinate)
+            height_contact = (heights < height_threshold).float()
             contact_mask = contact_mask * height_contact
 
-        # Remove batch dimension if input was 2D
-        if original_ndim == 2:
+        # Remove batch dimension if input was 3D
+        if original_ndim == 3:
             contact_mask = contact_mask.squeeze(0)
 
         return contact_mask
@@ -323,10 +329,38 @@ if __name__ == "__main__":
     joint_pos, kps = g1_kin.forward_kinematics_with_keypoints(qpos)
     print(f"\n✓ Combined FK+keypoints: {len(kps)} keypoints")
 
-    # Test foot contact
-    contact_mask = g1_kin.compute_foot_contact(qpos)
-    print(f"\n✓ Foot contact: {contact_mask.shape}")
-    print(f"  Contact ratio: L={contact_mask[..., 0].mean():.1%}, R={contact_mask[..., 1].mean():.1%}")
+    # Test contact detection using pre-computed positions
+    # Ankle contact from joint positions
+    ankle_pos = torch.stack([positions[..., 6, :], positions[..., 12, :]], dim=-2)  # [B, T, 2, 3]
+    contact_ankle = G1Kinematics.compute_contact_from_positions(ankle_pos, vel_threshold=0.2)
+    print(f"\n✓ Ankle contact: {contact_ankle.shape}")
+    print(f"  Contact ratio: L={contact_ankle[..., 0].mean():.1%}, R={contact_ankle[..., 1].mean():.1%}")
+
+    # Heel contact from keypoints
+    heel_pos = torch.stack([keypoints["left_heel"], keypoints["right_heel"]], dim=-2)  # [B, T, 2, 3]
+    contact_heel = G1Kinematics.compute_contact_from_positions(heel_pos, vel_threshold=0.2)
+    print(f"\n✓ Heel contact: {contact_heel.shape}")
+    print(f"  Contact ratio: L={contact_heel[..., 0].mean():.1%}, R={contact_heel[..., 1].mean():.1%}")
+
+    # Toe contact from keypoints
+    toe_pos = torch.stack([keypoints["left_toe"], keypoints["right_toe"]], dim=-2)  # [B, T, 2, 3]
+    contact_toe = G1Kinematics.compute_contact_from_positions(toe_pos, vel_threshold=0.2)
+    print(f"\n✓ Toe contact: {contact_toe.shape}")
+    print(f"  Contact ratio: L={contact_toe[..., 0].mean():.1%}, R={contact_toe[..., 1].mean():.1%}")
+
+    # Combined contact (OR logic: contact if either ankle OR heel is in contact)
+    contact_combined = torch.clamp(contact_ankle + contact_heel, 0, 1)
+    print(f"\n✓ Combined ankle+heel contact (OR logic): {contact_combined.shape}")
+    print(f"  Contact ratio: L={contact_combined[..., 0].mean():.1%}, R={contact_combined[..., 1].mean():.1%}")
+
+    # Arbitrary keypoints contact
+    all_foot_pos = torch.stack([
+        keypoints["left_heel"], keypoints["right_heel"],
+        keypoints["left_toe"], keypoints["right_toe"]
+    ], dim=-2)  # [B, T, 4, 3]
+    contact_all = G1Kinematics.compute_contact_from_positions(all_foot_pos, vel_threshold=0.2)
+    print(f"\n✓ All foot keypoints contact (4 points): {contact_all.shape}")
+    print(f"  Contact ratio: {[f'{contact_all[..., i].mean():.1%}' for i in range(4)]}")
 
     print("\n" + "=" * 80)
     print("All tests passed!")

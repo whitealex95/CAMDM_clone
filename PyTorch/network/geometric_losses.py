@@ -14,7 +14,7 @@ Reference model format:
 
 import torch
 import torch.nn.functional as F
-import utils.g1_kinematics as g1_kin
+from utils.g1_kinematics import G1Kinematics
 import utils.nn_transforms as nn_transforms
 
 
@@ -71,32 +71,21 @@ def model_format_to_qpos(model_output, rot_req='6d'):
     return qpos
 
 
-def compute_position_loss(x_true, x_pred, rot_req='6d', mask=None):
+def compute_position_loss(pos_pred, pos_true, mask=None):
     """
     Position Loss (L_pos): MSE between FK-transformed GT and prediction.
 
     Formula:
-        L_pos = Mean over N frames of || FK(x_true) - FK(x_pred) ||^2
+        L_pos = Mean over N frames of || pos_true - pos_pred ||^2
 
     Args:
-        x_true: [B, J, feat, T] or [B, T, J, feat] ground truth
-        x_pred: [B, J, feat, T] or [B, T, J, feat] prediction
-        rot_req: rotation representation type
+        pos_pred: [B, T, 30, 3] predicted joint positions from FK
+        pos_true: [B, T, 30, 3] ground truth joint positions from FK
         mask: [B, T] optional binary mask (1 = valid frame)
 
     Returns:
         loss: scalar tensor
     """
-    # Convert to qpos format
-    qpos_true = model_format_to_qpos(x_true, rot_req)  # [B, T, 36]
-    qpos_pred = model_format_to_qpos(x_pred, rot_req)  # [B, T, 36]
-
-    # Compute FK
-    with torch.no_grad() if x_true.requires_grad else torch.enable_grad():
-        pos_true = g1_kin.forward_kinematics_g1(qpos_true)  # [B, T, 30, 3]
-
-    pos_pred = g1_kin.forward_kinematics_g1(qpos_pred)  # [B, T, 30, 3]
-
     # Compute MSE
     mse = F.mse_loss(pos_pred, pos_true, reduction='none')  # [B, T, 30, 3]
 
@@ -114,57 +103,29 @@ def compute_position_loss(x_true, x_pred, rot_req='6d', mask=None):
 
 
 
-def compute_foot_contact_loss(x_pred, x_gt, rot_req='6d', mask=None, vel_threshold=0.02, fps=30):
+def compute_foot_contact_loss(foot_pos_pred, gt_contact_mask, mask=None, fps=30):
     """
     Foot Contact Loss (L_foot): Penalizes foot sliding during contact phases.
 
-    This loss identifies contact frames using the Ground Truth (x_gt) motion,
-    and then penalizes the velocity of the Predicted (x_pred) motion during those frames.
+    This loss penalizes the velocity of the Predicted foot positions during
+    contact frames identified by the GT contact mask.
 
     Formula:
         L_foot = Mean( || Vel_pred[t] ||^2 * Mask_gt[t] )
 
     Args:
-        x_pred: [B, J, feat, T] or [B, T, J, feat] predicted motion
-        x_gt: [B, J, feat, T] or [B, T, J, feat] ground truth motion (used for mask)
-        rot_req: rotation representation type
+        foot_pos_pred: [B, T, 2, 3] predicted foot positions (left, right)
+        gt_contact_mask: [B, T-1, 2] ground truth contact mask
         mask: [B, T] optional binary validity mask (1 = valid frame)
-        vel_threshold: velocity threshold for contact detection (m/s)
         fps: frames per second
 
     Returns:
         loss: scalar tensor representing average sliding velocity squared
     """
-    # -----------------------------------------------------------
-    # 1. Process Prediction (to get the velocity we want to penalize)
-    # -----------------------------------------------------------
-    qpos_pred = model_format_to_qpos(x_pred, rot_req)
-    pos_pred = g1_kin.forward_kinematics_g1(qpos_pred)    # [B, T, J, 3]
-    foot_pos_pred = g1_kin.extract_foot_positions(pos_pred) # [B, T, 2, 3]
-
-    # Compute predicted velocity
+    # Compute predicted foot velocity
     # [B, T-1, 2, 3]
     pred_velocity = (foot_pos_pred[:, 1:] - foot_pos_pred[:, :-1]) * fps
 
-    # -----------------------------------------------------------
-    # 2. Process Ground Truth (to determine WHEN we should penalize)
-    # -----------------------------------------------------------
-    with torch.no_grad():
-        qpos_gt = model_format_to_qpos(x_gt, rot_req)
-        pos_gt = g1_kin.forward_kinematics_g1(qpos_gt)
-        foot_pos_gt = g1_kin.extract_foot_positions(pos_gt)
-
-        # Compute mask based on GT stability
-        # [B, T-1, 2]
-        gt_contact_mask = g1_kin.compute_foot_contact_mask(
-            foot_pos_gt, 
-            vel_threshold=vel_threshold, 
-            fps=fps
-        )
-
-    # -----------------------------------------------------------
-    # 3. Compute Loss
-    # -----------------------------------------------------------
     # Zero out velocity when GT says there is no contact
     # gt_contact_mask: [B, T-1, 2] -> [B, T-1, 2, 1]
     masked_velocity = pred_velocity * gt_contact_mask.unsqueeze(-1)
@@ -182,55 +143,14 @@ def compute_foot_contact_loss(x_pred, x_gt, rot_req='6d', mask=None, vel_thresho
 
     return loss
 
-def compute_velocity_loss(x_true, x_pred, rot_req='6d', mask=None):
-    """
-    Velocity Loss (L_vel): Ensures similar temporal dynamics between GT and prediction.
-
-    Formula:
-        L_vel = Mean over (N-1) frames of || (x_true[i+1] - x_true[i]) - (x_pred[i+1] - x_pred[i]) ||^2
-
-    Args:
-        x_true: [B, J, feat, T] or [B, T, J, feat] ground truth
-        x_pred: [B, J, feat, T] or [B, T, J, feat] prediction
-        rot_req: rotation representation type (not used, operates directly on representation)
-        mask: [B, T] optional binary mask (1 = valid frame)
-
-    Returns:
-        loss: scalar tensor
-    """
-    # Normalize input format to [B, T, J, feat]
-    if x_true.dim() == 4 and x_true.shape[1] != x_true.shape[3]:
-        if x_true.shape[1] < x_true.shape[3]:  # [B, J, feat, T]
-            x_true = x_true.permute(0, 3, 1, 2)  # [B, T, J, feat]
-            x_pred = x_pred.permute(0, 3, 1, 2)
-
-    B, T, J, feat = x_true.shape
-
-    # Compute velocities (finite differences)
-    vel_true = x_true[:, 1:] - x_true[:, :-1]  # [B, T-1, J, feat]
-    vel_pred = x_pred[:, 1:] - x_pred[:, :-1]  # [B, T-1, J, feat]
-
-    # Compute MSE between velocities
-    mse = F.mse_loss(vel_pred, vel_true, reduction='none')  # [B, T-1, J, feat]
-
-    # Average over joints and features
-    mse = mse.mean(dim=[2, 3])  # [B, T-1]
-
-    # Apply mask if provided
-    if mask is not None:
-        temporal_mask = mask[:, :-1]  # [B, T-1]
-        mse = mse * temporal_mask
-        loss = mse.sum() / (temporal_mask.sum() + 1e-8)
-    else:
-        loss = mse.mean()
-
-    return loss
 
 
 def compute_geometric_losses(x_true, x_pred, rot_req='6d', mask=None,
-                             weights=None, threshold=0.02, fps=30):
+                             weights=None, vel_threshold=0.02, fps=30, g1_kin=None):
     """
     Compute all geometric losses and return as a dictionary.
+
+    Efficiently computes FK only once and reuses results for all losses.
 
     Args:
         x_true: [B, J, feat, T] or [B, T, J, feat] ground truth
@@ -238,8 +158,9 @@ def compute_geometric_losses(x_true, x_pred, rot_req='6d', mask=None,
         rot_req: rotation representation type
         mask: [B, T] optional binary mask (1 = valid frame)
         weights: dict with keys 'pos', 'foot', 'vel' for loss weighting
-        threshold: velocity threshold for foot contact (m/s)
+        vel_threshold: velocity threshold for foot contact (m/s)
         fps: frames per second
+        g1_kin: G1Kinematics instance (optional, creates new if None)
 
     Returns:
         losses: dict with keys 'loss_pos', 'loss_foot', 'loss_vel', 'loss_total'
@@ -247,23 +168,60 @@ def compute_geometric_losses(x_true, x_pred, rot_req='6d', mask=None,
     if weights is None:
         weights = {'pos': 1.0, 'foot': 0.5, 'vel': 0.1}
 
+    # Create kinematics instance if not provided
+    if g1_kin is None:
+        g1_kin = G1Kinematics()
+
     losses = {}
+
+    # Convert to qpos format once
+    qpos_true = model_format_to_qpos(x_true, rot_req)  # [B, T, 36]
+    qpos_pred = model_format_to_qpos(x_pred, rot_req)  # [B, T, 36]
+
+    # Compute FK once for both true and pred
+    with torch.no_grad():
+        pos_true = g1_kin.forward_kinematics(qpos_true)  # [B, T, 30, 3]
+    pos_pred = g1_kin.forward_kinematics(qpos_pred)  # [B, T, 30, 3]
+
+    # Extract foot positions once
+    # left_ankle_roll=6, right_ankle_roll=12
+    foot_pos_pred = torch.stack([pos_pred[..., 6, :], pos_pred[..., 12, :]], dim=-2)  # [B, T, 2, 3]
 
     # Position loss
     if weights.get('pos', 0) > 0:
-        losses['loss_pos'] = compute_position_loss(x_true, x_pred, rot_req, mask)
+        losses['loss_pos'] = compute_position_loss(pos_pred, pos_true, mask)
     else:
         losses['loss_pos'] = torch.tensor(0.0, device=x_pred.device)
 
     # Foot contact loss
     if weights.get('foot', 0) > 0:
-        losses['loss_foot'] = compute_foot_contact_loss(x_pred, rot_req, mask, threshold, fps)
+        # Compute GT contact mask using pre-computed FK positions
+        with torch.no_grad():
+            foot_pos_true = torch.stack([pos_true[..., 6, :], pos_true[..., 12, :]], dim=-2)  # [B, T, 2, 3]
+            gt_contact_mask = g1_kin.compute_contact_from_positions(
+                foot_pos_true, vel_threshold=vel_threshold, fps=fps
+            )  # [B, T-1, 2]
+        losses['loss_foot'] = compute_foot_contact_loss(foot_pos_pred, gt_contact_mask, mask, fps)
     else:
         losses['loss_foot'] = torch.tensor(0.0, device=x_pred.device)
 
-    # Velocity loss
+    # Velocity loss (computed on FK positions, not raw representation)
     if weights.get('vel', 0) > 0:
-        losses['loss_vel'] = compute_velocity_loss(x_true, x_pred, rot_req, mask)
+        # Compute velocities from FK positions
+        vel_true = pos_true[:, 1:] - pos_true[:, :-1]  # [B, T-1, 30, 3]
+        vel_pred = pos_pred[:, 1:] - pos_pred[:, :-1]  # [B, T-1, 30, 3]
+
+        # MSE between velocities
+        mse = F.mse_loss(vel_pred, vel_true, reduction='none')  # [B, T-1, 30, 3]
+        mse = mse.mean(dim=[2, 3])  # [B, T-1]
+
+        # Apply mask if provided
+        if mask is not None:
+            temporal_mask = mask[:, :-1]  # [B, T-1]
+            mse = mse * temporal_mask
+            losses['loss_vel'] = mse.sum() / (temporal_mask.sum() + 1e-8)
+        else:
+            losses['loss_vel'] = mse.mean()
     else:
         losses['loss_vel'] = torch.tensor(0.0, device=x_pred.device)
 
@@ -315,32 +273,8 @@ def test_losses():
     print(f"  mask: {mask.shape}")
     print()
 
-    # Test position loss
-    print("Testing Position Loss...")
-    loss_pos = compute_position_loss(x_true, x_pred, rot_req='6d', mask=mask)
-    print(f"  Loss: {loss_pos.item():.6f}")
-    assert loss_pos.item() >= 0, "Position loss must be non-negative"
-    print("  ✓ Position loss computed")
-    print()
-
-    # Test foot contact loss
-    print("Testing Foot Contact Loss...")
-    loss_foot = compute_foot_contact_loss(x_pred, rot_req='6d', mask=mask)
-    print(f"  Loss: {loss_foot.item():.6f}")
-    assert loss_foot.item() >= 0, "Foot contact loss must be non-negative"
-    print("  ✓ Foot contact loss computed")
-    print()
-
-    # Test velocity loss
-    print("Testing Velocity Loss...")
-    loss_vel = compute_velocity_loss(x_true, x_pred, rot_req='6d', mask=mask)
-    print(f"  Loss: {loss_vel.item():.6f}")
-    assert loss_vel.item() >= 0, "Velocity loss must be non-negative"
-    print("  ✓ Velocity loss computed")
-    print()
-
-    # Test combined losses
-    print("Testing Combined Losses...")
+    # Test combined losses (this now computes FK only once)
+    print("Testing Combined Losses (efficient FK computation)...")
     losses = compute_geometric_losses(
         x_true, x_pred, rot_req='6d', mask=mask,
         weights={'pos': 1.0, 'foot': 0.5, 'vel': 0.1}
@@ -349,7 +283,10 @@ def test_losses():
     print(f"  Foot Contact: {losses['loss_foot'].item():.6f}")
     print(f"  Velocity: {losses['loss_vel'].item():.6f}")
     print(f"  Total: {losses['loss_total'].item():.6f}")
-    print("  ✓ Combined losses computed")
+    assert losses['loss_pos'].item() >= 0, "Position loss must be non-negative"
+    assert losses['loss_foot'].item() >= 0, "Foot contact loss must be non-negative"
+    assert losses['loss_vel'].item() >= 0, "Velocity loss must be non-negative"
+    print("  ✓ Combined losses computed (FK called only once)")
     print()
 
     # Test gradient flow
