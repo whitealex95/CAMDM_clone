@@ -329,6 +329,8 @@ class HumanoidTrainingPortal(BaseTrainingPortal):
         # Geometric loss settings
         self.use_geometric_losses = getattr(config.trainer, 'use_geometric_losses', False)
         if self.use_geometric_losses:
+            from utils.g1_kinematics import G1Kinematics
+            self.g1_kin = G1Kinematics()
             self.geo_loss_weights = {
                 'pos': getattr(config.trainer, 'geo_loss_weight_pos', 1.0),
                 'foot': getattr(config.trainer, 'geo_loss_weight_foot', 0.5),
@@ -336,6 +338,7 @@ class HumanoidTrainingPortal(BaseTrainingPortal):
             }
             self.logger.info(f"Geometric losses enabled with weights: {self.geo_loss_weights}")
         else:
+            self.g1_kin = None
             self.logger.info("Geometric losses disabled")
     
     # ----------------------------------------------------------------------
@@ -406,7 +409,8 @@ class HumanoidTrainingPortal(BaseTrainingPortal):
                 mask=geo_mask,
                 weights=self.geo_loss_weights,
                 vel_threshold=0.05,  # 5cm/s velocity threshold for foot contact
-                fps=30
+                fps=30,
+                g1_kin=self.g1_kin
             )
 
             # Add geometric losses to loss_terms
