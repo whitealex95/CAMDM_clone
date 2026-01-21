@@ -332,9 +332,9 @@ class HumanoidTrainingPortal(BaseTrainingPortal):
             from utils.g1_kinematics import G1Kinematics
             self.g1_kin = G1Kinematics()
             self.geo_loss_weights = {
-                'pos': getattr(config.trainer, 'geo_loss_weight_pos', 1.0),
-                'foot': getattr(config.trainer, 'geo_loss_weight_foot', 0.5),
-                'vel': getattr(config.trainer, 'geo_loss_weight_vel', 0.1),
+                'geo_loss_weight_pos': getattr(config.trainer, 'geo_loss_weight_pos', 0.1),
+                'geo_loss_weight_vel': getattr(config.trainer, 'geo_loss_weight_vel', 0.1),
+                'geo_loss_weight_foot': getattr(config.trainer, 'geo_loss_weight_foot', 0.1),
             }
             self.logger.info(f"Geometric losses enabled with weights: {self.geo_loss_weights}")
         else:
@@ -414,9 +414,9 @@ class HumanoidTrainingPortal(BaseTrainingPortal):
             )
 
             # Add geometric losses to loss_terms
-            loss_terms['loss_geo_pos'] = geo_losses['loss_pos']
-            loss_terms['loss_geo_foot'] = geo_losses['loss_foot']
-            loss_terms['loss_geo_vel'] = geo_losses['loss_vel']
+            loss_terms['loss_geo_pos'] = geo_losses['loss_geo_pos'] * self.geo_loss_weights['geo_loss_weight_pos']
+            loss_terms['loss_geo_foot'] = geo_losses['loss_geo_foot'] * self.geo_loss_weights['geo_loss_weight_foot']
+            loss_terms['loss_geo_vel'] = geo_losses['loss_geo_vel'] * self.geo_loss_weights['geo_loss_weight_vel']
 
         # Total loss
         loss_terms["loss"] = loss_terms.get('vb', 0.) + \

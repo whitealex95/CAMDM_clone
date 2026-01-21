@@ -84,20 +84,21 @@ def compute_position_loss(pos_pred, pos_true, mask=None):
         mask: [B, T] optional binary mask (1 = valid frame)
 
     Returns:
-        loss: scalar tensor
+        loss: [B,] tensor representing average position loss per batch element
     """
     # Compute MSE
     mse = F.mse_loss(pos_pred, pos_true, reduction='none')  # [B, T, 30, 3]
 
-    # Average over joints and spatial dimensions
+    # Average over joints and spatial dimensions -> [B, T]
     mse = mse.mean(dim=[2, 3])  # [B, T]
 
     # Apply mask if provided
     if mask is not None:
-        mse = mse * mask
-        loss = mse.sum() / (mask.sum() + 1e-8)
+        mse = mse * mask  # [B, T]
+        # Average over time per batch element
+        loss = mse.sum(dim=1) / (mask.sum(dim=1) + 1e-8)  # [B,]
     else:
-        loss = mse.mean()
+        loss = mse.mean(dim=1)  # [B,]
 
     return loss
 
@@ -120,7 +121,7 @@ def compute_foot_contact_loss(foot_pos_pred, gt_contact_mask, mask=None, fps=30)
         fps: frames per second
 
     Returns:
-        loss: scalar tensor representing average sliding velocity squared
+        loss: [B,] tensor representing average sliding velocity squared per batch element
     """
     # Compute predicted foot velocity
     # [B, T-1, 2, 3]
@@ -130,16 +131,17 @@ def compute_foot_contact_loss(foot_pos_pred, gt_contact_mask, mask=None, fps=30)
     # gt_contact_mask: [B, T-1, 2] -> [B, T-1, 2, 1]
     masked_velocity = pred_velocity * gt_contact_mask.unsqueeze(-1)
 
-    # Sum squared error over x,y,z and both feet
+    # Sum squared error over x,y,z and both feet -> [B, T-1]
     loss_per_frame = (masked_velocity ** 2).sum(dim=[2, 3])  # [B, T-1]
 
     # Apply global temporal mask if provided
     if mask is not None:
         temporal_mask = mask[:, :-1]  # Align length [B, T] -> [B, T-1]
         loss_per_frame = loss_per_frame * temporal_mask
-        loss = loss_per_frame.sum() / (temporal_mask.sum() + 1e-8)
+        # Average over time per batch element
+        loss = loss_per_frame.sum(dim=1) / (temporal_mask.sum(dim=1) + 1e-8)  # [B,]
     else:
-        loss = loss_per_frame.mean()
+        loss = loss_per_frame.mean(dim=1)  # [B,]
 
     return loss
 
@@ -163,16 +165,19 @@ def compute_geometric_losses(x_true, x_pred, rot_req='6d', mask=None,
         g1_kin: G1Kinematics instance (optional, creates new if None)
 
     Returns:
-        losses: dict with keys 'loss_pos', 'loss_foot', 'loss_vel', 'loss_total'
+        losses: dict with keys 'geo_loss_weight_pos', 'geo_loss_weight_vel', 'geo_loss_weight_foot'
     """
     if weights is None:
-        weights = {'pos': 1.0, 'foot': 0.5, 'vel': 0.1}
+        weights = {'geo_loss_weight_pos': 1.0, 'geo_loss_weight_foot': 0.5, 'geo_loss_weight_vel': 0.1}
 
     # Create kinematics instance if not provided
     if g1_kin is None:
         g1_kin = G1Kinematics()
 
     losses = {}
+
+    # Get batch size
+    B = x_pred.shape[0]
 
     # Convert to qpos format once
     qpos_true = model_format_to_qpos(x_true, rot_req)  # [B, T, 36]
@@ -188,25 +193,25 @@ def compute_geometric_losses(x_true, x_pred, rot_req='6d', mask=None,
     foot_pos_pred = torch.stack([pos_pred[..., 6, :], pos_pred[..., 12, :]], dim=-2)  # [B, T, 2, 3]
 
     # Position loss
-    if weights.get('pos', 0) > 0:
-        losses['loss_pos'] = compute_position_loss(pos_pred, pos_true, mask)
+    if weights.get('geo_loss_weight_pos', 0) > 0:
+        losses['loss_geo_pos'] = compute_position_loss(pos_pred, pos_true, mask)
     else:
-        losses['loss_pos'] = torch.tensor(0.0, device=x_pred.device)
+        losses['loss_geo_pos'] = torch.zeros(B, device=x_pred.device)
 
     # Foot contact loss
-    if weights.get('foot', 0) > 0:
+    if weights.get('geo_loss_weight_foot', 0) > 0:
         # Compute GT contact mask using pre-computed FK positions
         with torch.no_grad():
             foot_pos_true = torch.stack([pos_true[..., 6, :], pos_true[..., 12, :]], dim=-2)  # [B, T, 2, 3]
             gt_contact_mask = g1_kin.compute_contact_from_positions(
                 foot_pos_true, vel_threshold=vel_threshold, fps=fps
             )  # [B, T-1, 2]
-        losses['loss_foot'] = compute_foot_contact_loss(foot_pos_pred, gt_contact_mask, mask, fps)
+        losses['loss_geo_foot'] = compute_foot_contact_loss(foot_pos_pred, gt_contact_mask, mask, fps)
     else:
-        losses['loss_foot'] = torch.tensor(0.0, device=x_pred.device)
+        losses['loss_geo_foot'] = torch.zeros(B, device=x_pred.device)
 
     # Velocity loss (computed on FK positions, not raw representation)
-    if weights.get('vel', 0) > 0:
+    if weights.get('geo_loss_weight_vel', 0) > 0:
         # Compute velocities from FK positions
         vel_true = pos_true[:, 1:] - pos_true[:, :-1]  # [B, T-1, 30, 3]
         vel_pred = pos_pred[:, 1:] - pos_pred[:, :-1]  # [B, T-1, 30, 3]
@@ -219,18 +224,12 @@ def compute_geometric_losses(x_true, x_pred, rot_req='6d', mask=None,
         if mask is not None:
             temporal_mask = mask[:, :-1]  # [B, T-1]
             mse = mse * temporal_mask
-            losses['loss_vel'] = mse.sum() / (temporal_mask.sum() + 1e-8)
+            # Average over time per batch element
+            losses['loss_geo_vel'] = mse.sum(dim=1) / (temporal_mask.sum(dim=1) + 1e-8)  # [B,]
         else:
-            losses['loss_vel'] = mse.mean()
+            losses['loss_geo_vel'] = mse.mean(dim=1)  # [B,]
     else:
-        losses['loss_vel'] = torch.tensor(0.0, device=x_pred.device)
-
-    # Total weighted loss
-    losses['loss_total'] = (
-        weights.get('pos', 0) * losses['loss_pos'] +
-        weights.get('foot', 0) * losses['loss_foot'] +
-        weights.get('vel', 0) * losses['loss_vel']
-    )
+        losses['loss_geo_vel'] = torch.zeros(B, device=x_pred.device)
 
     return losses
 
