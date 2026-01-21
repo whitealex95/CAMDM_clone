@@ -396,24 +396,23 @@ class HumanoidTrainingPortal(BaseTrainingPortal):
             target_vel = target[..., 1:] - target[..., :-1]
             loss_terms['loss_data_vel'] = self.diffusion.masked_l2(target_vel[:, :-1], model_output_vel[:, :-1], mask[..., 1:])
 
-        # 3. Geometric losses (FK-based)
+        # 3. Geometric losses (FK-based, aligned with MotionTrainingPortal)
         if self.use_geometric_losses:
             # Prepare mask for geometric losses: [B, T]
             geo_mask = mask.squeeze(1).squeeze(1)  # [B, 1, 1, T] -> [B, T]
 
-            # Compute geometric losses
+            # Compute geometric losses (vel_threshold=0.01 matches MotionTrainingPortal)
             geo_losses = compute_geometric_losses(
                 x_true=target,       # [B, J, feat, T]
                 x_pred=model_output,  # [B, J, feat, T]
                 rot_req=self.config.arch.rot_req,
                 mask=geo_mask,
                 weights=self.geo_loss_weights,
-                vel_threshold=0.05,  # 5cm/s velocity threshold for foot contact
-                fps=30,
+                vel_threshold=0.01,  # Matches MotionTrainingPortal
                 g1_kin=self.g1_kin
             )
 
-            # Add geometric losses to loss_terms
+            # Add geometric losses to loss_terms (weights applied here only, not inside compute_geometric_losses)
             loss_terms['loss_geo_pos'] = geo_losses['loss_geo_pos'] * self.geo_loss_weights['geo_loss_weight_pos']
             loss_terms['loss_geo_foot'] = geo_losses['loss_geo_foot'] * self.geo_loss_weights['geo_loss_weight_foot']
             loss_terms['loss_geo_vel'] = geo_losses['loss_geo_vel'] * self.geo_loss_weights['geo_loss_weight_vel']

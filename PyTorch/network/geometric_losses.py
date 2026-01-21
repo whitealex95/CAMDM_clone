@@ -104,54 +104,59 @@ def compute_position_loss(pos_pred, pos_true, mask=None):
 
 
 
-def compute_foot_contact_loss(foot_pos_pred, gt_contact_mask, mask=None, fps=30):
+def compute_foot_contact_loss(foot_pos_pred, fc_mask, mask=None):
     """
     Foot Contact Loss (L_foot): Penalizes foot sliding during contact phases.
 
-    This loss penalizes the velocity of the Predicted foot positions during
-    contact frames identified by the GT contact mask.
-
-    Formula:
-        L_foot = Mean( || Vel_pred[t] ||^2 * Mask_gt[t] )
+    Aligned with MotionTrainingPortal implementation:
+    - Computes predicted foot velocity
+    - Zeros out velocity where NOT in contact (using fc_mask)
+    - Computes MSE between masked velocity and zeros
 
     Args:
         foot_pos_pred: [B, T, 2, 3] predicted foot positions (left, right)
-        gt_contact_mask: [B, T-1, 2] ground truth contact mask
-        mask: [B, T] optional binary validity mask (1 = valid frame)
-        fps: frames per second
+        fc_mask: [B, 2, 3, T-1] binary contact mask (1 = in contact, velocity should be 0)
+        mask: [B, 1, 1, T] optional binary validity mask (1 = valid frame)
 
     Returns:
-        loss: [B,] tensor representing average sliding velocity squared per batch element
+        loss: [B,] tensor representing average sliding velocity during contact
     """
-    # Compute predicted foot velocity
-    # [B, T-1, 2, 3]
-    pred_velocity = (foot_pos_pred[:, 1:] - foot_pos_pred[:, :-1]) * fps
+    # Compute predicted foot velocity: [B, T-1, 2, 3]
+    pred_vel = foot_pos_pred[:, 1:] - foot_pos_pred[:, :-1]
 
-    # Zero out velocity when GT says there is no contact
-    # gt_contact_mask: [B, T-1, 2] -> [B, T-1, 2, 1]
-    masked_velocity = pred_velocity * gt_contact_mask.unsqueeze(-1)
+    # Permute to match MotionTrainingPortal format: [B, 2, 3, T-1]
+    pred_vel = pred_vel.permute(0, 2, 3, 1)
 
-    # Sum squared error over x,y,z and both feet -> [B, T-1]
-    loss_per_frame = (masked_velocity ** 2).sum(dim=[2, 3])  # [B, T-1]
+    # Zero out velocity where NOT in contact (fc_mask=False means no contact)
+    pred_vel = pred_vel.clone()
+    pred_vel[~fc_mask] = 0
 
-    # Apply global temporal mask if provided
+    # Target is zeros (foot should not move during contact)
+    target = torch.zeros_like(pred_vel)
+
+    # Compute MSE: [B, 2, 3, T-1]
+    mse = F.mse_loss(pred_vel, target, reduction='none')
+
+    # Apply temporal mask if provided
     if mask is not None:
-        temporal_mask = mask[:, :-1]  # Align length [B, T] -> [B, T-1]
-        loss_per_frame = loss_per_frame * temporal_mask
-        # Average over time per batch element
-        loss = loss_per_frame.sum(dim=1) / (temporal_mask.sum(dim=1) + 1e-8)  # [B,]
+        temporal_mask = mask[..., 1:]  # [B, 1, 1, T-1]
+        mse = mse * temporal_mask
+        # Sum over (feet, xyz, time), divide by valid elements
+        n_entries = mse.shape[1] * mse.shape[2]  # 2 * 3 = 6
+        loss = mse.sum(dim=[1, 2, 3]) / (temporal_mask.sum(dim=[1, 2, 3]) * n_entries + 1e-8)  # [B,]
     else:
-        loss = loss_per_frame.mean(dim=1)  # [B,]
+        loss = mse.mean(dim=[1, 2, 3])  # [B,]
 
     return loss
 
 
 
 def compute_geometric_losses(x_true, x_pred, rot_req='6d', mask=None,
-                             weights=None, vel_threshold=0.02, fps=30, g1_kin=None):
+                             weights=None, vel_threshold=0.01, g1_kin=None):
     """
     Compute all geometric losses and return as a dictionary.
 
+    Aligned with MotionTrainingPortal implementation.
     Efficiently computes FK only once and reuses results for all losses.
 
     Args:
@@ -159,13 +164,12 @@ def compute_geometric_losses(x_true, x_pred, rot_req='6d', mask=None,
         x_pred: [B, J, feat, T] or [B, T, J, feat] prediction
         rot_req: rotation representation type
         mask: [B, T] optional binary mask (1 = valid frame)
-        weights: dict with keys 'pos', 'foot', 'vel' for loss weighting
-        vel_threshold: velocity threshold for foot contact (m/s)
-        fps: frames per second
+        weights: dict with keys 'geo_loss_weight_pos', 'geo_loss_weight_foot', 'geo_loss_weight_vel'
+        vel_threshold: velocity threshold for foot contact (per frame, default 0.01 matching MotionTrainingPortal)
         g1_kin: G1Kinematics instance (optional, creates new if None)
 
     Returns:
-        losses: dict with keys 'geo_loss_weight_pos', 'geo_loss_weight_vel', 'geo_loss_weight_foot'
+        losses: dict with keys 'loss_geo_pos', 'loss_geo_vel', 'loss_geo_foot' (each [B,] tensor)
     """
     if weights is None:
         weights = {'geo_loss_weight_pos': 1.0, 'geo_loss_weight_foot': 0.5, 'geo_loss_weight_vel': 0.1}
@@ -198,15 +202,21 @@ def compute_geometric_losses(x_true, x_pred, rot_req='6d', mask=None,
     else:
         losses['loss_geo_pos'] = torch.zeros(B, device=x_pred.device)
 
-    # Foot contact loss
+    # Foot contact loss (aligned with MotionTrainingPortal)
     if weights.get('geo_loss_weight_foot', 0) > 0:
-        # Compute GT contact mask using pre-computed FK positions
+        # Compute GT foot positions and velocity
         with torch.no_grad():
             foot_pos_true = torch.stack([pos_true[..., 6, :], pos_true[..., 12, :]], dim=-2)  # [B, T, 2, 3]
-            gt_contact_mask = g1_kin.compute_contact_from_positions(
-                foot_pos_true, vel_threshold=vel_threshold, fps=fps
-            )  # [B, T-1, 2]
-        losses['loss_geo_foot'] = compute_foot_contact_loss(foot_pos_pred, gt_contact_mask, mask, fps)
+            # Permute to [B, 2, 3, T] to match MotionTrainingPortal
+            gt_foot_xyz = foot_pos_true.permute(0, 2, 3, 1)  # [B, 2, 3, T]
+            # Compute GT foot velocity norm
+            gt_foot_vel = torch.linalg.norm(gt_foot_xyz[..., 1:] - gt_foot_xyz[..., :-1], dim=2)  # [B, 2, T-1]
+            # Contact mask: velocity <= threshold (same as MotionTrainingPortal's 0.01)
+            fc_mask = (gt_foot_vel <= vel_threshold).unsqueeze(2).expand(-1, -1, 3, -1)  # [B, 2, 3, T-1]
+
+        # Reshape mask for foot contact loss: [B, T] -> [B, 1, 1, T]
+        foot_mask = mask.view(B, 1, 1, -1) if mask is not None else None
+        losses['loss_geo_foot'] = compute_foot_contact_loss(foot_pos_pred, fc_mask, foot_mask)
     else:
         losses['loss_geo_foot'] = torch.zeros(B, device=x_pred.device)
 
