@@ -159,19 +159,18 @@ class MotionPlayer:
         self.past_orient = past_orient
         self.future_orient = future_orient
     
-    def render_trajectory(self, viewer: mujoco.viewer.Handle):
+    def render_trajectory(self, scene):
         if not self.show_trajectory:
             return
         assert hasattr(self, 'past_traj') and hasattr(self, 'future_traj'), \
             "Trajectory data not available for visualization."
         if True:
-            viewer.user_scn.ngeom = 0
             # --- DRAW PAST (Blue) ---
             if len(self.past_traj) > 0:
-                draw_trajectory(viewer, self.past_traj, self.past_orient, color=[0.2, 0.5, 1.0, 1.0])
+                draw_trajectory(scene, self.past_traj, self.past_orient, color=[0.2, 0.5, 1.0, 1.0])
             # --- DRAW FUTURE (Red) ---
             if len(self.future_traj) > 0:
-                draw_trajectory(viewer, self.future_traj, self.future_orient, color=[1.0, 0.2, 0.2, 1.0])
+                draw_trajectory(scene, self.future_traj, self.future_orient, color=[1.0, 0.2, 0.2, 1.0])
 
     def toggle_trajectory(self):
         """Toggle trajectory visualization."""
@@ -322,7 +321,7 @@ def main():
             # with viewer.lock():
             if True:
                 viewer.user_scn.ngeom = 0
-                player.render_trajectory(viewer)
+                player.render_trajectory(viewer.user_scn)
                 viewer.cam.lookat[:] = data.qpos[:3]
                 viewer.sync()
             time.sleep(0.001)

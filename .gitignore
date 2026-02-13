@@ -81,6 +81,7 @@ venv.bak/
 
 ## Git-Ignore after G1 Experiments ##
 **/save/
+**/save_bk/
 **/data/
 **/checkpoints/
 **/videos/

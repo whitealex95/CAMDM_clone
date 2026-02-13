@@ -332,9 +332,9 @@ class HumanoidTrainingPortal(BaseTrainingPortal):
             from utils.g1_kinematics import G1Kinematics
             self.g1_kin = G1Kinematics()
             self.geo_loss_weights = {
-                'geo_loss_weight_pos': getattr(config.trainer, 'geo_loss_weight_pos', 0.1),
-                'geo_loss_weight_vel': getattr(config.trainer, 'geo_loss_weight_vel', 0.1),
-                'geo_loss_weight_foot': getattr(config.trainer, 'geo_loss_weight_foot', 0.1),
+                'loss_geo_pos_weight': getattr(config.trainer, 'loss_geo_pos_weight', 0.1),
+                'loss_geo_vel_weight': getattr(config.trainer, 'loss_geo_vel_weight', 0.1),
+                'loss_geo_foot_weight': getattr(config.trainer, 'loss_geo_foot_weight', 0.1),
             }
             self.logger.info(f"Geometric losses enabled with weights: {self.geo_loss_weights}")
         else:
@@ -401,21 +401,21 @@ class HumanoidTrainingPortal(BaseTrainingPortal):
             # Prepare mask for geometric losses: [B, T]
             geo_mask = mask.squeeze(1).squeeze(1)  # [B, 1, 1, T] -> [B, T]
 
-            # Compute geometric losses (vel_threshold=0.01 matches MotionTrainingPortal)
+            # Compute geometric losses (vel_threshold=0.01 matches CAMDM implementation for foot contact)
             geo_losses = compute_geometric_losses(
                 x_true=target,       # [B, J, feat, T]
                 x_pred=model_output,  # [B, J, feat, T]
                 rot_req=self.config.arch.rot_req,
                 mask=geo_mask,
                 weights=self.geo_loss_weights,
-                vel_threshold=0.01,  # Matches MotionTrainingPortal
+                foot_vel_thres=0.01,
                 g1_kin=self.g1_kin
             )
 
             # Add geometric losses to loss_terms (weights applied here only, not inside compute_geometric_losses)
-            loss_terms['loss_geo_pos'] = geo_losses['loss_geo_pos'] * self.geo_loss_weights['geo_loss_weight_pos']
-            loss_terms['loss_geo_foot'] = geo_losses['loss_geo_foot'] * self.geo_loss_weights['geo_loss_weight_foot']
-            loss_terms['loss_geo_vel'] = geo_losses['loss_geo_vel'] * self.geo_loss_weights['geo_loss_weight_vel']
+            loss_terms['loss_geo_pos'] = geo_losses['loss_geo_pos'] * self.geo_loss_weights['loss_geo_pos_weight']
+            loss_terms['loss_geo_foot'] = geo_losses['loss_geo_foot'] * self.geo_loss_weights['loss_geo_foot_weight']
+            loss_terms['loss_geo_vel'] = geo_losses['loss_geo_vel'] * self.geo_loss_weights['loss_geo_vel_weight']
 
         # Total loss
         loss_terms["loss"] = loss_terms.get('vb', 0.) + \

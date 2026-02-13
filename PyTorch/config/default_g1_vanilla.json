@@ -18,14 +18,10 @@
         "sigma_small": true
     },
     "trainer": {
-        "epoch": 10000,
+        "epoch": 100,
         "lr": 0.0001,
         "batch_size": 512,
         "cond_mask_prob": 0.15,
-        "loss_terms": "1010",
-        "use_geometric_losses": true,
-        "geo_loss_weight_pos": 0.1,
-        "geo_loss_weight_foot": 0.1,
-        "geo_loss_weight_vel": 0.1
+        "loss_terms": "1010"
     }
 }
