@@ -24,8 +24,8 @@
         "cond_mask_prob": 0.15,
         "loss_terms": "1010",
         "use_geometric_losses": true,
-        "geo_loss_weight_pos": 0.1,
-        "geo_loss_weight_foot": 0.1,
-        "geo_loss_weight_vel": 0.1
+        "loss_geo_pos_weight": 1.0,
+        "loss_geo_foot_weight": 1.0,
+        "loss_geo_vel_weight": 1.0
     }
 }

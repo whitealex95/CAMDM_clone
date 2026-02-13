@@ -152,7 +152,7 @@ def compute_foot_contact_loss(foot_pos_pred, fc_mask, mask=None):
 
 
 def compute_geometric_losses(x_true, x_pred, rot_req='6d', mask=None,
-                             weights=None, vel_threshold=0.01, g1_kin=None):
+                             weights=None, foot_vel_thres=0.01, g1_kin=None):
     """
     Compute all geometric losses and return as a dictionary.
 
@@ -164,15 +164,15 @@ def compute_geometric_losses(x_true, x_pred, rot_req='6d', mask=None,
         x_pred: [B, J, feat, T] or [B, T, J, feat] prediction
         rot_req: rotation representation type
         mask: [B, T] optional binary mask (1 = valid frame)
-        weights: dict with keys 'geo_loss_weight_pos', 'geo_loss_weight_foot', 'geo_loss_weight_vel'
-        vel_threshold: velocity threshold for foot contact (per frame, default 0.01 matching MotionTrainingPortal)
+        weights: dict with keys 'loss_geo_pos_weight', 'loss_geo_vel_weight', 'loss_geo_foot_weight'
+        foot_vel_thres: velocity threshold for foot contact (per frame, default 0.01 matching MotionTrainingPortal)
         g1_kin: G1Kinematics instance (optional, creates new if None)
 
     Returns:
         losses: dict with keys 'loss_geo_pos', 'loss_geo_vel', 'loss_geo_foot' (each [B,] tensor)
     """
     if weights is None:
-        weights = {'geo_loss_weight_pos': 1.0, 'geo_loss_weight_foot': 0.5, 'geo_loss_weight_vel': 0.1}
+        weights = {'loss_geo_pos_weight': 0.0, 'loss_geo_vel_weight': 0.0, 'loss_geo_foot_weight': 0.0}
 
     # Create kinematics instance if not provided
     if g1_kin is None:
@@ -189,42 +189,27 @@ def compute_geometric_losses(x_true, x_pred, rot_req='6d', mask=None,
 
     # Compute FK once for both true and pred
     with torch.no_grad():
-        pos_true = g1_kin.forward_kinematics(qpos_true)  # [B, T, 30, 3]
-    pos_pred = g1_kin.forward_kinematics(qpos_pred)  # [B, T, 30, 3]
+        fkpos_true = g1_kin.forward_kinematics(qpos_true)  # [B, T, 30, 3]
+    fkpos_pred = g1_kin.forward_kinematics(qpos_pred)  # [B, T, 30, 3]
 
     # Extract foot positions once
     # left_ankle_roll=6, right_ankle_roll=12
-    foot_pos_pred = torch.stack([pos_pred[..., 6, :], pos_pred[..., 12, :]], dim=-2)  # [B, T, 2, 3]
+    left_ankle_roll_idx = 6
+    right_ankle_roll_idx = 12
+    foot_pos_pred = torch.stack([fkpos_pred[..., left_ankle_roll_idx, :],
+                                 fkpos_pred[..., right_ankle_roll_idx, :]], dim=-2)  # [B, T, 2, 3]
 
-    # Position loss
-    if weights.get('geo_loss_weight_pos', 0) > 0:
-        losses['loss_geo_pos'] = compute_position_loss(pos_pred, pos_true, mask)
+    # 1. Position loss
+    if weights.get('loss_geo_pos_weight', 0) > 0:
+        losses['loss_geo_pos'] = compute_position_loss(fkpos_pred, fkpos_true, mask)
     else:
         losses['loss_geo_pos'] = torch.zeros(B, device=x_pred.device)
 
-    # Foot contact loss (aligned with MotionTrainingPortal)
-    if weights.get('geo_loss_weight_foot', 0) > 0:
-        # Compute GT foot positions and velocity
-        with torch.no_grad():
-            foot_pos_true = torch.stack([pos_true[..., 6, :], pos_true[..., 12, :]], dim=-2)  # [B, T, 2, 3]
-            # Permute to [B, 2, 3, T] to match MotionTrainingPortal
-            gt_foot_xyz = foot_pos_true.permute(0, 2, 3, 1)  # [B, 2, 3, T]
-            # Compute GT foot velocity norm
-            gt_foot_vel = torch.linalg.norm(gt_foot_xyz[..., 1:] - gt_foot_xyz[..., :-1], dim=2)  # [B, 2, T-1]
-            # Contact mask: velocity <= threshold (same as MotionTrainingPortal's 0.01)
-            fc_mask = (gt_foot_vel <= vel_threshold).unsqueeze(2).expand(-1, -1, 3, -1)  # [B, 2, 3, T-1]
-
-        # Reshape mask for foot contact loss: [B, T] -> [B, 1, 1, T]
-        foot_mask = mask.view(B, 1, 1, -1) if mask is not None else None
-        losses['loss_geo_foot'] = compute_foot_contact_loss(foot_pos_pred, fc_mask, foot_mask)
-    else:
-        losses['loss_geo_foot'] = torch.zeros(B, device=x_pred.device)
-
-    # Velocity loss (computed on FK positions, not raw representation)
-    if weights.get('geo_loss_weight_vel', 0) > 0:
+    # 2. Velocity loss (computed on FK positions, not raw representation)
+    if weights.get('loss_geo_vel_weight', 0) > 0:
         # Compute velocities from FK positions
-        vel_true = pos_true[:, 1:] - pos_true[:, :-1]  # [B, T-1, 30, 3]
-        vel_pred = pos_pred[:, 1:] - pos_pred[:, :-1]  # [B, T-1, 30, 3]
+        vel_true = fkpos_true[:, 1:] - fkpos_true[:, :-1]  # [B, T-1, 30, 3]
+        vel_pred = fkpos_pred[:, 1:] - fkpos_pred[:, :-1]  # [B, T-1, 30, 3]
 
         # MSE between velocities
         mse = F.mse_loss(vel_pred, vel_true, reduction='none')  # [B, T-1, 30, 3]
@@ -241,83 +226,25 @@ def compute_geometric_losses(x_true, x_pred, rot_req='6d', mask=None,
     else:
         losses['loss_geo_vel'] = torch.zeros(B, device=x_pred.device)
 
+
+    # 3. Foot contact loss (aligned with MotionTrainingPortal)
+    if weights.get('loss_geo_foot_weight', 0) > 0:
+        # Compute GT foot positions and velocity
+        with torch.no_grad():
+            foot_pos_true = torch.stack([fkpos_true[..., left_ankle_roll_idx, :],
+                                         fkpos_true[..., right_ankle_roll_idx, :]], dim=-2)  # [B, T, 2, 3]
+            # Permute to [B, 2, 3, T] to match MotionTrainingPortal
+            gt_foot_xyz = foot_pos_true.permute(0, 2, 3, 1)  # [B, 2, 3, T]
+            # Compute GT foot velocity norm
+            gt_foot_vel = torch.linalg.norm(gt_foot_xyz[..., 1:] - gt_foot_xyz[..., :-1], dim=2)  # [B, 2, T-1]
+            # Contact mask: velocity <= threshold means in contact
+            fc_mask = (gt_foot_vel <= foot_vel_thres).unsqueeze(2).expand(-1, -1, 3, -1)  # [B, 2, 3, T-1]
+
+        # Reshape mask for foot contact loss: [B, T] -> [B, 1, 1, T]
+        foot_mask = mask.view(B, 1, 1, -1) if mask is not None else None
+        losses['loss_geo_foot'] = compute_foot_contact_loss(foot_pos_pred, fc_mask, foot_mask)
+    else:
+        losses['loss_geo_foot'] = torch.zeros(B, device=x_pred.device)
+
+
     return losses
-
-
-# ==============================================================================
-# Test Functions
-# ==============================================================================
-
-def test_losses():
-    """Test loss computation with dummy data."""
-    print("Testing Geometric Losses...")
-
-    B, T, J, feat = 4, 50, 31, 6
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Create dummy data
-    x_true = torch.randn(B, J, feat, T, device=device, requires_grad=False)
-    x_pred = torch.randn(B, J, feat, T, device=device, requires_grad=False)
-    mask = torch.ones(B, T, device=device)
-
-    # Initialize root properly
-    with torch.no_grad():
-        x_true[:, 0, :, :] = 0.1  # Root rotation
-        # Set root position with linear motion
-        root_pos_traj = torch.linspace(0, 1, T, device=device).view(1, 1, T).expand(B, 3, T)  # [B, 3, T]
-        x_true[:, 30, :3, :] = root_pos_traj  # Root pos
-        x_pred[:, 0, :, :] = 0.1
-        x_pred[:, 30, :3, :] = root_pos_traj
-
-        # Set root quaternion w=1 for valid quaternions
-        x_true[:, 0, 0, :] = 1.0  # Assuming 6d, first component
-        x_pred[:, 0, 0, :] = 1.0
-
-    # Re-enable gradients for x_pred
-    x_pred.requires_grad_(True)
-
-    print("Input shapes:")
-    print(f"  x_true: {x_true.shape}")
-    print(f"  x_pred: {x_pred.shape}")
-    print(f"  mask: {mask.shape}")
-    print()
-
-    # Test combined losses (this now computes FK only once)
-    print("Testing Combined Losses (efficient FK computation)...")
-    losses = compute_geometric_losses(
-        x_true, x_pred, rot_req='6d', mask=mask,
-        weights={'pos': 1.0, 'foot': 0.5, 'vel': 0.1}
-    )
-    print(f"  Position: {losses['loss_pos'].item():.6f}")
-    print(f"  Foot Contact: {losses['loss_foot'].item():.6f}")
-    print(f"  Velocity: {losses['loss_vel'].item():.6f}")
-    print(f"  Total: {losses['loss_total'].item():.6f}")
-    assert losses['loss_pos'].item() >= 0, "Position loss must be non-negative"
-    assert losses['loss_foot'].item() >= 0, "Foot contact loss must be non-negative"
-    assert losses['loss_vel'].item() >= 0, "Velocity loss must be non-negative"
-    print("  ✓ Combined losses computed (FK called only once)")
-    print()
-
-    # Test gradient flow
-    print("Testing Gradient Flow...")
-    losses['loss_total'].backward()
-    assert x_pred.grad is not None, "Gradient not computed"
-    print(f"  Gradient shape: {x_pred.grad.shape}")
-    print(f"  Gradient norm: {x_pred.grad.norm().item():.6f}")
-    print("  ✓ Gradient flow verified")
-    print()
-
-    print("All loss tests passed!")
-
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("Geometric Losses Test Suite")
-    print("=" * 60)
-    print()
-
-    test_losses()
-
-    print("=" * 60)
-    print("All tests passed!")
-    print("=" * 60)
