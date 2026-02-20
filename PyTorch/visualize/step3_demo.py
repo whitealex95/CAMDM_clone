@@ -62,11 +62,12 @@ class ModelWrapper(torch.nn.Module):
 class MotionGenerator:
     """Autoregressive motion generator with Dataset Guidance."""
     
-    def __init__(self, model, diffusion, config, device="cuda"):
+    def __init__(self, model, diffusion, config, device="cuda", sampler="ddpm"):
         self.model = ModelWrapper(model)
         self.diffusion = diffusion
         self.config = config
         self.device = device
+        self.sampler = sampler.lower()
         
         # Model parameters
         self.past_frames = config.arch.past_frame
@@ -120,10 +121,18 @@ class MotionGenerator:
         }
         
         shape = (1, self.joint_num + 1, self.per_rot_feat, self.future_frames)
-        sample = self.diffusion.ddim_sample_loop(
-            self.model, shape, clip_denoised=False, model_kwargs=model_kwargs,
-            progress=False, eta=0.0, device=self.device
-        )
+        if self.sampler == "ddim":
+            sample = self.diffusion.ddim_sample_loop(
+                self.model, shape, clip_denoised=False, model_kwargs=model_kwargs,
+                progress=False, eta=0.0, device=self.device
+            )
+        elif self.sampler == "ddpm":
+            sample = self.diffusion.p_sample_loop(
+                self.model, shape, clip_denoised=False, model_kwargs=model_kwargs,
+                progress=False, device=self.device
+            )
+        else:
+            raise ValueError(f"Unknown sampler '{self.sampler}'. Expected one of: ddpm, ddim")
 
         # Process Output
         sample = sample.squeeze(0).permute(2, 0, 1).cpu().numpy() # (future, 31, feat)
@@ -537,6 +546,13 @@ def get_args():
     )
     parser.add_argument("--checkpoint", type=str, default="save/camdm_g1_lafan1_g1_epoch500_diff8/best.pt")
     parser.add_argument("--blend", type=float, default=0.3, help="0.0 = Pure AI, 1.0 = Pure GT Trajectory")    
+    parser.add_argument(
+        "--sampler",
+        type=str,
+        default="ddpm",
+        choices=["ddpm", "ddim"],
+        help="Diffusion sampler (ddpm matches Unity inference path more closely)"
+    )
 
     parser.add_argument(
         "--motion",
@@ -667,7 +683,7 @@ def main():
     diffusion_model.eval()
 
     # Create motion generator
-    generator = MotionGenerator(diffusion_model, diffusion, config, device)   
+    generator = MotionGenerator(diffusion_model, diffusion, config, device, sampler=args.sampler)
     
     # Create motion player
     player = DemoPlayer(
