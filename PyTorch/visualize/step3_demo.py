@@ -216,7 +216,8 @@ class DemoPlayer:
         self.generated_future_traj = None
         self.generated_future_orient = None
         # Blending factor (1-t^blend) predicted + t^blend target, t ∈ [0, 1]
-        self.blend = 1.0 # (0: pure target, not using generated prediction)
+        # Respect CLI/config input instead of hard-coding.
+        self.blend = blend
 
         # Inertializer for smooth transitions
         self.inertializer = None # Inertializer(dim=36, halflife=0.1) # 
@@ -274,10 +275,6 @@ class DemoPlayer:
         self.raw_generated_qpos = self.motion_generator.generate_motion(past_qpos,
                                 self.future_traj, self.future_orient, style_idx)
         generated_qpos = self.raw_generated_qpos.copy()
-        if True: # override with future frames
-            future_qpos_dataset = self.load_future_qpos()
-            # TODO: figure out why this is required. Shouldn't this be easily learned by the model?
-            # generated_qpos[:, :2] = self.future_traj[:, :2]
         return generated_qpos # (future_frames, 36)
 
     def update_pose(self):
