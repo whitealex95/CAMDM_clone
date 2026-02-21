@@ -4,6 +4,7 @@ Interactive motion-stitch inertialization test.
 Visualizes stitching two motion clips and compares:
 - Raw stitched sequence
 - CAMDM-style inertialized sequence
+- Spring-style inertialized sequence
 
 Interactive controls:
 - Motion A index
@@ -11,7 +12,8 @@ Interactive controls:
 - Switch frame in motion A
 - Start frame in motion B
 - Post-switch horizon
-- Blend times (rotation/position)
+- CAMDM blend times (rotation/position)
+- Spring halflife (rotation/position)
 - Joint DOF index to inspect
 """
 
@@ -38,7 +40,7 @@ if PYTORCH_DIR not in sys.path:
     sys.path.append(PYTORCH_DIR)
 
 from visualize.motion_loader import MotionDataset
-from visualize.utils.transition_manager import InertialTransitionManager
+from visualize.utils.transition_manager import create_transition_manager
 
 
 def yaw_from_wxyz(quat_wxyz):
@@ -61,6 +63,8 @@ def build_stitch_sequences(
     fps,
     blend_time_rotation,
     blend_time_position,
+    spring_halflife_rotation,
+    spring_halflife_position,
     quat_slice=slice(3, 7),
 ):
     ma = dataset[motion_a_idx]
@@ -84,13 +88,20 @@ def build_stitch_sequences(
 
     raw = np.concatenate([pre, post_targets], axis=0)
 
-    # CAMDM-style inertialized post segment.
     dt = 1.0 / fps
-    manager = InertialTransitionManager(
+    manager_camdm = create_transition_manager(
+        mode="camdm",
         frame_dt=dt,
+        quat_slice=quat_slice,
         blend_time_rotation=blend_time_rotation,
         blend_time_position=blend_time_position,
+    )
+    manager_spring = create_transition_manager(
+        mode="spring",
+        frame_dt=dt,
         quat_slice=quat_slice,
+        halflife_position=spring_halflife_position,
+        halflife_rotation=spring_halflife_rotation,
     )
 
     if pre.shape[0] >= 2:
@@ -99,18 +110,23 @@ def build_stitch_sequences(
     else:
         hist = [pre[-1], pre[-1]]
         curr = pre[-1]
-    manager.start_transition(hist, curr, post_targets)
+    manager_camdm.start_transition(hist, curr, post_targets)
+    manager_spring.start_transition(hist, curr, post_targets)
 
-    post_inert = []
+    post_camdm = []
+    post_spring = []
     for i in range(post_targets.shape[0]):
-        post_inert.append(manager.apply(post_targets[i]))
-    post_inert = np.asarray(post_inert)
+        post_camdm.append(manager_camdm.apply(post_targets[i]))
+        post_spring.append(manager_spring.apply(post_targets[i]))
+    post_camdm = np.asarray(post_camdm)
+    post_spring = np.asarray(post_spring)
 
-    inert = np.concatenate([pre, post_inert], axis=0)
+    inert_camdm = np.concatenate([pre, post_camdm], axis=0)
+    inert_spring = np.concatenate([pre, post_spring], axis=0)
     switch_global = pre.shape[0]
     t = np.arange(raw.shape[0]) * dt
 
-    return t, raw, inert, switch_global
+    return t, raw, inert_camdm, inert_spring, switch_global
 
 
 def main():
@@ -135,10 +151,12 @@ def main():
         "horizon": args.horizon,
         "blend_time_rotation": 0.2,
         "blend_time_position": 0.2,
+        "spring_halflife_rotation": 0.12,
+        "spring_halflife_position": 0.12,
         "joint_dof_idx": 7,  # qpos scalar dof index to inspect
     }
 
-    t, raw, inert, switch_g = build_stitch_sequences(
+    t, raw, inert_camdm, inert_spring, switch_g = build_stitch_sequences(
         dataset=dataset,
         motion_a_idx=init["motion_a_idx"],
         motion_b_idx=init["motion_b_idx"],
@@ -148,6 +166,8 @@ def main():
         fps=args.fps,
         blend_time_rotation=init["blend_time_rotation"],
         blend_time_position=init["blend_time_position"],
+        spring_halflife_rotation=init["spring_halflife_rotation"],
+        spring_halflife_position=init["spring_halflife_position"],
     )
 
     fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
@@ -155,32 +175,36 @@ def main():
 
     # Root X
     l_raw_x, = axes[0].plot(t, raw[:, 0], color="red", lw=1.8, label="Raw")
-    l_int_x, = axes[0].plot(t, inert[:, 0], color="green", lw=1.8, label="Inertialized")
+    l_camdm_x, = axes[0].plot(t, inert_camdm[:, 0], color="green", lw=1.8, label="CAMDM")
+    l_spring_x, = axes[0].plot(t, inert_spring[:, 0], color="blue", lw=1.5, label="Spring")
     axes[0].set_ylabel("Root X")
     axes[0].grid(alpha=0.25)
     axes[0].legend(loc="upper right")
 
     # Root Z
     l_raw_z, = axes[1].plot(t, raw[:, 2], color="red", lw=1.8)
-    l_int_z, = axes[1].plot(t, inert[:, 2], color="green", lw=1.8)
+    l_camdm_z, = axes[1].plot(t, inert_camdm[:, 2], color="green", lw=1.8)
+    l_spring_z, = axes[1].plot(t, inert_spring[:, 2], color="blue", lw=1.5)
     axes[1].set_ylabel("Root Z")
     axes[1].grid(alpha=0.25)
 
     # Root yaw
     l_raw_yaw, = axes[2].plot(t, yaw_from_wxyz(raw[:, 3:7]), color="red", lw=1.8)
-    l_int_yaw, = axes[2].plot(t, yaw_from_wxyz(inert[:, 3:7]), color="green", lw=1.8)
+    l_camdm_yaw, = axes[2].plot(t, yaw_from_wxyz(inert_camdm[:, 3:7]), color="green", lw=1.8)
+    l_spring_yaw, = axes[2].plot(t, yaw_from_wxyz(inert_spring[:, 3:7]), color="blue", lw=1.5)
     axes[2].set_ylabel("Root Yaw (rad)")
     axes[2].grid(alpha=0.25)
 
     # Selected scalar DOF
     l_raw_dof, = axes[3].plot(t, raw[:, init["joint_dof_idx"]], color="red", lw=1.8)
-    l_int_dof, = axes[3].plot(t, inert[:, init["joint_dof_idx"]], color="green", lw=1.8)
+    l_camdm_dof, = axes[3].plot(t, inert_camdm[:, init["joint_dof_idx"]], color="green", lw=1.8)
+    l_spring_dof, = axes[3].plot(t, inert_spring[:, init["joint_dof_idx"]], color="blue", lw=1.5)
     axes[3].set_ylabel(f"qpos[{init['joint_dof_idx']}]")
     axes[3].set_xlabel("Time (s)")
     axes[3].grid(alpha=0.25)
 
     vlines = [ax.axvline(t[switch_g], color="black", ls="--", lw=1.0) for ax in axes]
-    axes[0].set_title("Motion Stitch Test: Raw vs Inertialized")
+    axes[0].set_title("Motion Stitch Test: Raw vs CAMDM vs Spring")
 
     def add_slider(y, label, vmin, vmax, vinit, valstep=None):
         sax = plt.axes([0.10, y, 0.36, 0.025])
@@ -194,9 +218,11 @@ def main():
     s_br = add_slider(0.24, "Blend rot (s)", 0.01, 1.0, init["blend_time_rotation"])
     s_bp = add_slider(0.20, "Blend pos (s)", 0.01, 1.0, init["blend_time_position"])
     s_dof = add_slider(0.16, "DOF idx", 7, 35, init["joint_dof_idx"], valstep=1)
+    s_hr = add_slider(0.12, "Spring hl rot (s)", 0.01, 1.0, init["spring_halflife_rotation"])
+    s_hp = add_slider(0.08, "Spring hl pos (s)", 0.01, 1.0, init["spring_halflife_position"])
 
     # Put right-side sliders.
-    for s in (s_br, s_bp, s_dof):
+    for s in (s_br, s_bp, s_dof, s_hr, s_hp):
         x, y, w, h = s.ax.get_position().bounds
         s.ax.set_position([0.58, y, 0.34, h])
 
@@ -204,7 +230,7 @@ def main():
     b_reset = Button(reset_ax, "Reset")
 
     def update(_):
-        ta, ra, ia, swg = build_stitch_sequences(
+        ta, ra, ia_camdm, ia_spring, swg = build_stitch_sequences(
             dataset=dataset,
             motion_a_idx=int(s_a.val),
             motion_b_idx=int(s_b.val),
@@ -214,15 +240,18 @@ def main():
             fps=args.fps,
             blend_time_rotation=float(s_br.val),
             blend_time_position=float(s_bp.val),
+            spring_halflife_rotation=float(s_hr.val),
+            spring_halflife_position=float(s_hp.val),
         )
 
-        l_raw_x.set_data(ta, ra[:, 0]); l_int_x.set_data(ta, ia[:, 0])
-        l_raw_z.set_data(ta, ra[:, 2]); l_int_z.set_data(ta, ia[:, 2])
+        l_raw_x.set_data(ta, ra[:, 0]); l_camdm_x.set_data(ta, ia_camdm[:, 0]); l_spring_x.set_data(ta, ia_spring[:, 0])
+        l_raw_z.set_data(ta, ra[:, 2]); l_camdm_z.set_data(ta, ia_camdm[:, 2]); l_spring_z.set_data(ta, ia_spring[:, 2])
         l_raw_yaw.set_data(ta, yaw_from_wxyz(ra[:, 3:7]))
-        l_int_yaw.set_data(ta, yaw_from_wxyz(ia[:, 3:7]))
+        l_camdm_yaw.set_data(ta, yaw_from_wxyz(ia_camdm[:, 3:7]))
+        l_spring_yaw.set_data(ta, yaw_from_wxyz(ia_spring[:, 3:7]))
 
         dof = int(s_dof.val)
-        l_raw_dof.set_data(ta, ra[:, dof]); l_int_dof.set_data(ta, ia[:, dof])
+        l_raw_dof.set_data(ta, ra[:, dof]); l_camdm_dof.set_data(ta, ia_camdm[:, dof]); l_spring_dof.set_data(ta, ia_spring[:, dof])
         axes[3].set_ylabel(f"qpos[{dof}]")
 
         for vl in vlines:
@@ -235,10 +264,10 @@ def main():
         fig.canvas.draw_idle()
 
     def on_reset(_):
-        for s in (s_a, s_b, s_sw, s_sb, s_h, s_br, s_bp, s_dof):
+        for s in (s_a, s_b, s_sw, s_sb, s_h, s_br, s_bp, s_dof, s_hr, s_hp):
             s.reset()
 
-    for s in (s_a, s_b, s_sw, s_sb, s_h, s_br, s_bp, s_dof):
+    for s in (s_a, s_b, s_sw, s_sb, s_h, s_br, s_bp, s_dof, s_hr, s_hp):
         s.on_changed(update)
     b_reset.on_clicked(on_reset)
 
@@ -247,4 +276,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

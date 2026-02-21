@@ -1,13 +1,14 @@
 """
 Interactive 1D inertialization test.
 
-This script helps verify and understand the scalar inertialization behavior
-used in CAMDM-style transitions.
+This script helps verify and understand scalar inertialization behavior by
+comparing CAMDM vs Spring transitions side by side.
 
 Controls (sliders):
 - Motion A/B amplitude, frequency, phase, offset
 - Switch frame
-- Blend time
+- CAMDM blend time
+- Spring halflife
 """
 
 import argparse
@@ -55,6 +56,18 @@ def inertialize_scalar(prev, curr, target, dt, tf, t):
     return inertialize_scalar_from_xv(x0, v0, tf, t)
 
 
+def spring_decay_scalar(offset, offset_vel, dt, halflife):
+    """Critically-damped style decay in offset space (scalar version)."""
+    if halflife <= 0.0:
+        return 0.0, 0.0
+    y = np.log(2.0) / halflife
+    j1 = offset_vel + y * offset
+    e = np.exp(-y * dt)
+    new_offset = e * (offset + j1 * dt)
+    new_offset_vel = e * (offset_vel - y * j1 * dt)
+    return new_offset, new_offset_vel
+
+
 def make_wave(t, amp, freq, phase, offset):
     return amp * np.sin(2.0 * np.pi * freq * t + phase) + offset
 
@@ -71,7 +84,8 @@ def build_sequences(
     freq_b,
     phase_b,
     off_b,
-    blend_time,
+    blend_time_camdm,
+    halflife_spring,
 ):
     dt = 1.0 / fps
     t = np.arange(n_frames) * dt
@@ -81,21 +95,37 @@ def build_sequences(
     raw = motion_a.copy()
     raw[switch_idx:] = motion_b[switch_idx:]
 
-    out = raw.copy()
+    out_camdm = raw.copy()
+    out_spring = raw.copy()
     if switch_idx >= 1:
-        prev = raw[switch_idx - 2] if switch_idx >= 2 else raw[switch_idx - 1]
-        curr = raw[switch_idx - 1]
+        # Keep CAMDM and Spring state separate to avoid cross-contamination.
+        prev_camdm = raw[switch_idx - 2] if switch_idx >= 2 else raw[switch_idx - 1]
+        curr_camdm = raw[switch_idx - 1]
         elapsed = 0.0
+        prev_spring = raw[switch_idx - 2] if switch_idx >= 2 else raw[switch_idx - 1]
+        curr_spring = raw[switch_idx - 1]
+        target0 = motion_b[switch_idx]
+        target1 = motion_b[min(switch_idx + 1, n_frames - 1)]
+        spring_offset = curr_spring - target0
+        curr_vel = (curr_spring - prev_spring) / dt
+        target_vel = (target1 - target0) / dt
+        spring_offset_vel = curr_vel - target_vel
+
         for i in range(switch_idx, n_frames):
             target = motion_b[i]
-            tf = max(1e-4, blend_time - elapsed)
-            offset = inertialize_scalar(prev, curr, target, dt, tf, dt)
-            val = target + offset
-            out[i] = val
-            prev, curr = curr, val
+            tf = max(1e-4, blend_time_camdm - elapsed)
+            offset = inertialize_scalar(prev_camdm, curr_camdm, target, dt, tf, dt)
+            val_camdm = target + offset
+            out_camdm[i] = val_camdm
+            prev_camdm, curr_camdm = curr_camdm, val_camdm
             elapsed += dt
 
-    return t, motion_a, motion_b, raw, out
+            spring_offset, spring_offset_vel = spring_decay_scalar(
+                spring_offset, spring_offset_vel, dt, halflife_spring
+            )
+            out_spring[i] = target + spring_offset
+
+    return t, motion_a, motion_b, raw, out_camdm, out_spring
 
 
 def main():
@@ -117,10 +147,11 @@ def main():
         "phase_b": 1.0,
         "off_b": 0.8,
         "switch_idx": int(0.45 * n_frames),
-        "blend_time": 0.2,
+        "blend_time_camdm": 0.2,
+        "halflife_spring": 0.12,
     }
 
-    t, m1, m2, raw, out = build_sequences(n_frames=n_frames, fps=fps, **init)
+    t, m1, m2, raw, out_camdm, out_spring = build_sequences(n_frames=n_frames, fps=fps, **init)
 
     fig, ax = plt.subplots(figsize=(12, 6))
     plt.subplots_adjust(left=0.08, right=0.98, top=0.93, bottom=0.40)
@@ -128,10 +159,11 @@ def main():
     l1, = ax.plot(t, m1, lw=1.0, color="gray", alpha=0.7, label="Motion A")
     l2, = ax.plot(t, m2, lw=1.0, color="orange", alpha=0.7, label="Motion B")
     lraw, = ax.plot(t, raw, lw=2.0, color="red", label="Raw stitched")
-    lout, = ax.plot(t, out, lw=2.0, color="green", label="Inertialized")
+    lcamdm, = ax.plot(t, out_camdm, lw=2.0, color="green", label="CAMDM")
+    lspring, = ax.plot(t, out_spring, lw=1.8, color="blue", label="Spring")
     vline = ax.axvline(t[init["switch_idx"]], color="black", ls="--", lw=1.0, label="Switch")
 
-    ax.set_title("1D Inertialization: Raw vs Inertialized Stitch")
+    ax.set_title("1D Inertialization: Raw vs CAMDM vs Spring")
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Value")
     ax.grid(alpha=0.25)
@@ -151,10 +183,11 @@ def main():
     s_phase_b = add_slider(0.24, "B phase", -np.pi, np.pi, init["phase_b"])
     s_off_b = add_slider(0.20, "B offset", -2.0, 2.0, init["off_b"])
     s_switch = add_slider(0.16, "Switch frame", 1, n_frames - 2, init["switch_idx"], valstep=1)
-    s_blend = add_slider(0.12, "Blend time (s)", 0.01, 1.0, init["blend_time"])
+    s_blend = add_slider(0.12, "CAMDM blend (s)", 0.01, 1.0, init["blend_time_camdm"])
+    s_half = add_slider(0.08, "Spring hl (s)", 0.01, 1.0, init["halflife_spring"])
 
     # Put B sliders on right side
-    for s in (s_amp_b, s_freq_b, s_phase_b, s_off_b, s_switch, s_blend):
+    for s in (s_amp_b, s_freq_b, s_phase_b, s_off_b, s_switch, s_blend, s_half):
         x, y, w, h = s.ax.get_position().bounds
         s.ax.set_position([0.57, y, 0.35, h])
 
@@ -174,25 +207,27 @@ def main():
             freq_b=float(s_freq_b.val),
             phase_b=float(s_phase_b.val),
             off_b=float(s_off_b.val),
-            blend_time=float(s_blend.val),
+            blend_time_camdm=float(s_blend.val),
+            halflife_spring=float(s_half.val),
         )
-        tt, mm1, mm2, rr, oo = build_sequences(**params)
+        tt, mm1, mm2, rr, oo_camdm, oo_spring = build_sequences(**params)
         l1.set_ydata(mm1)
         l2.set_ydata(mm2)
         lraw.set_ydata(rr)
-        lout.set_ydata(oo)
+        lcamdm.set_ydata(oo_camdm)
+        lspring.set_ydata(oo_spring)
         vline.set_xdata([tt[params["switch_idx"]], tt[params["switch_idx"]]])
 
-        ymin = min(np.min(mm1), np.min(mm2), np.min(rr), np.min(oo)) - 0.4
-        ymax = max(np.max(mm1), np.max(mm2), np.max(rr), np.max(oo)) + 0.4
+        ymin = min(np.min(mm1), np.min(mm2), np.min(rr), np.min(oo_camdm), np.min(oo_spring)) - 0.4
+        ymax = max(np.max(mm1), np.max(mm2), np.max(rr), np.max(oo_camdm), np.max(oo_spring)) + 0.4
         ax.set_ylim(ymin, ymax)
         fig.canvas.draw_idle()
 
     def on_reset(_):
-        for s in (s_amp_a, s_freq_a, s_phase_a, s_off_a, s_amp_b, s_freq_b, s_phase_b, s_off_b, s_switch, s_blend):
+        for s in (s_amp_a, s_freq_a, s_phase_a, s_off_a, s_amp_b, s_freq_b, s_phase_b, s_off_b, s_switch, s_blend, s_half):
             s.reset()
 
-    for s in (s_amp_a, s_freq_a, s_phase_a, s_off_a, s_amp_b, s_freq_b, s_phase_b, s_off_b, s_switch, s_blend):
+    for s in (s_amp_a, s_freq_a, s_phase_a, s_off_a, s_amp_b, s_freq_b, s_phase_b, s_off_b, s_switch, s_blend, s_half):
         s.on_changed(update)
     b_reset.on_clicked(on_reset)
 
@@ -201,4 +236,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

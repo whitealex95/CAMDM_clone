@@ -201,3 +201,145 @@ class InertialTransitionManager:
             self.active = False
 
         return out
+
+
+class SpringTransitionManager:
+    """Spring/halflife style inertialization manager with the same API."""
+
+    def __init__(
+        self,
+        frame_dt,
+        quat_slice=slice(3, 7),
+        halflife_position=0.12,
+        halflife_rotation=0.12,
+    ):
+        self.frame_dt = float(frame_dt)
+        self.quat_slice = quat_slice
+        self.halflife_position = float(halflife_position)
+        self.halflife_rotation = float(halflife_rotation)
+
+        self.offset = None
+        self.offset_vel = None
+        self.rot_off = np.zeros(3, dtype=np.float64)      # rotvec offset for root quat
+        self.rot_off_vel = np.zeros(3, dtype=np.float64)  # angular-velocity offset
+        self.active = False
+
+    @staticmethod
+    def _decay_vec(x, v, dt, halflife):
+        if halflife <= 0.0:
+            return np.zeros_like(x), np.zeros_like(v)
+        y = np.log(2.0) / halflife
+        j1 = v + y * x
+        e = np.exp(-y * dt)
+        x_new = e * (x + j1 * dt)
+        v_new = e * (v - y * j1 * dt)
+        return x_new, v_new
+
+    def _ensure_buffers(self, dim):
+        if self.offset is None or self.offset.shape[0] != dim:
+            self.offset = np.zeros(dim, dtype=np.float64)
+            self.offset_vel = np.zeros(dim, dtype=np.float64)
+
+    def start_transition(self, qpos_history, current_qpos, generated_qpos):
+        dt = self.frame_dt
+        curr = np.array(qpos_history[-1], dtype=np.float64) if len(qpos_history) > 0 else np.array(current_qpos, dtype=np.float64)
+        prev = np.array(qpos_history[-2], dtype=np.float64) if len(qpos_history) >= 2 else curr.copy()
+        target0 = np.array(generated_qpos[0], dtype=np.float64)
+        target1 = np.array(generated_qpos[1], dtype=np.float64) if len(generated_qpos) > 1 else target0.copy()
+
+        curr_vel = (curr - prev) / dt
+        target_vel = (target1 - target0) / dt
+
+        self._ensure_buffers(curr.shape[0])
+        self.offset[:] = 0.0
+        self.offset_vel[:] = 0.0
+
+        # Position channels use position halflife.
+        self.offset[0:3] = curr[0:3] - target0[0:3]
+        self.offset_vel[0:3] = curr_vel[0:3] - target_vel[0:3]
+
+        # Scalar channels after root quat use rotation halflife.
+        scalar_start = self.quat_slice.stop
+        if scalar_start < curr.shape[0]:
+            self.offset[scalar_start:] = curr[scalar_start:] - target0[scalar_start:]
+            self.offset_vel[scalar_start:] = curr_vel[scalar_start:] - target_vel[scalar_start:]
+
+        # Quaternion offset represented as rotvec (single root quat, wxyz).
+        q_curr = _quat_normalize(curr[self.quat_slice])
+        q_tgt = _quat_normalize(target0[self.quat_slice])
+        if np.dot(q_curr, q_tgt) < 0.0:
+            q_tgt = -q_tgt
+        q_err = _quat_mul(q_curr, _quat_inv(q_tgt))
+        axis, angle = _to_axis_angle(q_err)
+        self.rot_off = axis * angle
+        self.rot_off_vel[:] = 0.0
+
+        self.active = True
+
+    def apply(self, raw_target_qpos):
+        target = np.array(raw_target_qpos, dtype=np.float64)
+        if not self.active or self.offset is None:
+            return target
+
+        dt = self.frame_dt
+        out = target.copy()
+
+        # Decay and apply root position offset.
+        self.offset[0:3], self.offset_vel[0:3] = self._decay_vec(
+            self.offset[0:3], self.offset_vel[0:3], dt, self.halflife_position
+        )
+        out[0:3] += self.offset[0:3]
+
+        # Decay and apply scalar DOF offsets (qpos[7:]) with rotation halflife.
+        scalar_start = self.quat_slice.stop
+        if scalar_start < out.shape[0]:
+            self.offset[scalar_start:], self.offset_vel[scalar_start:] = self._decay_vec(
+                self.offset[scalar_start:], self.offset_vel[scalar_start:], dt, self.halflife_rotation
+            )
+            out[scalar_start:] += self.offset[scalar_start:]
+
+        # Decay and apply quaternion rotvec offset.
+        self.rot_off, self.rot_off_vel = self._decay_vec(
+            self.rot_off, self.rot_off_vel, dt, self.halflife_rotation
+        )
+        q_tgt = _quat_normalize(out[self.quat_slice])
+        q_off = _quat_axis_angle(self.rot_off, np.linalg.norm(self.rot_off))
+        out[self.quat_slice] = _quat_normalize(_quat_mul(q_off, q_tgt))
+
+        # Auto-deactivate once all offsets are effectively zero.
+        if (
+            np.linalg.norm(self.offset[0:3]) < 1e-5
+            and (scalar_start >= out.shape[0] or np.linalg.norm(self.offset[scalar_start:]) < 1e-5)
+            and np.linalg.norm(self.rot_off) < 1e-5
+        ):
+            self.active = False
+
+        return out
+
+
+def create_transition_manager(
+    mode,
+    frame_dt,
+    quat_slice=slice(3, 7),
+    blend_time_rotation=0.2,
+    blend_time_position=0.2,
+    halflife_position=0.12,
+    halflife_rotation=0.12,
+):
+    """Factory to keep mode selection localized in this module."""
+    mode = str(mode).lower()
+    if mode == "camdm":
+        return InertialTransitionManager(
+            frame_dt=frame_dt,
+            blend_time_rotation=blend_time_rotation,
+            blend_time_position=blend_time_position,
+            quat_slice=quat_slice,
+        )
+    if mode == "spring":
+        return SpringTransitionManager(
+            frame_dt=frame_dt,
+            quat_slice=quat_slice,
+            halflife_position=halflife_position,
+            halflife_rotation=halflife_rotation,
+        )
+    raise ValueError(f"Unknown inertialization mode '{mode}'. Expected one of: camdm, spring")

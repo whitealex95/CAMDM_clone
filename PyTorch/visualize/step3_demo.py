@@ -40,7 +40,7 @@ from diffusion.create_diffusion import create_gaussian_diffusion
 
 from visualize.motion_loader import MotionDataset
 from visualize.utils.geometry import draw_trajectory
-from visualize.utils.transition_manager import InertialTransitionManager
+from visualize.utils.transition_manager import create_transition_manager
 from visualize.utils.trajectory import blend_trajectory, extend_future_traj_heusristic, align_trajectory_to_pose
 
 import torch
@@ -222,7 +222,9 @@ class DemoPlayer:
                  show_trajectory=True, past_frames=10, future_frames=45, blend=0.5,
                  cfg_count=2, applyframes=15,
                  inertialize=True,
+                 inertialization_mode="camdm",
                  blendtime_rotation=0.2, blendtime_position=0.2,
+                 spring_halflife_position=0.12, spring_halflife_rotation=0.12,
                  inertial_quat_start=3, inertial_quat_end=7):
         self.model = model
         self.data = data
@@ -267,9 +269,12 @@ class DemoPlayer:
         self.prev_style_idx = None
 
         self.inertialize = bool(inertialize)
+        self.inertialization_mode = str(inertialization_mode).lower()
         # CAMDM inertialization parameters.
         self.blendtime_rotation = float(blendtime_rotation)
         self.blendtime_position = float(blendtime_position)
+        self.spring_halflife_position = float(spring_halflife_position)
+        self.spring_halflife_rotation = float(spring_halflife_rotation)
         # Quaternion segment in a single qpos vector (shape (4,), wxyz; no batch here).
         quat_slice = slice(int(inertial_quat_start), int(inertial_quat_end))
         self.quat_slice = quat_slice
@@ -361,11 +366,14 @@ class DemoPlayer:
     def update_pose_inertialized(self):
         """Update MuJoCo model with current frame pose using Inertialization."""
         if self.transition_manager is None:
-            self.transition_manager = InertialTransitionManager(
-                self.frame_dt,
+            self.transition_manager = create_transition_manager(
+                mode=self.inertialization_mode,
+                frame_dt=self.frame_dt,
+                quat_slice=self.quat_slice,
                 blend_time_rotation=self.blendtime_rotation,
                 blend_time_position=self.blendtime_position,
-                quat_slice=self.quat_slice,
+                halflife_position=self.spring_halflife_position,
+                halflife_rotation=self.spring_halflife_rotation,
             )
 
         # Regenerate chunk and trigger transition at chunk boundary.
@@ -602,6 +610,13 @@ def get_args():
         help="Enable or disable inertialization"
     )
     parser.add_argument(
+        "--inertialization-mode",
+        type=str,
+        default="camdm",
+        choices=["camdm", "spring"],
+        help="Inertialization backend"
+    )
+    parser.add_argument(
         "--blendtime-rotation",
         type=float,
         default=0.2,
@@ -612,6 +627,18 @@ def get_args():
         type=float,
         default=0.2,
         help="CAMDM inertialization blend time for root position (seconds)"
+    )
+    parser.add_argument(
+        "--spring-halflife-position",
+        type=float,
+        default=0.12,
+        help="Spring inertialization half-life for root position (seconds)"
+    )
+    parser.add_argument(
+        "--spring-halflife-rotation",
+        type=float,
+        default=0.12,
+        help="Spring inertialization half-life for root rotation/joint scalars (seconds)"
     )
     parser.add_argument(
         "--inertial-quat-start",
@@ -770,8 +797,11 @@ def main():
         cfg_count=args.cfg_count,
         applyframes=args.applyframes,
         inertialize=(args.inertialize == "on"),
+        inertialization_mode=args.inertialization_mode,
         blendtime_rotation=args.blendtime_rotation,
         blendtime_position=args.blendtime_position,
+        spring_halflife_position=args.spring_halflife_position,
+        spring_halflife_rotation=args.spring_halflife_rotation,
         inertial_quat_start=args.inertial_quat_start,
         inertial_quat_end=args.inertial_quat_end,
     )
