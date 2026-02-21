@@ -51,6 +51,10 @@ def _to_axis_angle(q):
 
 
 def _inertialize_scalar_from_xv(x0, v0, dt, tf, t):
+    # Core CAMDM inertialization curve:
+    # solve a 5th-order polynomial x(t) that starts from (x0, v0) and smoothly
+    # reaches 0 by tf with zero terminal velocity/acceleration.
+    # Intuition: carry current momentum at the switch, then "ease out" to target.
     tf1 = -5.0 * x0 / v0 if abs(v0) > 1e-8 else -1.0
     if tf1 > 0.0:
         tf = min(tf, tf1)
@@ -63,6 +67,8 @@ def _inertialize_scalar_from_xv(x0, v0, dt, tf, t):
     tf3 = tf2 * tf
     tf4 = tf3 * tf
     tf5 = tf4 * tf
+    # Coefficients for x(t)=A t^5 + B t^4 + C t^3 + (a0/2)t^2 + v0 t + x0
+    # under boundary conditions at t=tf.
     a0 = (-8.0 * v0 * tf - 20.0 * x0) / tf2
     A = -(a0 * tf2 + 6.0 * v0 * tf + 12.0 * x0) / (2.0 * tf5)
     B = (3.0 * a0 * tf2 + 16.0 * v0 * tf + 30.0 * x0) / (2.0 * tf4)
@@ -82,6 +88,8 @@ def _inertialize_scalar(prev, curr, target, dt, tf, t):
 
 
 def _inertialize_position(prev, curr, target, dt, tf, t):
+    # Reduce vector position inertialization to 1D along the current offset
+    # direction, then reconstruct back in 3D.
     vx0 = curr - target
     vxn1 = prev - target
     x0 = np.linalg.norm(vx0)
@@ -108,6 +116,8 @@ def _inertialize_rotation(prev, curr, target, dt, tf, t):
     if np.dot(curr, target) < 0.0:
         target = -target
 
+    # Compute rotational offsets in target-local space, then inertialize the
+    # scalar angle along the offset axis and reconstruct quaternion.
     q0 = _quat_normalize(_quat_mul(curr, _quat_inv(target)))
     qn1 = _quat_normalize(_quat_mul(prev, _quat_inv(target)))
 
@@ -156,6 +166,8 @@ class InertialTransitionManager:
             return target
 
         dt = self.frame_dt
+        # Remaining blend horizon shrinks each frame, matching CAMDM's per-frame
+        # tf = EndTime - Time.time behavior.
         tf_pos = max(1e-4, self.blend_time_position - self.elapsed)
         tf_rot = max(1e-4, self.blend_time_rotation - self.elapsed)
 
