@@ -62,12 +62,13 @@ class ModelWrapper(torch.nn.Module):
 class MotionGenerator:
     """Autoregressive motion generator with Dataset Guidance."""
     
-    def __init__(self, model, diffusion, config, device="cuda", sampler="ddpm"):
+    def __init__(self, model, diffusion, config, device="cuda", sampler="ddpm", cfg_scale=1.0):
         self.model = ModelWrapper(model)
         self.diffusion = diffusion
         self.config = config
         self.device = device
         self.sampler = sampler.lower()
+        self.cfg_scale = float(cfg_scale)
         
         # Model parameters
         self.past_frames = config.arch.past_frame
@@ -76,7 +77,7 @@ class MotionGenerator:
         self.rot_req = config.arch.rot_req
         self.per_rot_feat = 6 # 6D rotation representation
             
-    def generate_motion(self, past_qpos, traj_trans, traj_pose, style_idx):
+    def generate_motion(self, past_qpos, traj_trans, traj_pose, style_idx, cfg_scale=None):
         """
         Generate future motions given past motion and trajectory conditions.
         past_qpos: (past_frames, 36=7+29) numpy array
@@ -119,16 +120,42 @@ class MotionGenerator:
             'style_idx': style_idx_tensor, # (1)
             'y': {}
         }
+        uncond_model_kwargs = {
+            'past_motion': torch.zeros_like(past_motion_tensor), # CAMDM uncond: empty past motion
+            'traj_trans': traj_trans_tensor,
+            'traj_pose': traj_pose_tensor,
+            'style_idx': style_idx_tensor,
+            'y': {}
+        }
+        guidance_scale = self.cfg_scale if cfg_scale is None else float(cfg_scale)
+        if guidance_scale == 1.0:
+            sampling_model = self.model
+            sampling_kwargs = model_kwargs
+        else:
+            class _CFGWrapper(torch.nn.Module):
+                def __init__(self, cond_model, uncond_kwargs, scale):
+                    super().__init__()
+                    self.cond_model = cond_model
+                    self.uncond_kwargs = uncond_kwargs
+                    self.scale = scale
+
+                def forward(self, x, timesteps, **kwargs):
+                    pred_cond = self.cond_model(x, timesteps, **kwargs)
+                    pred_uncond = self.cond_model(x, timesteps, **self.uncond_kwargs)
+                    return pred_uncond + self.scale * (pred_cond - pred_uncond)
+
+            sampling_model = _CFGWrapper(self.model, uncond_model_kwargs, guidance_scale)
+            sampling_kwargs = model_kwargs
         
         shape = (1, self.joint_num + 1, self.per_rot_feat, self.future_frames)
         if self.sampler == "ddim":
             sample = self.diffusion.ddim_sample_loop(
-                self.model, shape, clip_denoised=False, model_kwargs=model_kwargs,
+                sampling_model, shape, clip_denoised=False, model_kwargs=sampling_kwargs,
                 progress=False, eta=0.0, device=self.device
             )
         elif self.sampler == "ddpm":
             sample = self.diffusion.p_sample_loop(
-                self.model, shape, clip_denoised=False, model_kwargs=model_kwargs,
+                sampling_model, shape, clip_denoised=False, model_kwargs=sampling_kwargs,
                 progress=False, device=self.device
             )
         else:
@@ -192,7 +219,8 @@ def model_format_to_qpos(model_output):
 
 class DemoPlayer:
     def __init__(self, model, data, dataset, motion_generator: MotionGenerator,
-                 show_trajectory=True, past_frames=10, future_frames=45, blend=0.5):
+                 show_trajectory=True, past_frames=10, future_frames=45, blend=0.5,
+                 cfg_count=2):
         self.model = model
         self.data = data
         self.dataset = dataset
@@ -227,6 +255,11 @@ class DemoPlayer:
         # Blending factor (1-t^blend) predicted + t^blend target, t ∈ [0, 1]
         # Respect CLI/config input instead of hard-coding.
         self.blend = blend
+        # CAMDM CFG burst count: use cfg_scale for first N regenerations,
+        # then fallback to scale=1.0 until style changes.
+        self.cfg_count_cache = int(cfg_count)
+        self.cfg_count = int(cfg_count)
+        self.prev_style_idx = None
 
         # Inertializer for smooth transitions
         self.inertializer = None # Inertializer(dim=36, halflife=0.1) # 
@@ -241,6 +274,9 @@ class DemoPlayer:
         self.current_motion_idx = motion_idx % len(self.dataset)
         self.current_motion_data = self.dataset[self.current_motion_idx]
         self.current_frame = 0
+        if self.prev_style_idx is None or self.current_motion_data.style_idx != self.prev_style_idx:
+            self.cfg_count = self.cfg_count_cache
+        self.prev_style_idx = self.current_motion_data.style_idx
         
         print(f"\n{'='*60}")
         print(f"Motion {self.current_motion_idx + 1}/{len(self.dataset)}")
@@ -278,11 +314,15 @@ class DemoPlayer:
         else:
             past_qpos = past_qpos_dataset
         style_idx = self.current_motion_data.style_idx
+        effective_cfg_scale = self.motion_generator.cfg_scale if self.cfg_count > 0 else 1.0
 
         # generated_qpos = self.motion_generator.generate_motion(
         #     past_qpos, self.future_traj_dataset[:, :2], self.future_orient_dataset, style_idx)
         self.raw_generated_qpos = self.motion_generator.generate_motion(past_qpos,
-                                self.future_traj, self.future_orient, style_idx)
+                                self.future_traj, self.future_orient, style_idx,
+                                cfg_scale=effective_cfg_scale)
+        if self.cfg_count > 0:
+            self.cfg_count -= 1
         generated_qpos = self.raw_generated_qpos.copy()
         return generated_qpos # (future_frames, 36)
 
@@ -551,7 +591,19 @@ def get_args():
         type=str,
         default="ddpm",
         choices=["ddpm", "ddim"],
-        help="Diffusion sampler (ddpm matches Unity inference path more closely)"
+        help="Diffusion sampler (ddpm matches CAMDM inference path more closely)"
+    )
+    parser.add_argument(
+        "--cfg-scale",
+        type=float,
+        default=0.5,
+        help="CAMDM CFG weight used during short style-switch/startup burst"
+    )
+    parser.add_argument(
+        "--cfg-count",
+        type=int,
+        default=2,
+        help="CAMDM CFG burst length in regeneration cycles; 0 disables burst scheduling"
     )
 
     parser.add_argument(
@@ -683,7 +735,10 @@ def main():
     diffusion_model.eval()
 
     # Create motion generator
-    generator = MotionGenerator(diffusion_model, diffusion, config, device, sampler=args.sampler)
+    generator = MotionGenerator(
+        diffusion_model, diffusion, config, device,
+        sampler=args.sampler, cfg_scale=args.cfg_scale
+    )
     
     # Create motion player
     player = DemoPlayer(
@@ -691,7 +746,8 @@ def main():
         show_trajectory=True,
         past_frames=args.past_frames,
         future_frames=args.future_frames,
-        blend=args.blend
+        blend=args.blend,
+        cfg_count=args.cfg_count
     )
     
     # Start from specified motion
