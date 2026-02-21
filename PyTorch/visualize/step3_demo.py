@@ -40,7 +40,7 @@ from diffusion.create_diffusion import create_gaussian_diffusion
 
 from visualize.motion_loader import MotionDataset
 from visualize.utils.geometry import draw_trajectory
-from visualize.utils.intertializer import Inertializer
+from visualize.utils.transition_manager import InertialTransitionManager
 from visualize.utils.trajectory import blend_trajectory, extend_future_traj_heusristic, align_trajectory_to_pose
 
 import torch
@@ -220,7 +220,10 @@ def model_format_to_qpos(model_output):
 class DemoPlayer:
     def __init__(self, model, data, dataset, motion_generator: MotionGenerator,
                  show_trajectory=True, past_frames=10, future_frames=45, blend=0.5,
-                 cfg_count=2, applyframes=15):
+                 cfg_count=2, applyframes=15,
+                 inertialize=True,
+                 blendtime_rotation=0.2, blendtime_position=0.2,
+                 inertial_quat_start=3, inertial_quat_end=7):
         self.model = model
         self.data = data
         self.dataset = dataset
@@ -263,8 +266,14 @@ class DemoPlayer:
         self.cfg_count = int(cfg_count)
         self.prev_style_idx = None
 
-        # Inertializer for smooth transitions
-        self.inertializer = None # Inertializer(dim=36, halflife=0.1) # 
+        self.inertialize = bool(inertialize)
+        # CAMDM inertialization parameters.
+        self.blendtime_rotation = float(blendtime_rotation)
+        self.blendtime_position = float(blendtime_position)
+        # Quaternion segment in a single qpos vector (shape (4,), wxyz; no batch here).
+        quat_slice = slice(int(inertial_quat_start), int(inertial_quat_end))
+        self.quat_slice = quat_slice
+        self.transition_manager = None
         
         # Load first motion
         self.load_motion(motion_idx=27)
@@ -329,10 +338,10 @@ class DemoPlayer:
         return generated_qpos # (future_frames, 36)
 
     def update_pose(self):
-        if self.inertializer is None:
-            self.update_pose_raw()
-        else:
+        if self.inertialize:
             self.update_pose_inertialized()
+        else:
+            self.update_pose_raw()
 
     def update_pose_raw(self):
         """Update MuJoCo model with current frame pose."""
@@ -350,64 +359,35 @@ class DemoPlayer:
         self.generated_frame_idx = (self.generated_frame_idx + 1) % self.apply_generated_frames
 
     def update_pose_inertialized(self):
-            """Update MuJoCo model with current frame pose using Inertialization."""
-            
-            # 1. Estimate current velocity from history (Finite Difference)
-            #    Needed to ensure C1 continuity (smooth velocity)
-            if len(self.qpos_history) >= 2:
-                # Velocity = (Current - Prev) / dt
-                curr_vel = (np.array(self.qpos_history[-1]) - np.array(self.qpos_history[-2])) / self.frame_dt
-            else:
-                curr_vel = np.zeros_like(self.data.qpos)
+        """Update MuJoCo model with current frame pose using Inertialization."""
+        if self.transition_manager is None:
+            self.transition_manager = InertialTransitionManager(
+                self.frame_dt,
+                blend_time_rotation=self.blendtime_rotation,
+                blend_time_position=self.blendtime_position,
+                quat_slice=self.quat_slice,
+            )
 
-            # 2. Check if we need to generate new frames (The Transition Point)
-            if self.generated_frame_idx == 0:
-                # Capture the state BEFORE we overwrite the plan
-                source_qpos = np.array(self.qpos_history[-1]) if len(self.qpos_history) > 0 else self.data.qpos.copy()
-                source_vel = curr_vel
-                
-                # Generate the NEW trajectory
-                self.generated_qpos = self.generate_motion()
+        # Regenerate chunk and trigger transition at chunk boundary.
+        if self.generated_frame_idx == 0:
+            self.generated_qpos = self.generate_motion()
+            # Initialize transition state from previous/current pose to new chunk start.
+            self.transition_manager.start_transition(
+                self.qpos_history, self.data.qpos.copy(), self.generated_qpos
+            )
 
-                # Identify where the new trajectory starts
-                target_start_qpos = self.generated_qpos[0]
-                
-                # Estimate velocity of the new trajectory start
-                # (Use next frame if available, otherwise 0)
-                if len(self.generated_qpos) > 1:
-                    target_start_vel = (self.generated_qpos[1] - self.generated_qpos[0]) / self.frame_dt
-                else:
-                    target_start_vel = np.zeros_like(target_start_qpos)
+        raw_target_qpos = self.generated_qpos[self.generated_frame_idx]
+        # Apply one-frame inertialization toward the raw target pose.
+        final_qpos = self.transition_manager.apply(raw_target_qpos)
 
-                # >>> TRIGGER INERTIALIZATION <<<
-                # This calculates the gap so we can bridge it
-                self.inertializer.transition(source_qpos, source_vel, target_start_qpos, target_start_vel)
+        self.update_qpos_history(final_qpos.copy())  # Store the SMOOTHED pose
+        self.update_past_trajectory()
+        self.update_future_trajectory()
 
-            # 3. Get the raw target pose for the current frame
-            raw_target_qpos = self.generated_qpos[self.generated_frame_idx]
+        self.data.qpos[:] = final_qpos
+        mujoco.mj_forward(self.model, self.data)
 
-            # 4. Calculate the smooth offset for this frame
-            current_offset = self.inertializer.update(self.frame_dt)
-            
-            # 5. Apply offset to target
-            final_qpos = raw_target_qpos + current_offset
-
-            # 6. Post-process: Normalize Quaternion (indices 3,4,5,6)
-            #    Linear inertialization distorts rotation scaling, normalization fixes it.
-            #    Assumes layout: [x, y, z, w, x, y, z, ...joints]
-            quat = final_qpos[3:7]
-            if np.linalg.norm(quat) > 1e-6:
-                final_qpos[3:7] = quat / np.linalg.norm(quat)
-
-            # 7. Standard Updates
-            self.update_qpos_history(final_qpos.copy()) # Store the SMOOTHED pose
-            self.update_past_trajectory()
-            self.update_future_trajectory()
-            
-            self.data.qpos[:] = final_qpos
-            mujoco.mj_forward(self.model, self.data)
-
-            self.generated_frame_idx = (self.generated_frame_idx + 1) % self.apply_generated_frames
+        self.generated_frame_idx = (self.generated_frame_idx + 1) % self.apply_generated_frames
 
     def init_qpos_history(self, qpos):
         """Initialize qpos history deque."""
@@ -614,6 +594,37 @@ def get_args():
         default=15,
         help="CAMDM applyframes: number of generated frames to apply before next inference (must be <= future_frames)"
     )
+    parser.add_argument(
+        "--inertialize",
+        type=str,
+        default="on",
+        choices=["on", "off"],
+        help="Enable or disable inertialization"
+    )
+    parser.add_argument(
+        "--blendtime-rotation",
+        type=float,
+        default=0.2,
+        help="CAMDM inertialization blend time for rotations (seconds)"
+    )
+    parser.add_argument(
+        "--blendtime-position",
+        type=float,
+        default=0.2,
+        help="CAMDM inertialization blend time for root position (seconds)"
+    )
+    parser.add_argument(
+        "--inertial-quat-start",
+        type=int,
+        default=3,
+        help="Start index (inclusive) of quaternion slice in qpos"
+    )
+    parser.add_argument(
+        "--inertial-quat-end",
+        type=int,
+        default=7,
+        help="End index (exclusive) of quaternion slice in qpos"
+    )
 
     parser.add_argument(
         "--motion",
@@ -757,7 +768,12 @@ def main():
         future_frames=args.future_frames,
         blend=args.blend,
         cfg_count=args.cfg_count,
-        applyframes=args.applyframes
+        applyframes=args.applyframes,
+        inertialize=(args.inertialize == "on"),
+        blendtime_rotation=args.blendtime_rotation,
+        blendtime_position=args.blendtime_position,
+        inertial_quat_start=args.inertial_quat_start,
+        inertial_quat_end=args.inertial_quat_end,
     )
     
     # Start from specified motion
