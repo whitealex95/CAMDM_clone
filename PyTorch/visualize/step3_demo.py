@@ -219,7 +219,8 @@ def model_format_to_qpos(model_output):
 
 class DemoPlayer:
     def __init__(self, model, data, dataset, motion_generator: MotionGenerator,
-                 show_trajectory=True, past_frames=10, future_frames=45, blend=0.5,
+                 show_trajectory=True, past_frames=10, future_frames=45,
+                 traj_bias_pos=0.4, traj_bias_rot=2.2,
                  cfg_count=2, applyframes=15,
                  inertialize=True,
                  inertialization_mode="camdm",
@@ -259,9 +260,10 @@ class DemoPlayer:
         self.generated_qpos = None
         self.generated_future_traj = None
         self.generated_future_orient = None
-        # Blending factor (1-t^blend) predicted + t^blend target, t ∈ [0, 1]
-        # Respect CLI/config input instead of hard-coding.
-        self.blend = blend
+        # CAMDM baseline trajectory blending coefficients:
+        # scale = 1 - (1 - w)^bias, w = (t+1)/T.
+        self.traj_bias_pos = float(traj_bias_pos)
+        self.traj_bias_rot = float(traj_bias_rot)
         # CAMDM CFG burst count: use cfg_scale for first N regenerations,
         # then fallback to scale=1.0 until style changes.
         self.cfg_count_cache = int(cfg_count)
@@ -459,7 +461,8 @@ class DemoPlayer:
                 model_pred_future_traj, model_pred_future_orient, t_total, K=1)
             
             blended_future_traj, blended_future_orient = blend_trajectory(extended_future_traj, extended_future_orient,
-                                                                          self.future_traj_dataset, self.future_orient_dataset, self.blend)
+                                                                          self.future_traj_dataset, self.future_orient_dataset,
+                                                                          blend=self.traj_bias_pos, blend_rot=self.traj_bias_rot)
             self.future_traj = blended_future_traj # XY only
             self.future_orient = blended_future_orient # wxyz
         else:
@@ -576,7 +579,24 @@ def get_args():
         help="Dataset name (lafan1_g1 or 100style)"
     )
     parser.add_argument("--checkpoint", type=str, default="save/camdm_g1_lafan1_g1_epoch500_diff8/best.pt")
-    parser.add_argument("--blend", type=float, default=0.3, help="0.0 = Pure AI, 1.0 = Pure GT Trajectory")    
+    parser.add_argument(
+        "--traj-bias-pos",
+        type=float,
+        default=0.4,
+        help="CAMDM trajectory position blend bias (bias_HFTE)"
+    )
+    parser.add_argument(
+        "--traj-bias-rot",
+        type=float,
+        default=2.2,
+        help="CAMDM trajectory rotation blend bias (bias_dir)"
+    )
+    parser.add_argument(
+        "--blend",
+        type=float,
+        default=None,
+        help="Deprecated alias: set both --traj-bias-pos and --traj-bias-rot to this value"
+    )
     parser.add_argument(
         "--sampler",
         type=str,
@@ -672,6 +692,9 @@ def get_args():
         help="Number of future trajectory frames to visualize (default: 45)"
     )
     args = parser.parse_args()
+    if args.blend is not None:
+        args.traj_bias_pos = args.blend
+        args.traj_bias_rot = args.blend
     return args
 
 def print_instruction():
@@ -793,7 +816,8 @@ def main():
         show_trajectory=True,
         past_frames=args.past_frames,
         future_frames=args.future_frames,
-        blend=args.blend,
+        traj_bias_pos=args.traj_bias_pos,
+        traj_bias_rot=args.traj_bias_rot,
         cfg_count=args.cfg_count,
         applyframes=args.applyframes,
         inertialize=(args.inertialize == "on"),
