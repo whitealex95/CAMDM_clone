@@ -159,7 +159,7 @@ class InteractiveTrajectoryBlender:
         blended_orient = self.blended_qpos[:, 3:7]
         
         # Draw generated trajectory (Gray)
-        draw_trajectory(viewer, self.gen_qpos[:, :3], gen_orient, 
+        draw_trajectory(viewer.user_scn, self.gen_qpos[:, :3], gen_orient, 
                        color=[0.5, 0.5, 0.5, 0.7])
         
         # Draw target trajectory (Red)
@@ -167,11 +167,11 @@ class InteractiveTrajectoryBlender:
         target_3d = np.zeros((self.T, 3))
         target_3d[:, :2] = self.target_trans
         target_3d[:, 2] = 0.95  # Same height
-        draw_trajectory(viewer, target_3d, self.target_pose, 
+        draw_trajectory(viewer.user_scn, target_3d, self.target_pose, 
                        color=[1.0, 0.2, 0.2, 0.9])
         
         # Draw blended trajectory (Green)
-        draw_trajectory(viewer, self.blended_qpos[:, :3], blended_orient, 
+        draw_trajectory(viewer.user_scn, self.blended_qpos[:, :3], blended_orient, 
                        color=[0.2, 1.0, 0.2, 1.0])
 
     def render_overlay(self, viewer: mujoco.viewer.Handle):
@@ -417,7 +417,7 @@ def main():
             blender.step()
             blender.render_trajectory(viewer)
             draw_label(
-                viewer,
+                viewer.user_scn,
                 position=np.array([0.0, 0.0, 2.0]),
                 label=f"Blend: {blender.blend:.2f} (B/N to adjust)",
                 size=2,
