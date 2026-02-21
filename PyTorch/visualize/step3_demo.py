@@ -28,8 +28,6 @@ import time
 import numpy as np
 import mujoco
 import mujoco.viewer
-from scipy.spatial.transform import Rotation as R
-from scipy.spatial.transform import Slerp
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -44,7 +42,6 @@ from visualize.utils.transition_manager import create_transition_manager
 from visualize.utils.trajectory import blend_trajectory, extend_future_traj_heusristic, align_trajectory_to_pose
 
 import torch
-from visualize.utils.rotations import rot_from_wxyz
 
 
 class ModelWrapper(torch.nn.Module):
@@ -65,13 +62,11 @@ class MotionGenerator:
     def __init__(self, model, diffusion, config, device="cuda", sampler="ddpm", cfg_scale=1.0):
         self.model = ModelWrapper(model)
         self.diffusion = diffusion
-        self.config = config
         self.device = device
         self.sampler = sampler.lower()
         self.cfg_scale = float(cfg_scale)
         
         # Model parameters
-        self.past_frames = config.arch.past_frame
         self.future_frames = config.arch.future_frame
         self.joint_num = 30 # 1 + 29
         self.rot_req = config.arch.rot_req
@@ -87,9 +82,8 @@ class MotionGenerator:
         Returns:
             generated_qpos: (future_frames, 36=7+29) numpy array
         """
-        # Obtain current root position and orientation for centering
+        # Obtain current root position for centering
         curr_root_XY = past_qpos[-1, :2].copy()  # (2,)
-        curr_root_quat = past_qpos[-1, 3:7]
 
         # A. Prepare Past Motion Conditions
         past_qpos_centered = past_qpos.copy()
@@ -320,10 +314,6 @@ class DemoPlayer:
         past_qpos_dataset = self.current_motion_data.get_past_qpos(self.current_frame)
         return past_qpos_dataset
 
-    def load_future_qpos(self):
-        future_qpos_dataset = self.current_motion_data.get_future_qpos(self.current_frame)
-        return future_qpos_dataset
-
     def generate_motion(self):
         """Generate future poses using the motion generator."""
         past_qpos_dataset = self.load_past_qpos()
@@ -334,14 +324,11 @@ class DemoPlayer:
         style_idx = self.current_motion_data.style_idx
         effective_cfg_scale = self.motion_generator.cfg_scale if self.cfg_count > 0 else 1.0
 
-        # generated_qpos = self.motion_generator.generate_motion(
-        #     past_qpos, self.future_traj_dataset[:, :2], self.future_orient_dataset, style_idx)
-        self.raw_generated_qpos = self.motion_generator.generate_motion(past_qpos,
-                                self.future_traj, self.future_orient, style_idx,
-                                cfg_scale=effective_cfg_scale)
+        generated_qpos = self.motion_generator.generate_motion(
+            past_qpos, self.future_traj, self.future_orient, style_idx, cfg_scale=effective_cfg_scale
+        )
         if self.cfg_count > 0:
             self.cfg_count -= 1
-        generated_qpos = self.raw_generated_qpos.copy()
         return generated_qpos # (future_frames, 36)
 
     def update_pose(self):
@@ -536,16 +523,15 @@ class DemoPlayer:
             return
         assert hasattr(self, 'past_traj') and hasattr(self, 'future_traj'), \
             "Trajectory data not available for visualization."
-        if True:
-            # --- DRAW PAST (Blue) ---
-            if len(self.past_traj) > 0:
-                draw_trajectory(scene, self.past_traj, self.past_orient, color=[0.2, 0.5, 1.0, 1.0])
-            # --- DRAW FUTURE (Red) ---
-            if len(self.future_traj_dataset) > 0:
-                draw_trajectory(scene, self.future_traj_dataset, self.future_orient_dataset, color=[1.0, 0.2, 0.2, 1.0])
-                draw_trajectory(scene, self.future_traj, self.future_orient, color=[0.2, 1.0, 0.2, 1.0])
-                if self.generated_future_traj is not None:
-                    draw_trajectory(scene, self.generated_future_traj, self.generated_future_orient, color=[0.2, 0.2, 0.2, 0.5])
+        # --- DRAW PAST (Blue) ---
+        if len(self.past_traj) > 0:
+            draw_trajectory(scene, self.past_traj, self.past_orient, color=[0.2, 0.5, 1.0, 1.0])
+        # --- DRAW FUTURE (Red/Green/Gray) ---
+        if len(self.future_traj_dataset) > 0:
+            draw_trajectory(scene, self.future_traj_dataset, self.future_orient_dataset, color=[1.0, 0.2, 0.2, 1.0])
+            draw_trajectory(scene, self.future_traj, self.future_orient, color=[0.2, 1.0, 0.2, 1.0])
+            if self.generated_future_traj is not None:
+                draw_trajectory(scene, self.generated_future_traj, self.generated_future_orient, color=[0.2, 0.2, 0.2, 0.5])
 
     def toggle_trajectory(self):
         """Toggle trajectory visualization."""
@@ -572,129 +558,35 @@ class DemoPlayer:
 
 def get_args():
     parser = argparse.ArgumentParser(description="Visualize training motion data")
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="lafan1_g1",
-        help="Dataset name (lafan1_g1 or 100style)"
-    )
+    # Data/model setup
+    parser.add_argument("--dataset", type=str, default="lafan1_g1", help="Dataset name (lafan1_g1 or 100style)")
     parser.add_argument("--checkpoint", type=str, default="save/camdm_g1_lafan1_g1_epoch500_diff8/best.pt")
-    parser.add_argument(
-        "--traj-bias-pos",
-        type=float,
-        default=0.4,
-        help="CAMDM trajectory position blend bias (bias_HFTE)"
-    )
-    parser.add_argument(
-        "--traj-bias-rot",
-        type=float,
-        default=2.2,
-        help="CAMDM trajectory rotation blend bias (bias_dir)"
-    )
-    parser.add_argument(
-        "--blend",
-        type=float,
-        default=None,
-        help="Deprecated alias: set both --traj-bias-pos and --traj-bias-rot to this value"
-    )
-    parser.add_argument(
-        "--sampler",
-        type=str,
-        default="ddpm",
-        choices=["ddpm", "ddim"],
-        help="Diffusion sampler (ddpm matches CAMDM inference path more closely)"
-    )
-    parser.add_argument(
-        "--cfg-scale",
-        type=float,
-        default=0.5,
-        help="CAMDM CFG weight used during short style-switch/startup burst"
-    )
-    parser.add_argument(
-        "--cfg-count",
-        type=int,
-        default=2,
-        help="CAMDM CFG burst length in regeneration cycles; 0 disables burst scheduling"
-    )
-    parser.add_argument(
-        "--applyframes",
-        type=int,
-        default=15,
-        help="CAMDM applyframes: number of generated frames to apply before next inference (must be <= future_frames)"
-    )
-    parser.add_argument(
-        "--inertialize",
-        type=str,
-        default="on",
-        choices=["on", "off"],
-        help="Enable or disable inertialization"
-    )
-    parser.add_argument(
-        "--inertialization-mode",
-        type=str,
-        default="camdm",
-        choices=["camdm", "spring"],
-        help="Inertialization backend"
-    )
-    parser.add_argument(
-        "--blendtime-rotation",
-        type=float,
-        default=0.2,
-        help="CAMDM inertialization blend time for rotations (seconds)"
-    )
-    parser.add_argument(
-        "--blendtime-position",
-        type=float,
-        default=0.2,
-        help="CAMDM inertialization blend time for root position (seconds)"
-    )
-    parser.add_argument(
-        "--spring-halflife-position",
-        type=float,
-        default=0.12,
-        help="Spring inertialization half-life for root position (seconds)"
-    )
-    parser.add_argument(
-        "--spring-halflife-rotation",
-        type=float,
-        default=0.12,
-        help="Spring inertialization half-life for root rotation/joint scalars (seconds)"
-    )
-    parser.add_argument(
-        "--inertial-quat-start",
-        type=int,
-        default=3,
-        help="Start index (inclusive) of quaternion slice in qpos"
-    )
-    parser.add_argument(
-        "--inertial-quat-end",
-        type=int,
-        default=7,
-        help="End index (exclusive) of quaternion slice in qpos"
-    )
 
-    parser.add_argument(
-        "--motion",
-        type=int,
-        default=0,
-        help="Starting motion index"
-    )
-    parser.add_argument(
-        "--past-frames",
-        type=int,
-        default=10,
-        help="Number of past trajectory frames to visualize (default: 10)"
-    )
-    parser.add_argument(
-        "--future-frames",
-        type=int,
-        default=45,
-        help="Number of future trajectory frames to visualize (default: 45)"
-    )
+    # Trajectory conditioning
+    parser.add_argument("--traj-bias-pos", type=float, default=0.4, help="CAMDM trajectory position blend bias (bias_HFTE)")
+    parser.add_argument("--traj-bias-rot", type=float, default=2.2, help="CAMDM trajectory rotation blend bias (bias_dir)")
+    parser.add_argument("--past-frames", type=int, default=10, help="Number of past trajectory frames to visualize (default: 10)")
+    parser.add_argument("--future-frames", type=int, default=45, help="Number of future trajectory frames to visualize (default: 45)")
+
+    # Diffusion/CFG
+    parser.add_argument("--sampler", type=str, default="ddpm", choices=["ddpm", "ddim"], help="Diffusion sampler (ddpm matches CAMDM inference path more closely)")
+    parser.add_argument("--cfg-scale", type=float, default=0.5, help="CAMDM CFG weight used during short style-switch/startup burst")
+    parser.add_argument("--cfg-count", type=int, default=2, help="CAMDM CFG burst length in regeneration cycles; 0 disables burst scheduling")
+    parser.add_argument("--applyframes", type=int, default=15, help="CAMDM applyframes: number of generated frames to apply before next inference (must be <= future_frames)")
+
+    # Inertialization
+    parser.add_argument("--inertialize", type=str, default="on", choices=["on", "off"], help="Enable or disable inertialization")
+    parser.add_argument("--inertialization-mode", type=str, default="camdm", choices=["camdm", "spring"], help="Inertialization backend")
+    parser.add_argument("--blendtime-rotation", type=float, default=0.2, help="CAMDM inertialization blend time for rotations (seconds)")
+    parser.add_argument("--blendtime-position", type=float, default=0.2, help="CAMDM inertialization blend time for root position (seconds)")
+    parser.add_argument("--spring-halflife-position", type=float, default=0.12, help="Spring inertialization half-life for root position (seconds)")
+    parser.add_argument("--spring-halflife-rotation", type=float, default=0.12, help="Spring inertialization half-life for root rotation/joint scalars (seconds)")
+    parser.add_argument("--inertial-quat-start", type=int, default=3, help="Start index (inclusive) of quaternion slice in qpos")
+    parser.add_argument("--inertial-quat-end", type=int, default=7, help="End index (exclusive) of quaternion slice in qpos")
+
+    # Playback/navigation
+    parser.add_argument("--motion", type=int, default=0, help="Starting motion index")
     args = parser.parse_args()
-    if args.blend is not None:
-        args.traj_bias_pos = args.blend
-        args.traj_bias_rot = args.blend
     return args
 
 def print_instruction():
@@ -851,26 +743,24 @@ def main():
             while viewer.is_running():
 
                 player.step()
-                # with viewer.lock():
-                if True:
-                    viewer.user_scn.ngeom = 0
-                    player.render_trajectory(viewer.user_scn)
-                    if player.camera_follow:
-                        viewer.cam.lookat[:] = mj_data.qpos[:3]
-                    viewer.sync()
+                viewer.user_scn.ngeom = 0
+                player.render_trajectory(viewer.user_scn)
+                if player.camera_follow:
+                    viewer.cam.lookat[:] = mj_data.qpos[:3]
+                viewer.sync()
 
-                    # --- Render frame to video---
-                    if time.time() - frame_last_time > 1/FPS:
-                        renderer.update_scene(
-                            mj_data, 
-                            camera=viewer.cam # Use the viewer's active camera
-                        )
-                        player.render_trajectory(renderer.scene)
-                        frame = renderer.render()
-                        writer.append_data(frame)
-                        frame_last_time = time.time()
-                    else:
-                        continue
+                # --- Render frame to video---
+                if time.time() - frame_last_time > 1/FPS:
+                    renderer.update_scene(
+                        mj_data, 
+                        camera=viewer.cam # Use the viewer's active camera
+                    )
+                    player.render_trajectory(renderer.scene)
+                    frame = renderer.render()
+                    writer.append_data(frame)
+                    frame_last_time = time.time()
+                else:
+                    continue
         except KeyboardInterrupt:
             writer.close()
             print("Video saved to", OUT)
