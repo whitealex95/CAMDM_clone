@@ -220,7 +220,7 @@ def model_format_to_qpos(model_output):
 class DemoPlayer:
     def __init__(self, model, data, dataset, motion_generator: MotionGenerator,
                  show_trajectory=True, past_frames=10, future_frames=45, blend=0.5,
-                 cfg_count=2):
+                 cfg_count=2, applyframes=15):
         self.model = model
         self.data = data
         self.dataset = dataset
@@ -240,7 +240,9 @@ class DemoPlayer:
         # Frame rate (from make_pose_data_g1.py)
         self.fps = 30
         self.frame_dt = 1.0 / self.fps
-        self.apply_generated_frames = 10 # frames to apply per generation step (default: 15, meaning 2Hz generation)
+        # CAMDM uses "applyframes" to control how many predicted frames are applied
+        # before running a new diffusion pass.
+        self.apply_generated_frames = int(applyframes)
         self.generated_frame_idx = 0
 
         # Create a queue to store qpos history
@@ -572,6 +574,7 @@ class DemoPlayer:
             f"Style: {self.current_motion_data.style} | "
             f"{'Playing' if self.playing else 'Paused'} "
             f"({self.playback_speed}x) | "
+            f"ApplyFrames: {self.apply_generated_frames} | "
             f"Traj: {'ON' if self.show_trajectory else 'OFF'}"
         )
         print(status)
@@ -604,6 +607,12 @@ def get_args():
         type=int,
         default=2,
         help="CAMDM CFG burst length in regeneration cycles; 0 disables burst scheduling"
+    )
+    parser.add_argument(
+        "--applyframes",
+        type=int,
+        default=15,
+        help="CAMDM applyframes: number of generated frames to apply before next inference (must be <= future_frames)"
     )
 
     parser.add_argument(
@@ -747,7 +756,8 @@ def main():
         past_frames=args.past_frames,
         future_frames=args.future_frames,
         blend=args.blend,
-        cfg_count=args.cfg_count
+        cfg_count=args.cfg_count,
+        applyframes=args.applyframes
     )
     
     # Start from specified motion
