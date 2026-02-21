@@ -209,33 +209,3 @@ def align_trajectory_to_pose(future_traj, future_orient, ref_qpos, curr_qpos):
     aligned_orient = aligned_quats_scipy.as_quat()[:, [3, 0, 1, 2]]
 
     return aligned_traj, aligned_orient
-
-if __name__ == "__main__":
-    # Simple test gen_qpos trajectory of 45 steps
-    blend = 0.5
-    T = 45
-    n_joints = 29
-    gen_qpos = np.zeros((T, 7 + n_joints))  # 7 for root (pos + quat_wxyz), rest for joints
-    
-    for t in range(T):
-        # Linearly move in x from 0 to 10
-        gen_qpos[t, 0] = (10.0 / (T - 1)) * t
-        # Keep y and z at 0
-        gen_qpos[t, 1] = 0.0
-        gen_qpos[t, 2] = 0.0
-        # No rotation (identity quaternion)
-        gen_qpos[t, 3:7] = [1.0, 0.0, 0.0, 0.0]
-    
-    # Target trajectory: move in y from 0 to 10, no change in x
-    target_trans = np.zeros((T, 2))
-    target_pose = np.zeros((T, 4))
-    for t in range(T):
-        target_trans[t, 0] = 0.0  # x
-        target_trans[t, 1] = (10.0 / (T - 1)) * t  # y
-        # 90 degree rotation around z-axis
-        angle = (np.pi / 2) * (t / (T - 1))
-        half_sin = np.sin(angle / 2)
-        target_pose[t] = [np.cos(angle / 2), 0.0, 0.0, half_sin]  # wxyz    
-    
-    blended_qpos = blend_qpos(gen_qpos, target_trans, target_pose, blend=0.5)
-    print("Blended QPos:\n", blended_qpos)
