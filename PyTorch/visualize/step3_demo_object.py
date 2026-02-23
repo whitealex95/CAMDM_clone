@@ -222,7 +222,9 @@ class MotionGeneratorObject:
 
     def generate_motion(
         self, past_qpos43, past_contact, traj_trans, traj_pose, traj_contact,
-        traj_obj_trans, traj_obj_pose, style_idx, cfg_scale=None
+        traj_obj_trans, traj_obj_pose, style_idx, cfg_scale=None,
+        frame_mode="root_yaw_gravity_aligned",
+        has_object=True,
     ):
         curr_root_xy = past_qpos43[-1, :2].copy()
 
@@ -232,8 +234,11 @@ class MotionGeneratorObject:
         past_q[:, [36, 37]] -= curr_root_xy[None, :]
 
         past_body = qpos36_to_body_state(past_q[:, :36])         # [Tp,186]
-        frame_mode = self.object_pose_relative_frame
-        past_obj_rel = np.stack([compute_object_pose_relative_frame(x, frame_mode=frame_mode) for x in past_q], axis=0)  # [Tp,12]
+        if has_object:
+            past_obj_rel = np.stack([compute_object_pose_relative_frame(x, frame_mode=frame_mode) for x in past_q], axis=0)  # [Tp,12]
+        else:
+            # Match walk padding used in training data.
+            past_obj_rel = np.zeros((past_q.shape[0], 12), dtype=np.float32)
         past_state = np.concatenate([past_body, past_obj_rel, past_contact.reshape(-1, 1)], axis=-1)  # [Tp,199]
         past_state = past_state[..., None]                        # [Tp,199,1]
 
@@ -241,9 +246,15 @@ class MotionGeneratorObject:
         traj_trans_centered -= curr_root_xy[None, :]
 
         traj_pose_repr = nn_transforms.get_rotation(torch.from_numpy(traj_pose).float(), self.rot_req).numpy()
-        traj_obj_pose_repr = nn_transforms.get_rotation(torch.from_numpy(traj_obj_pose).float(), self.rot_req).numpy()
-        traj_obj_trans_centered = traj_obj_trans.copy()
-        traj_obj_trans_centered -= curr_root_xy[None, :]
+        if has_object:
+            traj_obj_pose_repr = nn_transforms.get_rotation(torch.from_numpy(traj_obj_pose).float(), self.rot_req).numpy()
+            traj_obj_trans_centered = traj_obj_trans.copy()
+            traj_obj_trans_centered -= curr_root_xy[None, :]
+        else:
+            # Neutral object condition for walk style.
+            traj_obj_trans_centered = np.zeros_like(traj_trans_centered, dtype=np.float32)
+            id_quat = np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (traj_pose.shape[0], 1))
+            traj_obj_pose_repr = nn_transforms.get_rotation(torch.from_numpy(id_quat).float(), self.rot_req).numpy()
 
         past_motion_t = torch.from_numpy(past_state).float().unsqueeze(0).permute(0, 2, 3, 1).to(self.device)
         traj_trans_t = torch.from_numpy(traj_trans_centered).float().unsqueeze(0).permute(0, 2, 1).to(self.device)
@@ -313,6 +324,9 @@ class MotionGeneratorObject:
 
         pred_qpos36 = body_state_to_qpos36(pred_body)
         pred_qpos36[:, :2] += curr_root_xy[None, :]
+        if not has_object:
+            pred_obj_rel[:] = 0.0
+            pred_contact[:] = 0.0
         return pred_qpos36.astype(np.float32), pred_obj_rel.astype(np.float32), pred_contact.squeeze(-1).astype(np.float32)
 
 
@@ -461,7 +475,9 @@ class DemoPlayerObject:
         q36, obj_rel, pred_c = self.motion_generator.generate_motion(
             past_q, past_c, self.future_traj, self.future_orient, desired_contact,
             self.future_obj_traj, self.future_obj_orient,
-            style_idx, cfg_scale=effective_cfg_scale
+            style_idx, cfg_scale=effective_cfg_scale,
+            frame_mode=self.object_pose_relative_frame,
+            has_object=self.current_motion_data.has_object,
         )
         if self.cfg_count > 0:
             self.cfg_count -= 1
@@ -476,13 +492,13 @@ class DemoPlayerObject:
         obj_rel = self.generated_obj_rel[i]
         c = float(self.generated_contact[i])
 
-        # Update object world pose only when contact is active.
-        if c > 0.5:
+        # Update object world pose only when predicted contact is active.
+        if self.current_motion_data.has_object and c > 0.5:
             obj_pos, obj_q = object_relative_to_world(
                 q36[:3], q36[3:7], obj_rel, frame_mode=self.object_pose_relative_frame
             )
             self.current_obj_pose_world = np.concatenate([obj_pos, obj_q], axis=0).astype(np.float32)
-        elif self.current_obj_pose_world is None:
+        elif self.current_obj_pose_world is None or not self.current_motion_data.has_object:
             self.current_obj_pose_world = np.array([0.0, 0.0, -10.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
         q43 = np.concatenate([q36, self.current_obj_pose_world], axis=0).astype(np.float32)
