@@ -40,7 +40,7 @@ class SingleObjectMotionDataset(Dataset):
         self.object_pose_rel_list = []
         self.object_contact_list = []
 
-        self.local_conds = {"traj_pose": [], "traj_trans": []}
+        self.local_conds = {"traj_pose": [], "traj_trans": [], "obj_traj_pose": [], "obj_traj_trans": []}
         self.global_conds = {"style": []}
         item_indices = []
         motion_idx = 0
@@ -54,6 +54,18 @@ class SingleObjectMotionDataset(Dataset):
             root_pos = motion["global_root_positions"].astype(dtype)
             obj_rel = np.asarray(motion.get("object_pose_relative", np.zeros((N, 12), dtype=dtype)), dtype=dtype)
             obj_contact = np.asarray(motion.get("object_contact_mask", np.zeros((N, 1), dtype=dtype)), dtype=dtype).reshape(N, 1)
+            if "obj_traj" not in motion or "obj_traj_pose" not in motion:
+                raise KeyError(
+                    "Missing required object future conditions in pkl motion: "
+                    "'obj_traj' and 'obj_traj_pose'. Re-generate merged_object_motion.pkl with the latest script."
+                )
+            if motion.get("object_pose_relative_frame", None) != "root_yaw_gravity_aligned":
+                raise ValueError(
+                    "object_pose_relative_frame must be 'root_yaw_gravity_aligned'. "
+                    "Re-generate merged_object_motion.pkl with the latest script."
+                )
+            obj_traj = np.array(motion["obj_traj"], dtype=dtype)
+            obj_traj_pose = np.array(motion["obj_traj_pose"], dtype=dtype)
 
             self.rotations_list.append(rotations)
             self.root_pos_list.append(root_pos)
@@ -62,6 +74,8 @@ class SingleObjectMotionDataset(Dataset):
 
             self.local_conds["traj_pose"].append(np.array(motion["traj_pose"], dtype=dtype))
             self.local_conds["traj_trans"].append(np.array(motion["traj"], dtype=dtype))
+            self.local_conds["obj_traj_pose"].append(np.array(obj_traj_pose, dtype=dtype))
+            self.local_conds["obj_traj_trans"].append(np.array(obj_traj, dtype=dtype))
             self.global_conds["style"].append(motion["style"])
 
             clips = np.arange(0, N - window_size + 1, offset_frame)[:, None] + np.arange(window_size)
@@ -77,6 +91,8 @@ class SingleObjectMotionDataset(Dataset):
 
         self.traj_aug_indexs1 = list(range(self.local_conds['traj_pose'][0].shape[0]))
         self.traj_aug_indexs2 = list(range(self.local_conds['traj_trans'][0].shape[0]))
+        self.traj_obj_aug_indexs1 = list(range(self.local_conds['obj_traj_pose'][0].shape[0]))
+        self.traj_obj_aug_indexs2 = list(range(self.local_conds['obj_traj_trans'][0].shape[0]))
 
         self.mask = np.ones(window_size - past_frame, dtype=bool)
         self.style_set = sorted(set(self.global_conds["style"]))
@@ -112,11 +128,14 @@ class SingleObjectMotionDataset(Dataset):
         root_pos = self.root_pos_list[motion_idx][frame_ids].copy()
         obj_pose_rel = self.object_pose_rel_list[motion_idx][frame_ids].copy()
         obj_contact = self.object_contact_list[motion_idx][frame_ids].copy()
+        root_ref_xy = root_pos[self.reference_frame_idx - 1, [0, 1]].copy()
 
-        root_pos[:, [0, 1]] -= root_pos[self.reference_frame_idx - 1, [0, 1]]
+        root_pos[:, [0, 1]] -= root_ref_xy
 
         traj_rot = self.local_conds["traj_pose"][motion_idx][random.choice(self.traj_aug_indexs1)][frame_ids]
         traj_pos = self.local_conds["traj_trans"][motion_idx][random.choice(self.traj_aug_indexs2)][frame_ids]
+        traj_obj_rot = self.local_conds["obj_traj_pose"][motion_idx][random.choice(self.traj_obj_aug_indexs1)][frame_ids]
+        traj_obj_pos = self.local_conds["obj_traj_trans"][motion_idx][random.choice(self.traj_obj_aug_indexs2)][frame_ids]
 
         r = np.random.rand()
         if r < 0.75:
@@ -126,22 +145,32 @@ class SingleObjectMotionDataset(Dataset):
         traj_pos -= traj_pos[self.reference_frame_idx - 1]
         traj_pos = traj_pos[self.reference_frame_idx:]
         traj_rot = traj_rot[self.reference_frame_idx:]
+        traj_obj_pos -= root_ref_xy  # normalize by root reference XY
+        traj_obj_pos = traj_obj_pos[self.reference_frame_idx:]
+        traj_obj_rot = traj_obj_rot[self.reference_frame_idx:]
 
         rot_xyzw = rotations[..., [1, 2, 3, 0]]
         trajrot_xyzw = traj_rot[..., [1, 2, 3, 0]]
+        traj_obj_rot_xyzw = traj_obj_rot[..., [1, 2, 3, 0]]
 
         theta = np.repeat(np.random.uniform(0, 2 * np.pi), rotations.shape[0])
         rot_vec = R.from_rotvec(np.stack([0 * theta, 0 * theta, theta], axis=-1))
 
         rotations[:, 0] = (rot_vec * R.from_quat(rot_xyzw[:, 0])).as_quat()[..., [3, 0, 1, 2]]
         traj_rot = (rot_vec[self.reference_frame_idx:] * R.from_quat(trajrot_xyzw)).as_quat()[..., [3, 0, 1, 2]]
+        traj_obj_rot = (rot_vec[self.reference_frame_idx:] * R.from_quat(traj_obj_rot_xyzw)).as_quat()[..., [3, 0, 1, 2]]
         root_pos = rot_vec.apply(root_pos)
+        traj_obj_pos_3d = np.concatenate([traj_obj_pos, np.zeros((traj_obj_pos.shape[0], 1), dtype=traj_obj_pos.dtype)], axis=-1)
+        traj_obj_pos = rot_vec[self.reference_frame_idx:].apply(traj_obj_pos_3d)[:, :2]
         # object_pose_relative is in root frame, so do NOT rotate it here.
 
         rotations = torch.from_numpy(rotations.astype(self.dtype))
         traj_pos = torch.from_numpy(traj_pos.astype(self.dtype))
         traj_rot = torch.from_numpy(traj_rot.astype(self.dtype))
         traj_rot = self.convert_rot(traj_rot)
+        traj_obj_rot = torch.from_numpy(traj_obj_rot.astype(self.dtype))
+        traj_obj_rot = self.convert_rot(traj_obj_rot)
+        traj_obj_pos = torch.from_numpy(traj_obj_pos.astype(self.dtype))
 
         obj_pose_rel = torch.from_numpy(obj_pose_rel.astype(self.dtype))
         obj_contact = torch.from_numpy(obj_contact.astype(self.dtype))
@@ -174,9 +203,10 @@ class SingleObjectMotionDataset(Dataset):
                 "traj_pose": traj_rot,
                 "traj_trans": traj_pos,
                 "traj_contact": traj_contact,
+                "traj_obj_pose": traj_obj_rot,
+                "traj_obj_trans": traj_obj_pos,
                 "style": self.global_conds["style"][motion_idx],
                 "style_idx": style_idx,
                 "mask": self.mask,
             },
         }
-

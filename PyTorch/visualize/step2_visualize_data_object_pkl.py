@@ -44,11 +44,18 @@ def set_box_color(model, state: str):
                 break
 
 
-def root_relative_object_to_world(root_pos, root_quat_wxyz, obj_rel_pose):
+def _quat_wxyz_to_yaw_mat(q):
+    yaw = R.from_quat(q[[1, 2, 3, 0]]).as_euler("zyx")[0]
+    return R.from_euler("z", yaw).as_matrix()
+
+
+def root_relative_object_to_world(root_pos, root_quat_wxyz, obj_rel_pose, frame_mode="root"):
     p_rel = obj_rel_pose[:3]
     r_rel = obj_rel_pose[3:].reshape(3, 3)
 
-    r_root = R.from_quat(root_quat_wxyz[[1, 2, 3, 0]]).as_matrix()
+    if frame_mode != "root_yaw_gravity_aligned":
+        raise ValueError("Unsupported object_pose_relative_frame. Expected 'root_yaw_gravity_aligned'.")
+    r_root = _quat_wxyz_to_yaw_mat(root_quat_wxyz)
     r_obj = r_root @ r_rel
     p_obj = root_pos + r_root @ p_rel
     q_obj_xyzw = R.from_matrix(r_obj).as_quat()
@@ -63,6 +70,12 @@ class MergedObjectMotion:
         self.text = motion.get("text", self.style)
         self.source = motion.get("source", "unknown")
         self.has_object = bool(motion.get("has_object", False))
+        self.object_pose_relative_frame = motion.get("object_pose_relative_frame", None)
+        if self.object_pose_relative_frame != "root_yaw_gravity_aligned":
+            raise ValueError(
+                "Expected 'object_pose_relative_frame' == 'root_yaw_gravity_aligned'. "
+                "Re-generate merged_object_motion.pkl with the latest script."
+            )
 
         self.local_joint_rotations = motion["local_joint_rotations"].astype(np.float32)  # (T,30,4)
         self.global_root_positions = motion["global_root_positions"].astype(np.float32)  # (T,3)
@@ -91,7 +104,9 @@ class MergedObjectMotion:
 
         if self.has_object and self.object_pose_relative is not None:
             obj_rel = self.object_pose_relative[frame_idx]
-            obj_pos, obj_quat = root_relative_object_to_world(root_pos, root_quat, obj_rel)
+            obj_pos, obj_quat = root_relative_object_to_world(
+                root_pos, root_quat, obj_rel, frame_mode=self.object_pose_relative_frame
+            )
             obj_qpos = np.concatenate([obj_pos, obj_quat], axis=0)  # 7
         else:
             obj_qpos = np.array([0.0, 0.0, -10.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)

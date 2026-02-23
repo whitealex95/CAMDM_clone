@@ -27,18 +27,25 @@ def quat_wxyz_to_mat(q):
     return R.from_quat(q[[1, 2, 3, 0]]).as_matrix()
 
 
+def quat_wxyz_to_yaw_mat(q):
+    yaw = R.from_quat(q[[1, 2, 3, 0]]).as_euler("zyx")[0]
+    return R.from_euler("z", yaw).as_matrix()
+
+
 def mat_to_quat_wxyz(m):
     q = R.from_matrix(m).as_quat()  # xyzw
     return q[[3, 0, 1, 2]]
 
 
-def compute_object_pose_relative_frame(qpos43):
+def compute_object_pose_relative_frame(qpos43, frame_mode="root"):
     root_pos = qpos43[:3]
     root_q = qpos43[3:7]
     obj_pos = qpos43[36:39]
     obj_q = qpos43[39:43]
 
-    root_r = quat_wxyz_to_mat(root_q)
+    if frame_mode != "root_yaw_gravity_aligned":
+        raise ValueError("Unsupported object_pose_relative_frame. Expected 'root_yaw_gravity_aligned'.")
+    root_r = quat_wxyz_to_yaw_mat(root_q)
     obj_r = quat_wxyz_to_mat(obj_q)
     root_r_inv = root_r.T
     p_rel = root_r_inv @ (obj_pos - root_pos)
@@ -46,10 +53,12 @@ def compute_object_pose_relative_frame(qpos43):
     return np.concatenate([p_rel, r_rel.reshape(-1)], axis=0)
 
 
-def object_relative_to_world(root_pos, root_q_wxyz, obj_rel_12):
+def object_relative_to_world(root_pos, root_q_wxyz, obj_rel_12, frame_mode="root"):
     p_rel = obj_rel_12[:3]
     r_rel = obj_rel_12[3:].reshape(3, 3)
-    root_r = quat_wxyz_to_mat(root_q_wxyz)
+    if frame_mode != "root_yaw_gravity_aligned":
+        raise ValueError("Unsupported object_pose_relative_frame. Expected 'root_yaw_gravity_aligned'.")
+    root_r = quat_wxyz_to_yaw_mat(root_q_wxyz)
     obj_pos = root_pos + root_r @ p_rel
     obj_r = root_r @ r_rel
     obj_q = mat_to_quat_wxyz(obj_r)
@@ -100,6 +109,8 @@ class ObjectModelWrapper(torch.nn.Module):
             kwargs.get("traj_trans"),
             kwargs.get("traj_contact"),
             kwargs.get("style_idx"),
+            kwargs.get("traj_obj_pose"),
+            kwargs.get("traj_obj_trans"),
         )
 
 
@@ -114,8 +125,24 @@ class ObjectMotionData:
         self.traj_pose = motion_dict["traj_pose"]
         self.object_pose_relative = np.asarray(motion_dict.get("object_pose_relative", None), dtype=np.float32)
         self.object_contact_mask = np.asarray(motion_dict.get("object_contact_mask", None), dtype=np.float32).reshape(-1, 1)
+        self.object_pose_relative_frame = motion_dict.get("object_pose_relative_frame", None)
+        if self.object_pose_relative_frame != "root_yaw_gravity_aligned":
+            raise ValueError(
+                "Expected 'object_pose_relative_frame' == 'root_yaw_gravity_aligned'. "
+                "Re-generate merged_object_motion.pkl with the latest script."
+            )
+        if "obj_traj" not in motion_dict or "obj_traj_pose" not in motion_dict:
+            raise KeyError(
+                "Missing required keys: 'obj_traj' and 'obj_traj_pose'. "
+                "Re-generate merged_object_motion.pkl with the latest script."
+            )
+        self.obj_traj = motion_dict["obj_traj"]
+        self.obj_traj_pose = motion_dict["obj_traj_pose"]
         self.has_object = bool(motion_dict.get("has_object", False))
         self.num_frames = len(self.global_root_positions)
+
+        self.obj_traj = [np.asarray(self.obj_traj[0], dtype=np.float32), np.asarray(self.obj_traj[1], dtype=np.float32)]
+        self.obj_traj_pose = [np.asarray(self.obj_traj_pose[0], dtype=np.float32), np.asarray(self.obj_traj_pose[1], dtype=np.float32)]
 
     def get_qpos43(self, frame_idx):
         i = min(frame_idx, self.num_frames - 1)
@@ -124,7 +151,9 @@ class ObjectMotionData:
         joints = self.local_joint_rotations[i, 1:, 0]
         qpos36 = np.concatenate([root_pos, root_q, joints], axis=0)
         if self.has_object:
-            obj_pos, obj_q = object_relative_to_world(root_pos, root_q, self.object_pose_relative[i])
+            obj_pos, obj_q = object_relative_to_world(
+                root_pos, root_q, self.object_pose_relative[i], frame_mode=self.object_pose_relative_frame
+            )
         else:
             obj_pos = np.array([0.0, 0.0, -10.0], dtype=np.float32)
             obj_q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
@@ -150,6 +179,13 @@ class ObjectMotionData:
         past = np.concatenate([past_xy, np.zeros((len(past_xy), 1), dtype=np.float32)], axis=-1)
         fut = np.concatenate([fut_xy, np.zeros((len(fut_xy), 1), dtype=np.float32)], axis=-1)
         return past, fut, past_q, fut_q
+
+    def get_object_trajectory(self, frame_idx, past_frames=10, future_frames=45):
+        obj_xy = self.obj_traj[0]
+        obj_q = self.obj_traj_pose[0]
+        fs = frame_idx
+        fe = min(self.num_frames, frame_idx + future_frames)
+        return obj_xy[fs:fe], obj_q[fs:fe]
 
 
 class ObjectMotionDataset:
@@ -184,7 +220,10 @@ class MotionGeneratorObject:
         self.state_dim = 199
         self.body_dim = 186
 
-    def generate_motion(self, past_qpos43, past_contact, traj_trans, traj_pose, traj_contact, style_idx, cfg_scale=None):
+    def generate_motion(
+        self, past_qpos43, past_contact, traj_trans, traj_pose, traj_contact,
+        traj_obj_trans, traj_obj_pose, style_idx, cfg_scale=None
+    ):
         curr_root_xy = past_qpos43[-1, :2].copy()
 
         # center XY as in training
@@ -193,7 +232,8 @@ class MotionGeneratorObject:
         past_q[:, [36, 37]] -= curr_root_xy[None, :]
 
         past_body = qpos36_to_body_state(past_q[:, :36])         # [Tp,186]
-        past_obj_rel = np.stack([compute_object_pose_relative_frame(x) for x in past_q], axis=0)  # [Tp,12]
+        frame_mode = self.object_pose_relative_frame
+        past_obj_rel = np.stack([compute_object_pose_relative_frame(x, frame_mode=frame_mode) for x in past_q], axis=0)  # [Tp,12]
         past_state = np.concatenate([past_body, past_obj_rel, past_contact.reshape(-1, 1)], axis=-1)  # [Tp,199]
         past_state = past_state[..., None]                        # [Tp,199,1]
 
@@ -201,10 +241,15 @@ class MotionGeneratorObject:
         traj_trans_centered -= curr_root_xy[None, :]
 
         traj_pose_repr = nn_transforms.get_rotation(torch.from_numpy(traj_pose).float(), self.rot_req).numpy()
+        traj_obj_pose_repr = nn_transforms.get_rotation(torch.from_numpy(traj_obj_pose).float(), self.rot_req).numpy()
+        traj_obj_trans_centered = traj_obj_trans.copy()
+        traj_obj_trans_centered -= curr_root_xy[None, :]
 
         past_motion_t = torch.from_numpy(past_state).float().unsqueeze(0).permute(0, 2, 3, 1).to(self.device)
         traj_trans_t = torch.from_numpy(traj_trans_centered).float().unsqueeze(0).permute(0, 2, 1).to(self.device)
         traj_pose_t = torch.from_numpy(traj_pose_repr).float().unsqueeze(0).permute(0, 2, 1).to(self.device)
+        traj_obj_pose_t = torch.from_numpy(traj_obj_pose_repr).float().unsqueeze(0).permute(0, 2, 1).to(self.device)
+        traj_obj_trans_t = torch.from_numpy(traj_obj_trans_centered).float().unsqueeze(0).permute(0, 2, 1).to(self.device)
         traj_contact_t = torch.from_numpy(traj_contact.astype(np.float32)).float().reshape(1, -1, 1).permute(0, 2, 1).to(self.device)
         style_idx_t = torch.tensor([style_idx], device=self.device)
 
@@ -213,6 +258,8 @@ class MotionGeneratorObject:
             "traj_trans": traj_trans_t,
             "traj_pose": traj_pose_t,
             "traj_contact": traj_contact_t,
+            "traj_obj_pose": traj_obj_pose_t,
+            "traj_obj_trans": traj_obj_trans_t,
             "style_idx": style_idx_t,
             "y": {},
         }
@@ -221,6 +268,8 @@ class MotionGeneratorObject:
             "traj_trans": traj_trans_t,
             "traj_pose": traj_pose_t,
             "traj_contact": torch.zeros_like(traj_contact_t),
+            "traj_obj_pose": torch.zeros_like(traj_obj_pose_t),
+            "traj_obj_trans": torch.zeros_like(traj_obj_trans_t),
             "style_idx": style_idx_t,
             "y": {},
         }
@@ -312,6 +361,7 @@ class DemoPlayerObject:
     def load_motion(self, motion_idx):
         self.current_motion_idx = motion_idx % len(self.dataset)
         self.current_motion_data = self.dataset[self.current_motion_idx]
+        self.object_pose_relative_frame = self.current_motion_data.object_pose_relative_frame
         self.current_frame = 0
         if self.prev_style_idx is None or self.current_motion_data.style_idx != self.prev_style_idx:
             self.cfg_count = self.cfg_count_cache
@@ -356,11 +406,24 @@ class DemoPlayerObject:
             aligned_traj, aligned_orient, self.future_frames
         )
 
+        # Object target future trajectory (same alignment transform as root trajectory).
+        obj_traj_dataset, obj_orient_dataset = self.current_motion_data.get_object_trajectory(
+            self.current_frame, self.past_frames, self.future_frames
+        )
+        aligned_obj_traj, aligned_obj_orient = align_trajectory_to_pose(
+            obj_traj_dataset, obj_orient_dataset, ref_q[:36], curr_q[:36]
+        )
+        self.future_obj_traj_dataset, self.future_obj_orient_dataset = match_future_horizon(
+            aligned_obj_traj, aligned_obj_orient, self.future_frames
+        )
+
     def update_future_trajectory(self):
         self.load_future_trajectory()
         if self.generated_qpos36 is None:
             self.future_traj = self.future_traj_dataset
             self.future_orient = self.future_orient_dataset
+            self.future_obj_traj = self.future_obj_traj_dataset
+            self.future_obj_orient = self.future_obj_orient_dataset
             return
 
         t_cur = self.generated_frame_idx
@@ -375,6 +438,8 @@ class DemoPlayerObject:
         )
         self.future_traj = blend_traj
         self.future_orient = blend_orient
+        self.future_obj_traj = self.future_obj_traj_dataset
+        self.future_obj_orient = self.future_obj_orient_dataset
 
     def build_desired_contact_traj(self):
         start = float(self.contact_history[-1]) if len(self.contact_history) > 0 else 0.0
@@ -394,7 +459,9 @@ class DemoPlayerObject:
         effective_cfg_scale = self.motion_generator.cfg_scale if self.cfg_count > 0 else 1.0
 
         q36, obj_rel, pred_c = self.motion_generator.generate_motion(
-            past_q, past_c, self.future_traj, self.future_orient, desired_contact, style_idx, cfg_scale=effective_cfg_scale
+            past_q, past_c, self.future_traj, self.future_orient, desired_contact,
+            self.future_obj_traj, self.future_obj_orient,
+            style_idx, cfg_scale=effective_cfg_scale
         )
         if self.cfg_count > 0:
             self.cfg_count -= 1
@@ -411,7 +478,9 @@ class DemoPlayerObject:
 
         # Update object world pose only when contact is active.
         if c > 0.5:
-            obj_pos, obj_q = object_relative_to_world(q36[:3], q36[3:7], obj_rel)
+            obj_pos, obj_q = object_relative_to_world(
+                q36[:3], q36[3:7], obj_rel, frame_mode=self.object_pose_relative_frame
+            )
             self.current_obj_pose_world = np.concatenate([obj_pos, obj_q], axis=0).astype(np.float32)
         elif self.current_obj_pose_world is None:
             self.current_obj_pose_world = np.array([0.0, 0.0, -10.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
@@ -575,9 +644,11 @@ def main():
         traj_pose_feats=6,
         traj_trans_feats=2,
         traj_contact_feats=1,
+        traj_obj_pose_feats=6,
+        traj_obj_trans_feats=2,
         device=device,
     ).to(device)
-    diffusion_model.load_state_dict(checkpoint["state_dict"])
+    diffusion_model.load_state_dict(checkpoint["state_dict"], strict=True)
     diffusion_model.eval()
 
     generator = MotionGeneratorObject(

@@ -54,6 +54,15 @@ def wxyz_to_mat(wxyz: np.ndarray) -> np.ndarray:
     return R.from_quat(wxyz[:, [1, 2, 3, 0]]).as_matrix()
 
 
+def wxyz_to_yaw_mat(wxyz: np.ndarray) -> np.ndarray:
+    """
+    Quaternion (wxyz) -> yaw-only rotation matrix (world-up aligned).
+    """
+    rot = R.from_quat(wxyz[:, [1, 2, 3, 0]])
+    yaw = rot.as_euler("zyx")[:, 0]
+    return R.from_euler("z", yaw).as_matrix()
+
+
 def build_local_joint_rotations_from_qpos(qpos: np.ndarray) -> np.ndarray:
     """qpos=(T,43) -> local_joint_rotations=(T,30,4)."""
     T = qpos.shape[0]
@@ -72,13 +81,13 @@ def build_traj_from_root(root_pos: np.ndarray, root_quat_wxyz: np.ndarray):
 
 
 def compute_object_pose_relative(qpos: np.ndarray) -> np.ndarray:
-    """Returns (T,12): [p_rel(3), R_rel(9 row-major)]."""
+    """Returns (T,12): [p_rel(3), R_rel(9 row-major)] in gravity-aligned root-yaw frame."""
     root_pos = qpos[:, 0:3]
     root_quat = qpos[:, 3:7]
     obj_pos = qpos[:, 36:39]
     obj_quat = qpos[:, 39:43]
 
-    root_rot_m = wxyz_to_mat(root_quat)
+    root_rot_m = wxyz_to_yaw_mat(root_quat)
     obj_rot_m = wxyz_to_mat(obj_quat)
 
     root_rot_inv = np.transpose(root_rot_m, (0, 2, 1))
@@ -86,6 +95,24 @@ def compute_object_pose_relative(qpos: np.ndarray) -> np.ndarray:
     r_rel = np.einsum("tij,tjk->tik", root_rot_inv, obj_rot_m)
 
     return np.concatenate([p_rel, r_rel.reshape(len(qpos), 9)], axis=-1).astype(np.float32)
+
+
+def build_object_traj_from_qpos(qpos: np.ndarray):
+    """
+    Build planar object trajectory conditions:
+    - obj_traj: [k0(T,2), k1(T,2)]
+    - obj_traj_pose: [k0(T,4), k1(T,4)] (yaw-only quaternion wxyz)
+    """
+    obj_pos = qpos[:, 36:39].astype(np.float32)
+    obj_quat_wxyz = qpos[:, 39:43].astype(np.float32)
+
+    obj_rot = R.from_quat(obj_quat_wxyz[:, [1, 2, 3, 0]])
+    obj_forward = obj_rot.apply(AXIS_FORWARD.repeat(len(obj_pos), axis=0))
+    obj_forward[:, 2] = 0.0
+    obj_forward /= np.linalg.norm(obj_forward, axis=-1, keepdims=True) + 1e-8
+
+    # Reuse same extraction logic as root trajectory (planar XY + yaw-only orientation).
+    return extract_traj(obj_pos, obj_forward)
 
 
 def load_walk_motions(walk_pkl_path: str) -> Tuple[List[Dict], List[str]]:
@@ -100,10 +127,16 @@ def load_walk_motions(walk_pkl_path: str) -> Tuple[List[Dict], List[str]]:
         T = motion["local_joint_rotations"].shape[0]
         padded_obj_pose = np.zeros((T, 12), dtype=np.float32)
         padded_contact = np.zeros((T, 1), dtype=np.float32)
+        padded_obj_traj = [np.zeros((T, 2), dtype=np.float32), np.zeros((T, 2), dtype=np.float32)]
+        identity_quat = np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (T, 1))
+        padded_obj_traj_pose = [identity_quat.copy(), identity_quat.copy()]
 
         m = dict(motion)
         m["object_pose_relative"] = padded_obj_pose
         m["object_contact_mask"] = padded_contact
+        m["object_pose_relative_frame"] = "root_yaw_gravity_aligned"
+        m["obj_traj"] = padded_obj_traj
+        m["obj_traj_pose"] = padded_obj_traj_pose
         m["has_object"] = False
         m["source"] = "walk"
         m["text"] = m.get("text", m.get("style", "walk"))
@@ -131,6 +164,7 @@ def load_object_motions(object_dir: str, joint_names: List[str]) -> List[Dict]:
 
         obj_pose_rel = compute_object_pose_relative(qpos)
         contact = detect_grasp_from_motion(qpos)
+        obj_traj, obj_traj_pose = build_object_traj_from_qpos(qpos)
 
         basename = os.path.basename(npz_path)
         motions.append(
@@ -145,6 +179,9 @@ def load_object_motions(object_dir: str, joint_names: List[str]) -> List[Dict]:
                 "joint_names": joint_names,
                 "object_pose_relative": obj_pose_rel,
                 "object_contact_mask": contact,
+                "object_pose_relative_frame": "root_yaw_gravity_aligned",
+                "obj_traj": obj_traj,
+                "obj_traj_pose": obj_traj_pose,
                 "has_object": True,
                 "source": "object_npz",
             }
@@ -169,9 +206,10 @@ def main():
         "motions": walk_motions + object_motions,
         "metadata": {
             "description": "Walk + single-object pick/carry/place merged dataset",
-            "object_pose_relative_format": "p_rel(3) + R_rel_row_major(9), relative to root frame per frame",
+            "object_pose_relative_format": "p_rel(3) + R_rel_row_major(9), relative to root-yaw (gravity-aligned) frame per frame",
             "object_contact_logic": "Same as step2_visualize_data_object.py detect_grasp_from_motion",
             "walk_object_padding": "zeros for object_pose_relative/contact_mask",
+            "object_future_condition_format": "obj_traj(T,2) + obj_traj_pose(T,4,wxyz,yaw-only)",
             "counts": {
                 "walk_motions": len(walk_motions),
                 "object_motions": len(object_motions),

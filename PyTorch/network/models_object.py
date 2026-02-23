@@ -25,6 +25,8 @@ class MotionDiffusionObject(nn.Module):
         traj_pose_feats=6,
         traj_trans_feats=2,
         traj_contact_feats=1,
+        traj_obj_pose_feats=6,
+        traj_obj_trans_feats=2,
         device=None,
     ):
         super().__init__()
@@ -53,6 +55,8 @@ class MotionDiffusionObject(nn.Module):
         self.traj_trans_process = TrajProcess(traj_trans_feats, self.latent_dim)
         self.traj_pose_process = TrajProcess(traj_pose_feats, self.latent_dim)
         self.traj_contact_process = TrajProcess(traj_contact_feats, self.latent_dim)
+        self.traj_obj_trans_process = TrajProcess(traj_obj_trans_feats, self.latent_dim)
+        self.traj_obj_pose_process = TrajProcess(traj_obj_pose_feats, self.latent_dim)
         self.sequence_pos_encoder = PositionalEncoding(self.latent_dim, self.dropout)
 
         self.embed_style = EmbedStyle(nstyles, self.latent_dim)
@@ -83,7 +87,8 @@ class MotionDiffusionObject(nn.Module):
 
         self.output_process = OutputProcess(self.input_feats, self.latent_dim, self.njoints, self.nfeats)
 
-    def forward(self, x, timesteps, past_motion, traj_pose, traj_trans, traj_contact, style_idx):
+    def forward(self, x, timesteps, past_motion, traj_pose, traj_trans, traj_contact, style_idx,
+                traj_obj_pose, traj_obj_trans):
         bs, njoints, nfeats, nframes = x.shape
 
         time_emb = self.embed_timestep(timesteps)
@@ -91,6 +96,8 @@ class MotionDiffusionObject(nn.Module):
         traj_trans_emb = self.traj_trans_process(traj_trans)
         traj_pose_emb = self.traj_pose_process(traj_pose)
         traj_contact_emb = self.traj_contact_process(traj_contact)
+        traj_obj_trans_emb = self.traj_obj_trans_process(traj_obj_trans)
+        traj_obj_pose_emb = self.traj_obj_pose_process(traj_obj_pose)
         past_motion_emb = self.past_motion_process(past_motion)
         future_motion_emb = self.future_motion_process(x)
 
@@ -101,6 +108,8 @@ class MotionDiffusionObject(nn.Module):
                 traj_trans_emb,
                 traj_pose_emb,
                 traj_contact_emb,
+                traj_obj_trans_emb,
+                traj_obj_pose_emb,
                 past_motion_emb,
                 future_motion_emb,
             ),
@@ -120,13 +129,18 @@ class MotionDiffusionObject(nn.Module):
         traj_pose = y["traj_pose"]
         traj_trans = y["traj_trans"]
         traj_contact = y["traj_contact"]
+        traj_obj_pose = y["traj_obj_pose"]
+        traj_obj_trans = y["traj_obj_trans"]
 
         keep_batch_idx = torch.rand(bs, device=past_motion.device) < (1 - self.cond_mask_prob)
         keep_view = keep_batch_idx.view((bs, 1, 1, 1))
         past_motion = past_motion * keep_view
         traj_contact = traj_contact * keep_batch_idx.view((bs, 1, 1))
 
-        return self.forward(x, timesteps, past_motion, traj_pose, traj_trans, traj_contact, style_idx)
+        return self.forward(
+            x, timesteps, past_motion, traj_pose, traj_trans, traj_contact, style_idx,
+            traj_obj_pose=traj_obj_pose, traj_obj_trans=traj_obj_trans
+        )
 
 
 class MotionProcess(nn.Module):
@@ -207,4 +221,3 @@ class EmbedStyle(nn.Module):
     def forward(self, input):
         idx = input.to(torch.long)
         return self.action_embedding[idx]
-
