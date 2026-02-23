@@ -40,6 +40,7 @@ from visualize.motion_loader import MotionDataset
 from visualize.utils.geometry import draw_trajectory
 from visualize.utils.transition_manager import create_transition_manager
 from visualize.utils.trajectory import blend_trajectory, extend_future_traj_heusristic, align_trajectory_to_pose
+from visualize.utils.trajectory import match_future_horizon
 
 import torch
 
@@ -421,13 +422,14 @@ class DemoPlayer:
                 ref_qpos, 
                 curr_qpos
             )
-
-            self.future_traj_dataset = aligned_traj
-            self.future_orient_dataset = aligned_orient
+            self.future_traj_dataset, self.future_orient_dataset = match_future_horizon(
+                aligned_traj, aligned_orient, self.future_frames
+            )
         else:
             # Use raw global data directly
-            self.future_traj_dataset = future_traj_dataset
-            self.future_orient_dataset = future_orient_dataset
+            self.future_traj_dataset, self.future_orient_dataset = match_future_horizon(
+                future_traj_dataset, future_orient_dataset, self.future_frames
+            )
 
     def update_future_trajectory(self):
         """Update future trajectory based on target future and predicted future

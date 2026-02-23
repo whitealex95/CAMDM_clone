@@ -20,6 +20,7 @@ from network.models_object import MotionDiffusionObject
 
 from visualize.utils.geometry import draw_trajectory
 from visualize.utils.trajectory import align_trajectory_to_pose, blend_trajectory, extend_future_traj_heusristic
+from visualize.utils.trajectory import match_future_horizon
 
 
 def quat_wxyz_to_mat(q):
@@ -351,8 +352,9 @@ class DemoPlayerObject:
         ref_q = self.current_motion_data.get_qpos43(self.current_frame)
         curr_q = self.data.qpos.copy()
         aligned_traj, aligned_orient = align_trajectory_to_pose(future_traj_dataset, future_orient_dataset, ref_q[:36], curr_q[:36])
-        self.future_traj_dataset = aligned_traj
-        self.future_orient_dataset = aligned_orient
+        self.future_traj_dataset, self.future_orient_dataset = match_future_horizon(
+            aligned_traj, aligned_orient, self.future_frames
+        )
 
     def update_future_trajectory(self):
         self.load_future_trajectory()
@@ -606,4 +608,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

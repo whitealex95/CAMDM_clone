@@ -209,3 +209,40 @@ def align_trajectory_to_pose(future_traj, future_orient, ref_qpos, curr_qpos):
     aligned_orient = aligned_quats_scipy.as_quat()[:, [3, 0, 1, 2]]
 
     return aligned_traj, aligned_orient
+
+
+def match_future_horizon(traj_xy, orient_wxyz, target_len):
+    """
+    Make trajectory/orientation arrays exactly target_len by padding with the last
+    frame (or default identity/zero when empty) or trimming when longer.
+
+    Args:
+        traj_xy: (T, 2) trajectory in XY.
+        orient_wxyz: (T, 4) orientation in wxyz.
+        target_len: desired horizon length.
+    Returns:
+        traj_xy_fixed: (target_len, 2)
+        orient_wxyz_fixed: (target_len, 4)
+    """
+    T = int(target_len)
+    traj_xy = np.asarray(traj_xy, dtype=np.float32)
+    orient_wxyz = np.asarray(orient_wxyz, dtype=np.float32)
+
+    if traj_xy.shape[0] == 0:
+        traj_xy = np.zeros((1, 2), dtype=np.float32)
+    if orient_wxyz.shape[0] == 0:
+        orient_wxyz = np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+
+    if traj_xy.shape[0] < T:
+        pad_n = T - traj_xy.shape[0]
+        traj_xy = np.concatenate([traj_xy, np.repeat(traj_xy[-1:], pad_n, axis=0)], axis=0)
+    else:
+        traj_xy = traj_xy[:T]
+
+    if orient_wxyz.shape[0] < T:
+        pad_n = T - orient_wxyz.shape[0]
+        orient_wxyz = np.concatenate([orient_wxyz, np.repeat(orient_wxyz[-1:], pad_n, axis=0)], axis=0)
+    else:
+        orient_wxyz = orient_wxyz[:T]
+
+    return traj_xy, orient_wxyz
