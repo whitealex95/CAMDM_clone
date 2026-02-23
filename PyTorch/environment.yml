@@ -124,6 +124,7 @@ dependencies:
       - torch-tb-profiler==0.4.3
       - tqdm==4.66.4
       - tzdata==2024.1
+      - wandb==0.17.1
       - werkzeug==3.0.3
       - zipp==3.19.0
 prefix: /ghome/l2/mingyi/lib/anaconda3_py311/envs/camdm

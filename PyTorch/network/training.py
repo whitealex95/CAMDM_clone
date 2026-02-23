@@ -11,6 +11,7 @@ import utils.common as common
 from tqdm import tqdm
 import utils.nn_transforms as nn_transforms
 import itertools
+from types import SimpleNamespace
 
 import torch
 from torch.optim import AdamW
@@ -57,6 +58,9 @@ class BaseTrainingPortal:
         self.use_ddp = False
         
         self.prior_loader = prior_loader
+        self.wandb = None
+        self.wandb_run = None
+        self._init_wandb()
         
         
     def diffuse(self, x_start, t, cond, noise=None, return_loss=False):
@@ -64,6 +68,68 @@ class BaseTrainingPortal:
 
     def evaluate_sampling(self, dataloader, save_folder_name):
         raise NotImplementedError('evaluate_sampling function must be implemented')
+
+    def _asdict_recursive(self, obj):
+        if isinstance(obj, dict):
+            return {k: self._asdict_recursive(v) for k, v in obj.items()}
+        if isinstance(obj, SimpleNamespace) or hasattr(obj, "__dict__"):
+            return {k: self._asdict_recursive(v) for k, v in vars(obj).items()}
+        if isinstance(obj, (list, tuple)):
+            return [self._asdict_recursive(v) for v in obj]
+        if isinstance(obj, torch.device):
+            return str(obj)
+        return obj
+
+    def _init_wandb(self):
+        use_wandb = bool(getattr(self.config.trainer, "use_wandb", False))
+        if not use_wandb:
+            return
+        try:
+            import wandb
+        except ImportError:
+            self.logger.warning("W&B requested but wandb is not installed. Proceeding without W&B.")
+            return
+
+        project = getattr(self.config.trainer, "wandb_project", "CAMDM")
+        entity = getattr(self.config.trainer, "wandb_entity", None)
+        group = getattr(self.config.trainer, "wandb_group", None)
+        run_name = getattr(self.config.trainer, "wandb_run_name", None) or self.config.name
+        tags = getattr(self.config.trainer, "wandb_tags", None)
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+        self.wandb = wandb
+        self.wandb_run = wandb.init(
+            project=project,
+            entity=entity,
+            group=group,
+            name=run_name,
+            tags=tags,
+            dir=self.save_dir,
+            config=self._asdict_recursive(self.config),
+            reinit=True,
+        )
+        self.logger.info(f"W&B enabled: project={project}, run={self.wandb_run.name}")
+
+    def _wandb_log(self, metrics, step):
+        if self.wandb_run is not None:
+            self.wandb.log(metrics, step=step)
+
+    def _finish_wandb(self):
+        if self.wandb_run is not None:
+            self.wandb.finish()
+            self.wandb_run = None
+
+    def _log_epoch_metrics(self, epoch_losses, epoch_idx):
+        metrics = {}
+        for key_name, values in epoch_losses.items():
+            if 'loss' in key_name:
+                mean_val = float(np.mean(values))
+                self.tb_writer.add_scalar(f'train/{key_name}', mean_val, epoch_idx)
+                metrics[f"train/{key_name}"] = mean_val
+        metrics["train/lr"] = float(self.opt.param_groups[0]["lr"])
+        metrics["train/best_loss"] = float(self.best_loss)
+        self._wandb_log(metrics, step=epoch_idx)
     
         
     def run_loop(self):
@@ -141,16 +207,15 @@ class BaseTrainingPortal:
             if epoch_idx > 0 and epoch_idx % self.config.trainer.save_freq == 0:
                 self.save_checkpoint(filename=f'weights_{epoch_idx}')
                 self.evaluate_sampling(sampling_subset, save_folder_name='train_samples')
-            
-            for key_name in epoch_losses.keys():
-                if 'loss' in key_name:
-                    self.tb_writer.add_scalar(f'train/{key_name}', np.mean(epoch_losses[key_name]), epoch_idx)
+
+            self._log_epoch_metrics(epoch_losses, epoch_idx)
 
             self.scheduler.step()
         
         best_path = '%s/best.pt' % (self.config.save)
         self.load_checkpoint(best_path)
         self.evaluate_sampling(sampling_subset, save_folder_name='best')
+        self._finish_wandb()
 
 
     def state_dict(self):

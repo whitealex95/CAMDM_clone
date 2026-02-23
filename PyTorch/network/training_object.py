@@ -137,9 +137,7 @@ class HumanoidSingleObjectTrainingPortal(BaseTrainingPortal):
                 self.save_checkpoint(filename=f"weights_{epoch_idx}")
                 self.evaluate_sampling(sampling_subset, save_folder_name="train_samples")
 
-            for key_name in epoch_losses.keys():
-                if "loss" in key_name:
-                    self.tb_writer.add_scalar(f"train/{key_name}", np.mean(epoch_losses[key_name]), epoch_idx)
+            self._log_epoch_metrics(epoch_losses, epoch_idx)
 
             self.scheduler.step()
 
@@ -152,6 +150,7 @@ class HumanoidSingleObjectTrainingPortal(BaseTrainingPortal):
                 f"Skip loading best checkpoint because it does not exist yet: {best_path}. "
                 "This is expected for very short runs (<=10 epochs)."
             )
+        self._finish_wandb()
 
     def evaluate_sampling(self, dataloader, save_folder_name):
         self.model.eval()

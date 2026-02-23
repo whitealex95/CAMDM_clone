@@ -32,6 +32,12 @@ def add_train_args(parser):
     parser.add_argument('--cond_mask_prob', type=float, help='Probability of masking conditioning.')
     parser.add_argument('--ema', default=False, type=bool, help='Use Exponential Moving Average (EMA) for model parameters.')
     parser.add_argument('--workers', default=8, type=int, help='Number of workers for data loading.')
+    parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging.')
+    parser.add_argument('--wandb_project', type=str, help='W&B project name.')
+    parser.add_argument('--wandb_entity', type=str, help='W&B entity/team name.')
+    parser.add_argument('--wandb_group', type=str, help='W&B run group.')
+    parser.add_argument('--wandb_run_name', type=str, help='W&B run name.')
+    parser.add_argument('--wandb_tags', type=str, help='Comma-separated W&B tags.')
 
 
 def config_parse(args):
@@ -72,6 +78,12 @@ def config_parse(args):
     config.trainer.use_loss_contact = True if loss_terms[3] == '1' else False
     config.trainer.load_num = None
     config.trainer.save_freq = int(config.trainer.epoch // 10)
+    config.trainer.use_wandb = bool(args.wandb or getattr(config.trainer, 'use_wandb', False))
+    config.trainer.wandb_project = args.wandb_project if args.wandb_project is not None else getattr(config.trainer, 'wandb_project', 'CAMDM')
+    config.trainer.wandb_entity = args.wandb_entity if args.wandb_entity is not None else getattr(config.trainer, 'wandb_entity', None)
+    config.trainer.wandb_group = args.wandb_group if args.wandb_group is not None else getattr(config.trainer, 'wandb_group', None)
+    config.trainer.wandb_run_name = args.wandb_run_name if args.wandb_run_name is not None else getattr(config.trainer, 'wandb_run_name', None)
+    config.trainer.wandb_tags = args.wandb_tags if args.wandb_tags is not None else getattr(config.trainer, 'wandb_tags', None)
 
     data_prefix = args.data.split('/')[-1].split('.')[0]
     config.save = '%s/%s_%s' % (args.save, args.name, data_prefix) if 'debug' not in config.name else '%s/%s' % (args.save, args.name)
