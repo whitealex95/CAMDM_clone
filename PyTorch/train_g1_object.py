@@ -64,7 +64,7 @@ def train(config, resume, logger, tb_writer):
         traj_trans_feats=2,
         traj_contact_feats=1,
         traj_obj_pose_feats=train_data.per_rot_feat,
-        traj_obj_trans_feats=2,
+        traj_obj_trans_feats=train_data.local_conds["obj_traj_trans"][0].shape[-1],
         device=config.device,
     ).to(config.device)
 

@@ -26,7 +26,7 @@ class MotionDiffusionObject(nn.Module):
         traj_trans_feats=2,
         traj_contact_feats=1,
         traj_obj_pose_feats=6,
-        traj_obj_trans_feats=2,
+        traj_obj_trans_feats=3,
         device=None,
     ):
         super().__init__()

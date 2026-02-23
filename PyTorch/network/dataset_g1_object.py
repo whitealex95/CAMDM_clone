@@ -66,6 +66,11 @@ class SingleObjectMotionDataset(Dataset):
                 )
             obj_traj = np.array(motion["obj_traj"], dtype=dtype)
             obj_traj_pose = np.array(motion["obj_traj_pose"], dtype=dtype)
+            if obj_traj.shape[-1] != 3:
+                raise ValueError(
+                    f"obj_traj must have shape (..., 3) for xyz conditioning, got last dim={obj_traj.shape[-1]}. "
+                    "Re-generate merged_object_motion.pkl with latest script."
+                )
 
             self.rotations_list.append(rotations)
             self.root_pos_list.append(root_pos)
@@ -145,7 +150,7 @@ class SingleObjectMotionDataset(Dataset):
         traj_pos -= traj_pos[self.reference_frame_idx - 1]
         traj_pos = traj_pos[self.reference_frame_idx:]
         traj_rot = traj_rot[self.reference_frame_idx:]
-        traj_obj_pos -= root_ref_xy  # normalize by root reference XY
+        traj_obj_pos[:, :2] -= root_ref_xy  # normalize by root reference XY
         traj_obj_pos = traj_obj_pos[self.reference_frame_idx:]
         traj_obj_rot = traj_obj_rot[self.reference_frame_idx:]
 
@@ -160,8 +165,7 @@ class SingleObjectMotionDataset(Dataset):
         traj_rot = (rot_vec[self.reference_frame_idx:] * R.from_quat(trajrot_xyzw)).as_quat()[..., [3, 0, 1, 2]]
         traj_obj_rot = (rot_vec[self.reference_frame_idx:] * R.from_quat(traj_obj_rot_xyzw)).as_quat()[..., [3, 0, 1, 2]]
         root_pos = rot_vec.apply(root_pos)
-        traj_obj_pos_3d = np.concatenate([traj_obj_pos, np.zeros((traj_obj_pos.shape[0], 1), dtype=traj_obj_pos.dtype)], axis=-1)
-        traj_obj_pos = rot_vec[self.reference_frame_idx:].apply(traj_obj_pos_3d)[:, :2]
+        traj_obj_pos = rot_vec[self.reference_frame_idx:].apply(traj_obj_pos)
         # object_pose_relative is in root frame, so do NOT rotate it here.
 
         rotations = torch.from_numpy(rotations.astype(self.dtype))

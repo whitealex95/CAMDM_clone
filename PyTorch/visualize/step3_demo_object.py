@@ -143,6 +143,11 @@ class ObjectMotionData:
 
         self.obj_traj = [np.asarray(self.obj_traj[0], dtype=np.float32), np.asarray(self.obj_traj[1], dtype=np.float32)]
         self.obj_traj_pose = [np.asarray(self.obj_traj_pose[0], dtype=np.float32), np.asarray(self.obj_traj_pose[1], dtype=np.float32)]
+        if self.obj_traj[0].shape[-1] != 3 or self.obj_traj[1].shape[-1] != 3:
+            raise ValueError(
+                f"obj_traj must be xyz (last dim=3), got {[self.obj_traj[0].shape[-1], self.obj_traj[1].shape[-1]]}. "
+                "Re-generate merged_object_motion.pkl with latest script."
+            )
 
     def get_qpos43(self, frame_idx):
         i = min(frame_idx, self.num_frames - 1)
@@ -181,11 +186,11 @@ class ObjectMotionData:
         return past, fut, past_q, fut_q
 
     def get_object_trajectory(self, frame_idx, past_frames=10, future_frames=45):
-        obj_xy = self.obj_traj[0]
+        obj_xyz = self.obj_traj[0]
         obj_q = self.obj_traj_pose[0]
         fs = frame_idx
         fe = min(self.num_frames, frame_idx + future_frames)
-        return obj_xy[fs:fe], obj_q[fs:fe]
+        return obj_xyz[fs:fe], obj_q[fs:fe]
 
 
 class ObjectMotionDataset:
@@ -249,10 +254,10 @@ class MotionGeneratorObject:
         if has_object:
             traj_obj_pose_repr = nn_transforms.get_rotation(torch.from_numpy(traj_obj_pose).float(), self.rot_req).numpy()
             traj_obj_trans_centered = traj_obj_trans.copy()
-            traj_obj_trans_centered -= curr_root_xy[None, :]
+            traj_obj_trans_centered[:, :2] -= curr_root_xy[None, :]
         else:
             # Neutral object condition for walk style.
-            traj_obj_trans_centered = np.zeros_like(traj_trans_centered, dtype=np.float32)
+            traj_obj_trans_centered = np.zeros((traj_trans_centered.shape[0], 3), dtype=np.float32)
             id_quat = np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (traj_pose.shape[0], 1))
             traj_obj_pose_repr = nn_transforms.get_rotation(torch.from_numpy(id_quat).float(), self.rot_req).numpy()
 
@@ -424,12 +429,21 @@ class DemoPlayerObject:
         obj_traj_dataset, obj_orient_dataset = self.current_motion_data.get_object_trajectory(
             self.current_frame, self.past_frames, self.future_frames
         )
+        obj_z = obj_traj_dataset[:, 2:3]
         aligned_obj_traj, aligned_obj_orient = align_trajectory_to_pose(
-            obj_traj_dataset, obj_orient_dataset, ref_q[:36], curr_q[:36]
+            obj_traj_dataset[:, :2], obj_orient_dataset, ref_q[:36], curr_q[:36]
         )
         self.future_obj_traj_dataset, self.future_obj_orient_dataset = match_future_horizon(
             aligned_obj_traj, aligned_obj_orient, self.future_frames
         )
+        if obj_z.shape[0] == 0:
+            obj_z = np.zeros((1, 1), dtype=np.float32)
+        if obj_z.shape[0] < self.future_frames:
+            pad_n = self.future_frames - obj_z.shape[0]
+            obj_z = np.concatenate([obj_z, np.repeat(obj_z[-1:], pad_n, axis=0)], axis=0)
+        else:
+            obj_z = obj_z[: self.future_frames]
+        self.future_obj_traj_dataset = np.concatenate([self.future_obj_traj_dataset, obj_z], axis=-1).astype(np.float32)
 
     def update_future_trajectory(self):
         self.load_future_trajectory()
@@ -661,7 +675,7 @@ def main():
         traj_trans_feats=2,
         traj_contact_feats=1,
         traj_obj_pose_feats=6,
-        traj_obj_trans_feats=2,
+        traj_obj_trans_feats=3,
         device=device,
     ).to(device)
     diffusion_model.load_state_dict(checkpoint["state_dict"], strict=True)

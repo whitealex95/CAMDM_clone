@@ -99,8 +99,8 @@ def compute_object_pose_relative(qpos: np.ndarray) -> np.ndarray:
 
 def build_object_traj_from_qpos(qpos: np.ndarray):
     """
-    Build planar object trajectory conditions:
-    - obj_traj: [k0(T,2), k1(T,2)]
+    Build object trajectory conditions:
+    - obj_traj: [k0(T,3), k1(T,3)] (xyz)
     - obj_traj_pose: [k0(T,4), k1(T,4)] (yaw-only quaternion wxyz)
     """
     obj_pos = qpos[:, 36:39].astype(np.float32)
@@ -111,8 +111,13 @@ def build_object_traj_from_qpos(qpos: np.ndarray):
     obj_forward[:, 2] = 0.0
     obj_forward /= np.linalg.norm(obj_forward, axis=-1, keepdims=True) + 1e-8
 
-    # Reuse same extraction logic as root trajectory (planar XY + yaw-only orientation).
-    return extract_traj(obj_pos, obj_forward)
+    # Reuse orientation extraction logic; keep translation in xyz.
+    _, obj_traj_pose = extract_traj(obj_pos, obj_forward)
+    obj_traj = []
+    for k in (5, 10):
+        smooth_xyz = gaussian_filter1d(obj_pos[:, [0, 1, 2]], k, axis=0).astype(np.float32)
+        obj_traj.append(smooth_xyz)
+    return obj_traj, obj_traj_pose
 
 
 def load_walk_motions(walk_pkl_path: str) -> Tuple[List[Dict], List[str]]:
@@ -127,7 +132,7 @@ def load_walk_motions(walk_pkl_path: str) -> Tuple[List[Dict], List[str]]:
         T = motion["local_joint_rotations"].shape[0]
         padded_obj_pose = np.zeros((T, 12), dtype=np.float32)
         padded_contact = np.zeros((T, 1), dtype=np.float32)
-        padded_obj_traj = [np.zeros((T, 2), dtype=np.float32), np.zeros((T, 2), dtype=np.float32)]
+        padded_obj_traj = [np.zeros((T, 3), dtype=np.float32), np.zeros((T, 3), dtype=np.float32)]
         identity_quat = np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (T, 1))
         padded_obj_traj_pose = [identity_quat.copy(), identity_quat.copy()]
 
@@ -209,7 +214,7 @@ def main():
             "object_pose_relative_format": "p_rel(3) + R_rel_row_major(9), relative to root-yaw (gravity-aligned) frame per frame",
             "object_contact_logic": "Same as step2_visualize_data_object.py detect_grasp_from_motion",
             "walk_object_padding": "zeros for object_pose_relative/contact_mask",
-            "object_future_condition_format": "obj_traj(T,2) + obj_traj_pose(T,4,wxyz,yaw-only)",
+            "object_future_condition_format": "obj_traj(T,3,xyz) + obj_traj_pose(T,4,wxyz,yaw-only)",
             "counts": {
                 "walk_motions": len(walk_motions),
                 "object_motions": len(object_motions),

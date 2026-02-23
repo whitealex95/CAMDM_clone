@@ -36,7 +36,7 @@ class HumanoidSingleObjectTrainingPortal(BaseTrainingPortal):
         cond["traj_trans"] = cond["traj_trans"].permute(0, 2, 1)         # [B, 2, Tf]
         cond["traj_contact"] = cond["traj_contact"].permute(0, 2, 1)     # [B, 1, Tf]
         cond["traj_obj_pose"] = cond["traj_obj_pose"].permute(0, 2, 1)   # [B, feat, Tf]
-        cond["traj_obj_trans"] = cond["traj_obj_trans"].permute(0, 2, 1) # [B, 2, Tf]
+        cond["traj_obj_trans"] = cond["traj_obj_trans"].permute(0, 2, 1) # [B, Dobj, Tf]
 
         model_output = self.model.interface(x_t, self.diffusion._scale_timesteps(t), cond)
 
