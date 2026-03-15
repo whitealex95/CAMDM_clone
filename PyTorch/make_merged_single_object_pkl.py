@@ -56,10 +56,15 @@ def wxyz_to_mat(wxyz: np.ndarray) -> np.ndarray:
 
 def wxyz_to_yaw_mat(wxyz: np.ndarray) -> np.ndarray:
     """
-    Quaternion (wxyz) -> yaw-only rotation matrix (world-up aligned).
+    Quaternion (wxyz, batch) -> yaw-only rotation matrices via forward-vector projection.
+    More robust than Euler decomposition when pitch/roll are non-zero.
     """
     rot = R.from_quat(wxyz[:, [1, 2, 3, 0]])
-    yaw = rot.as_euler("zyx")[:, 0]
+    forward = rot.apply(np.tile([1.0, 0.0, 0.0], (len(wxyz), 1)))  # local X in world
+    forward[:, 2] = 0.0                                              # project onto XY plane
+    norm = np.linalg.norm(forward[:, :2], axis=1, keepdims=True)
+    forward[:, :2] /= np.maximum(norm, 1e-8)
+    yaw = np.arctan2(forward[:, 1], forward[:, 0])
     return R.from_euler("z", yaw).as_matrix()
 
 

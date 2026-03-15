@@ -28,7 +28,14 @@ def quat_wxyz_to_mat(q):
 
 
 def quat_wxyz_to_yaw_mat(q):
-    yaw = R.from_quat(q[[1, 2, 3, 0]]).as_euler("zyx")[0]
+    """wxyz quaternion -> yaw-only rotation matrix via forward-vector projection."""
+    rot = R.from_quat(q[[1, 2, 3, 0]])
+    forward = rot.apply([1.0, 0.0, 0.0])   # local X in world space
+    forward[2] = 0.0                        # project onto XY plane
+    norm = np.linalg.norm(forward[:2])
+    if norm > 1e-8:
+        forward[:2] /= norm
+    yaw = np.arctan2(forward[1], forward[0])
     return R.from_euler("z", yaw).as_matrix()
 
 
