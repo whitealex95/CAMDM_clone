@@ -161,6 +161,45 @@ def extend_future_traj_heusristic(model_pred_future_traj, model_pred_future_orie
 
     return ext_traj[:t_total], ext_orient[:t_total]
     
+def blend_obj_trajectory(pred_xyz, pred_pose, target_xyz, target_pose, blend=0.4, blend_rot=None):
+    """Blend predicted future object trajectory (XYZ + full 3D orientation) with target.
+
+    Uses the same CAMDM-baseline coefficient curve as blend_trajectory, but operates
+    on 3-D positions and uses nlerp for full quaternion orientation (not yaw-only).
+
+    Args:
+        pred_xyz (np.ndarray): [T, 3] predicted world XYZ positions
+        pred_pose (np.ndarray): [T, 4] predicted wxyz quaternions
+        target_xyz (np.ndarray): [T, 3] target world XYZ positions
+        target_pose (np.ndarray): [T, 4] target wxyz quaternions
+        blend (float): position bias exponent (CAMDM ``bias_HFTE``, default 0.4)
+        blend_rot (float|None): rotation bias exponent. If None, reuses ``blend``.
+    Returns:
+        blended_xyz (np.ndarray): [T, 3]
+        blended_pose (np.ndarray): [T, 4]
+    """
+    if blend_rot is None:
+        blend_rot = blend
+    T = len(pred_xyz)
+    blended_xyz = pred_xyz.copy()
+    blended_pose = pred_pose.copy()
+    for t in range(T):
+        pos_scale = _blend_scale(t, T, blend)
+        blended_xyz[t] = (1.0 - pos_scale) * pred_xyz[t] + pos_scale * target_xyz[t]
+
+        rot_scale = _blend_scale(t, T, blend_rot)
+        q_pred = pred_pose[t][[1, 2, 3, 0]]   # xyzw
+        q_tgt = target_pose[t][[1, 2, 3, 0]]  # xyzw
+        # Ensure shortest path (same hemisphere).
+        if np.dot(q_pred, q_tgt) < 0.0:
+            q_tgt = -q_tgt
+        q_blend = (1.0 - rot_scale) * q_pred + rot_scale * q_tgt
+        n = np.linalg.norm(q_blend)
+        q_blend = q_blend / n if n > 1e-8 else q_pred
+        blended_pose[t] = q_blend[[3, 0, 1, 2]]  # wxyz
+    return blended_xyz, blended_pose
+
+
 def align_trajectory_to_pose(future_traj, future_orient, ref_qpos, curr_qpos):
     """
     Aligns a global trajectory from the dataset to match the robot's current pose.

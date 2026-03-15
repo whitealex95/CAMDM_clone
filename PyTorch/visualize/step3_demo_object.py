@@ -102,6 +102,18 @@ def body_state_to_qpos36(body_state):
         qpos[t, 7:] = joints
     return qpos
 
+from enum import Enum, auto
+
+class RobotState(Enum):
+    WALK = auto()
+    BOX_LIFT = auto() # Before Lifting box
+    BOX_HOLD = auto() # While Holding Box
+    BOX_DROP = auto() # After Dropping box
+
+class RobotStateMachine:
+    def __init__(self):
+        # Initial State Setup
+        self.state = RobotState.BOX_LIFT
 
 class ObjectModelWrapper(torch.nn.Module):
     def __init__(self, model):
@@ -380,9 +392,11 @@ class DemoPlayerObject:
         self.command_contact_target = 0.0
         self.qpos_history = deque(maxlen=self.past_frames)
         self.contact_history = deque(maxlen=self.past_frames)
+        self.obj_pose_history = deque(maxlen=self.past_frames)  # each entry: world [pos3, quat4] (7D)
         self.current_obj_pose_world = None
 
         self._pending_commands = deque(maxlen=1)  # only keep the latest command
+        self.robot_state_machine = RobotStateMachine()
 
         self.load_motion(0)
 
@@ -401,22 +415,26 @@ class DemoPlayerObject:
 
         self.qpos_history.clear()
         self.contact_history.clear()
+        self.obj_pose_history.clear()
         init_contact = self.current_motion_data.get_contact(self.current_frame)
         for _ in range(self.past_frames):
             self.qpos_history.append(q.copy())
             self.contact_history.append(init_contact)
+            self.obj_pose_history.append(q[36:43].copy())  # init with dataset pose
+        
+        self.robot_state_machine.state = RobotState.BOX_LIFT # init with BOX_LIFT
 
         self.current_obj_pose_world = q[36:43].copy()
         self.generated_qpos36 = None
         self.generated_obj_rel = None
         self.generated_contact = None
         self.generated_frame_idx = 0
-        self.update_past_trajectory()
+        self.update_past_trajectory_for_visualization()
         self.update_future_trajectory()
 
         print(f"\nMotion {self.current_motion_idx + 1}/{len(self.dataset)} | style={self.current_motion_data.style}")
 
-    def update_past_trajectory(self):
+    def update_past_trajectory_for_visualization(self):
         qh = np.array(self.qpos_history)
         self.past_traj = qh[:, :3]
         self.past_orient = qh[:, 3:7]
@@ -512,9 +530,60 @@ class DemoPlayerObject:
         return out
 
     def generate_motion(self):
-        past_q = np.array(self.qpos_history)  # [Tp,43]
-        past_c = np.array(self.contact_history, dtype=np.float32)  # [Tp]
-        desired_contact = self.build_desired_contact_traj()  # [Tf]
+        # Reconstruct past_qpos43 by fusing body history with the separately
+        # tracked object pose history so the generator's past_obj_rel
+        # conditioning reflects the actual live object trajectory.
+        body_hist = np.array(self.qpos_history)[:, :36]               # [Tp, 36]
+        obj_hist  = np.array(self.obj_pose_history)                    # [Tp, 7]
+        past_q = np.concatenate([body_hist, obj_hist], axis=-1)        # [Tp, 43]
+        past_c = np.array(self.contact_history, dtype=np.float32)     # [Tp]
+
+        # Update robot state machine
+        if self.robot_state_machine.state == RobotState.BOX_LIFT:
+            if past_c.mean() > 0.5:
+                self.robot_state_machine.state = RobotState.BOX_HOLD
+                print("Box_LIFT -> BOX_HOLD")
+        elif self.robot_state_machine.state == RobotState.BOX_HOLD:
+            if past_c.mean() < 0.5:
+                self.robot_state_machine.state = RobotState.BOX_DROP
+                print("Box_HOLD -> BOX_DROP")
+                self.robot_state_machine.state = RobotState.WALK
+
+        # Use the dataset's ground-truth contact schedule when available;
+        # fall back to the user-commanded ramp for non-object (walk) clips.
+        if self.current_motion_data.has_object:
+            fs = self.current_frame
+            fe = fs + self.future_frames
+            gt_contact = self.current_motion_data.object_contact_mask[fs:fe, 0]  # [<=Tf]
+            if len(gt_contact) < self.future_frames:
+                pad = self.future_frames - len(gt_contact)
+                last = gt_contact[-1] if len(gt_contact) > 0 else 0.0
+                gt_contact = np.concatenate([gt_contact, np.full(pad, last, dtype=np.float32)])
+            desired_contact = gt_contact.astype(np.float32)  # [Tf]
+            if self.robot_state_machine.state == RobotState.BOX_DROP:
+                print("Box in drop state, overriding to zero contact.")
+                # Override to zero contact after box drop.
+                desired_contact *= 0.0
+                past_c *= 0.0
+        else:
+            print("Doesn't have object")
+            desired_contact = self.build_desired_contact_traj()  # [Tf]
+
+        if True and self.robot_state_machine.state == RobotState.WALK:
+            desired_contact *= 0.0
+            past_c *= 0.0
+            self.future_obj_traj *= 0
+            self.future_obj_orient = np.zeros((self.future_frames, 4), dtype=np.float32)
+            self.future_obj_orient[:, 3] = 1.0
+            self.current_motion_data.style ='walk'
+            self.current_motion_data.style_idx = 1
+            self.current_motion_data.has_object = False
+            
+        
+        # GENERATE MOTION #
+        if self.robot_state_machine.state == RobotState.BOX_DROP:
+            print("generating motion in box drop state")
+            self.cfg_count = int(self.cfg_count)
         style_idx = self.current_motion_data.style_idx
         effective_cfg_scale = self.motion_generator.cfg_scale if self.cfg_count > 0 else 1.0
 
@@ -533,9 +602,9 @@ class DemoPlayerObject:
         if self.generated_qpos36 is None:
             print("self.generated_frame_idx", self.generated_frame_idx)
             print("generated_qpos36 is None")
-            # breakpoint()
 
         if self.generated_frame_idx == 0:
+            print("Generating motion")
             self.generated_qpos36, self.generated_obj_rel, self.generated_contact = self.generate_motion()
 
 
@@ -543,9 +612,9 @@ class DemoPlayerObject:
         q36 = self.generated_qpos36[i]
         obj_rel = self.generated_obj_rel[i]
         c = float(self.generated_contact[i])
-
+        
         # Update object world pose only when predicted contact is active.
-        if self.current_motion_data.has_object and c > 0.5:
+        if self.current_motion_data.has_object:# and c > 0.5:
             obj_pos, obj_q = object_relative_to_world(
                 q36[:3], q36[3:7], obj_rel, frame_mode=self.object_pose_relative_frame
             )
@@ -557,12 +626,11 @@ class DemoPlayerObject:
 
         self.qpos_history.append(q43.copy())
         self.contact_history.append(np.clip(c, 0.0, 1.0))
-        self.update_past_trajectory()
+        self.obj_pose_history.append(self.current_obj_pose_world.copy())  # track object world pose
+        self.update_past_trajectory_for_visualization()
         self.update_future_trajectory()
         self.data.qpos[:] = q43
         mujoco.mj_forward(self.model, self.data)
-
-        self.generated_frame_idx = (self.generated_frame_idx + 1) % self.apply_generated_frames
 
     def process_pending_commands(self):
         """Drain the key-callback queue. Call this from the main loop before step()."""
@@ -577,9 +645,12 @@ class DemoPlayerObject:
         if dt >= self.frame_dt / self.playback_speed:
             self.current_frame += 1
             if self.current_frame >= self.current_motion_data.num_frames:
-                self.current_frame = 0
+                # Load next motion
+                self.load_motion((self.current_motion_idx + 1) % len(self.dataset))
+
             self.update_pose()
             self.last_update_time = time.time()
+            self.generated_frame_idx = (self.generated_frame_idx + 1) % self.apply_generated_frames
 
     def set_pick_command(self):
         self.command_contact_target = 1.0
@@ -591,11 +662,9 @@ class DemoPlayerObject:
 
     def next_motion(self):
         self.load_motion(self.current_motion_idx + 1)
-        self.step()
 
     def prev_motion(self):
         self.load_motion(self.current_motion_idx - 1)
-        self.step()
 
     def toggle_pause(self):
         self.playing = not self.playing
