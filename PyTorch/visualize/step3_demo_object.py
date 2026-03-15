@@ -19,7 +19,7 @@ from diffusion.create_diffusion import create_gaussian_diffusion
 from network.models_object import MotionDiffusionObject
 
 from visualize.utils.geometry import draw_trajectory
-from visualize.utils.trajectory import align_trajectory_to_pose, blend_trajectory, extend_future_traj_heusristic
+from visualize.utils.trajectory import align_trajectory_to_pose, blend_trajectory, blend_obj_trajectory, extend_future_traj_heusristic
 from visualize.utils.trajectory import match_future_horizon
 
 
@@ -375,6 +375,8 @@ class DemoPlayerObject:
         self.contact_history = deque(maxlen=self.past_frames)
         self.current_obj_pose_world = None
 
+        self._pending_commands = deque(maxlen=1)  # only keep the latest command
+
         self.load_motion(0)
 
     def load_motion(self, motion_idx):
@@ -466,8 +468,31 @@ class DemoPlayerObject:
         )
         self.future_traj = blend_traj
         self.future_orient = blend_orient
-        self.future_obj_traj = self.future_obj_traj_dataset
-        self.future_obj_orient = self.future_obj_orient_dataset
+
+        # Blend object trajectory the same way as root trajectory.
+        pred_obj_rel_future = self.generated_obj_rel[t_cur + 1:]   # [remaining, 12]
+        pred_q36_future = self.generated_qpos36[t_cur + 1:]        # [remaining, 36]
+        if len(pred_obj_rel_future) > 0 and self.current_motion_data.has_object:
+            pred_obj_xyz = []
+            pred_obj_quats = []
+            for j in range(len(pred_obj_rel_future)):
+                obj_pos, obj_q = object_relative_to_world(
+                    pred_q36_future[j, :3], pred_q36_future[j, 3:7],
+                    pred_obj_rel_future[j], frame_mode=self.object_pose_relative_frame,
+                )
+                pred_obj_xyz.append(obj_pos)
+                pred_obj_quats.append(obj_q)
+            pred_obj_xyz = np.array(pred_obj_xyz, dtype=np.float32)    # [remaining, 3]
+            pred_obj_quats = np.array(pred_obj_quats, dtype=np.float32) # [remaining, 4]
+            pred_obj_xyz, pred_obj_quats = match_future_horizon(pred_obj_xyz, pred_obj_quats, self.future_frames)
+            self.future_obj_traj, self.future_obj_orient = blend_obj_trajectory(
+                pred_obj_xyz, pred_obj_quats,
+                self.future_obj_traj_dataset, self.future_obj_orient_dataset,
+                blend=self.traj_bias_pos, blend_rot=self.traj_bias_rot,
+            )
+        else:
+            self.future_obj_traj = self.future_obj_traj_dataset
+            self.future_obj_orient = self.future_obj_orient_dataset
 
     def build_desired_contact_traj(self):
         start = float(self.contact_history[-1]) if len(self.contact_history) > 0 else 0.0
@@ -498,8 +523,14 @@ class DemoPlayerObject:
         return q36, obj_rel, pred_c
 
     def update_pose(self):
+        if self.generated_qpos36 is None:
+            print("self.generated_frame_idx", self.generated_frame_idx)
+            print("generated_qpos36 is None")
+            # breakpoint()
+
         if self.generated_frame_idx == 0:
             self.generated_qpos36, self.generated_obj_rel, self.generated_contact = self.generate_motion()
+
 
         i = self.generated_frame_idx
         q36 = self.generated_qpos36[i]
@@ -526,6 +557,12 @@ class DemoPlayerObject:
 
         self.generated_frame_idx = (self.generated_frame_idx + 1) % self.apply_generated_frames
 
+    def process_pending_commands(self):
+        """Drain the key-callback queue. Call this from the main loop before step()."""
+        while self._pending_commands:
+            cmd = self._pending_commands.popleft()
+            cmd()
+
     def step(self):
         if not self.playing:
             return
@@ -547,9 +584,11 @@ class DemoPlayerObject:
 
     def next_motion(self):
         self.load_motion(self.current_motion_idx + 1)
+        self.step()
 
     def prev_motion(self):
         self.load_motion(self.current_motion_idx - 1)
+        self.step()
 
     def toggle_pause(self):
         self.playing = not self.playing
@@ -615,30 +654,32 @@ def print_instruction():
 
 
 def key_callback(player, keycode):
+    """Enqueue commands to be executed on the main thread before the next step."""
     if keycode == 32:
-        player.toggle_pause()
+        player._pending_commands.append(player.toggle_pause)
     elif keycode == 265:
-        player.next_motion()
+        player._pending_commands.append(player.next_motion)
     elif keycode == 264:
-        player.prev_motion()
+        player._pending_commands.append(player.prev_motion)
     elif keycode in (ord("r"), ord("R")):
-        player.reset()
+        player._pending_commands.append(player.reset)
     elif keycode in (ord("t"), ord("T")):
-        player.toggle_trajectory()
+        player._pending_commands.append(player.toggle_trajectory)
     elif keycode in (ord("c"), ord("C")):
-        player.toggle_camera_follow()
+        player._pending_commands.append(player.toggle_camera_follow)
     elif keycode in (ord("s"), ord("S")):
-        player.print_status()
+        player._pending_commands.append(player.print_status)
     elif keycode in (ord("p"), ord("P")):
-        player.set_pick_command()
+        player._pending_commands.append(player.set_pick_command)
     elif keycode in (ord("o"), ord("O")):
-        player.set_drop_command()
+        player._pending_commands.append(player.set_drop_command)
     elif ord("1") <= keycode <= ord("9"):
         speed_map = {
             ord("1"): 0.25, ord("2"): 0.5, ord("3"): 0.75, ord("4"): 0.9, ord("5"): 1.0,
             ord("6"): 1.25, ord("7"): 1.5, ord("8"): 1.75, ord("9"): 2.0,
         }
-        player.set_speed(speed_map[keycode])
+        speed = speed_map[keycode]
+        player._pending_commands.append(lambda s=speed: player.set_speed(s))
 
 
 def main():
@@ -698,6 +739,7 @@ def main():
     with mujoco.viewer.launch_passive(mj_model, mj_data, key_callback=lambda kc: key_callback(player, kc)) as viewer:
         viewer.sync()
         while viewer.is_running():
+            player.process_pending_commands()
             player.step()
             viewer.user_scn.ngeom = 0
             player.render_trajectory(viewer.user_scn)
