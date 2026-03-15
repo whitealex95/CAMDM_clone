@@ -281,6 +281,28 @@ class MotionGeneratorObject:
             traj_obj_pose_repr = nn_transforms.get_rotation(torch.from_numpy(id_quat).float(), self.rot_req).numpy()
 
         past_motion_t = torch.from_numpy(past_state).float().unsqueeze(0).permute(0, 2, 3, 1).to(self.device)
+
+        # Per-step continuity guidance: pull first generated frame toward last past frame.
+        # past_motion_t shape: (1, 1, state_dim, past_frames)
+        CONTINUITY_SCALE = 0.0   # tune: larger → stronger continuity, may hurt diversity
+        last_past_body = past_motion_t[0, 0, :self.body_dim, -1].detach()  # [186]
+
+        def _continuity_cond_fn(x, t, p_mean_var, **kwargs):
+            """Returns ∇_x log p(continuity | x_t) = -scale * ∇_x MSE(x[frame0, body], last_past_body)."""
+            with torch.enable_grad():
+                x_in = x.detach().requires_grad_(True)
+                frames = x_in[0, :self.body_dim, 0, :]          # [body_dim, future_frames]
+                target = last_past_body.unsqueeze(-1)            # [body_dim, 1]  (broadcast)
+                # Exponential decay: weight[t] = exp(-decay_rate * t)
+                # → frame 0 fully constrained, frame 44 nearly free
+                decay_rate = 0.9
+                decay = torch.exp(
+                    -decay_rate * torch.arange(frames.shape[-1], device=x_in.device).float()
+                )                                                # [future_frames]
+                loss = ((frames - target) ** 2 * decay.unsqueeze(0)).mean()
+                grad = torch.autograd.grad(loss, x_in)[0]
+            return -CONTINUITY_SCALE * grad   # negative: steer mean to minimise loss
+
         traj_trans_t = torch.from_numpy(traj_trans_centered).float().unsqueeze(0).permute(0, 2, 1).to(self.device)
         traj_pose_t = torch.from_numpy(traj_pose_repr).float().unsqueeze(0).permute(0, 2, 1).to(self.device)
         traj_obj_pose_t = torch.from_numpy(traj_obj_pose_repr).float().unsqueeze(0).permute(0, 2, 1).to(self.device)
@@ -333,12 +355,14 @@ class MotionGeneratorObject:
         if self.sampler == "ddim":
             sample = self.diffusion.ddim_sample_loop(
                 sampling_model, shape, clip_denoised=False, model_kwargs=sampling_kwargs,
-                progress=False, eta=0.0, device=self.device
+                progress=False, eta=0.0, device=self.device,
+                cond_fn=_continuity_cond_fn, cond_fn_with_grad=True,
             )
         else:
             sample = self.diffusion.p_sample_loop(
                 sampling_model, shape, clip_denoised=False, model_kwargs=sampling_kwargs,
-                progress=False, device=self.device
+                progress=False, device=self.device,
+                cond_fn=_continuity_cond_fn, cond_fn_with_grad=True,
             )
 
         sample_np = sample.squeeze(0).permute(2, 0, 1).cpu().numpy()[:, :, 0]  # [Tf,199]
