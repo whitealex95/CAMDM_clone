@@ -21,6 +21,7 @@ from network.models_object import MotionDiffusionObject
 from visualize.utils.geometry import draw_trajectory
 from visualize.utils.trajectory import align_trajectory_to_pose, blend_trajectory, blend_obj_trajectory, extend_future_traj_heusristic
 from visualize.utils.trajectory import match_future_horizon
+from visualize.utils.transition_manager import create_transition_manager
 
 
 def quat_wxyz_to_mat(q):
@@ -382,7 +383,12 @@ class DemoPlayerObject:
     def __init__(
         self, model, data, dataset, motion_generator, show_trajectory=True,
         past_frames=10, future_frames=45, applyframes=15, cfg_count=2,
-        traj_bias_pos=0.4, traj_bias_rot=2.2
+        traj_bias_pos=0.4, traj_bias_rot=2.2,
+        inertialize=True,
+        inertialization_mode="camdm",
+        blendtime_rotation=0.2, blendtime_position=0.2,
+        spring_halflife_position=0.12, spring_halflife_rotation=0.12,
+        inertial_quat_start=3, inertial_quat_end=7,
     ):
         self.model = model
         self.data = data
@@ -422,12 +428,30 @@ class DemoPlayerObject:
         self._pending_commands = deque(maxlen=1)  # only keep the latest command
         self.robot_state_machine = RobotStateMachine()
 
+        self.inertialize = bool(inertialize)
+        self.inertialization_mode = str(inertialization_mode).lower()
+        self.blendtime_rotation = float(blendtime_rotation)
+        self.blendtime_position = float(blendtime_position)
+        self.spring_halflife_position = float(spring_halflife_position)
+        self.spring_halflife_rotation = float(spring_halflife_rotation)
+        self.quat_slice = slice(int(inertial_quat_start), int(inertial_quat_end))
+        self.transition_manager = None
+        self._has_object_override = None  # None = use data; False = WALK override
+
         self.load_motion(0)
+
+    @property
+    def has_object(self):
+        if self._has_object_override is not None:
+            return self._has_object_override
+        return self.current_motion_data.has_object
 
     def load_motion(self, motion_idx):
         self.current_motion_idx = motion_idx % len(self.dataset)
         self.current_motion_data = self.dataset[self.current_motion_idx]
         self.object_pose_relative_frame = self.current_motion_data.object_pose_relative_frame
+        self._has_object_override = None
+        self.transition_manager = None
         self.current_frame = 0
         if self.prev_style_idx is None or self.current_motion_data.style_idx != self.prev_style_idx:
             self.cfg_count = self.cfg_count_cache
@@ -521,7 +545,7 @@ class DemoPlayerObject:
         # Blend object trajectory the same way as root trajectory.
         pred_obj_rel_future = self.generated_obj_rel[t_cur + 1:]   # [remaining, 12]
         pred_q36_future = self.generated_qpos36[t_cur + 1:]        # [remaining, 36]
-        if len(pred_obj_rel_future) > 0 and self.current_motion_data.has_object:
+        if len(pred_obj_rel_future) > 0 and self.has_object:
             pred_obj_xyz = []
             pred_obj_quats = []
             for j in range(len(pred_obj_rel_future)):
@@ -575,7 +599,7 @@ class DemoPlayerObject:
 
         # Use the dataset's ground-truth contact schedule when available;
         # fall back to the user-commanded ramp for non-object (walk) clips.
-        if self.current_motion_data.has_object:
+        if self.has_object:
             fs = self.current_frame
             fe = fs + self.future_frames
             gt_contact = self.current_motion_data.object_contact_mask[fs:fe, 0]  # [<=Tf]
@@ -601,7 +625,7 @@ class DemoPlayerObject:
             self.future_obj_orient[:, 3] = 1.0
             self.current_motion_data.style ='walk'
             self.current_motion_data.style_idx = 1
-            self.current_motion_data.has_object = False
+            self._has_object_override = False
             
         
         # GENERATE MOTION #
@@ -616,45 +640,81 @@ class DemoPlayerObject:
             self.future_obj_traj, self.future_obj_orient,
             style_idx, cfg_scale=effective_cfg_scale,
             frame_mode=self.object_pose_relative_frame,
-            has_object=self.current_motion_data.has_object,
+            has_object=self.has_object,
         )
         if self.cfg_count > 0:
             self.cfg_count -= 1
         return q36, obj_rel, pred_c
 
     def update_pose(self):
+        if self.inertialize:
+            self.update_pose_inertialized()
+        else:
+            self.update_pose_raw()
+
+    def _apply_generated_frame(self, q36, obj_rel, c):
+        """Shared logic: given a final q36 (after any smoothing), build q43 and update state."""
+        if self.has_object:
+            obj_pos, obj_q = object_relative_to_world(
+                q36[:3], q36[3:7], obj_rel, frame_mode=self.object_pose_relative_frame
+            )
+            self.current_obj_pose_world = np.concatenate([obj_pos, obj_q], axis=0).astype(np.float32)
+        elif self.current_obj_pose_world is None or not self.has_object:
+            self.current_obj_pose_world = np.array([0.0, 0.0, -10.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+        q43 = np.concatenate([q36, self.current_obj_pose_world], axis=0).astype(np.float32)
+        self.qpos_history.append(q43.copy())
+        self.contact_history.append(np.clip(c, 0.0, 1.0))
+        self.obj_pose_history.append(self.current_obj_pose_world.copy())
+        self.update_past_trajectory_for_visualization()
+        self.update_future_trajectory()
+        self.data.qpos[:] = q43
+        mujoco.mj_forward(self.model, self.data)
+
+    def update_pose_raw(self):
         if self.generated_qpos36 is None:
-            print("self.generated_frame_idx", self.generated_frame_idx)
             print("generated_qpos36 is None")
 
         if self.generated_frame_idx == 0:
             print("Generating motion")
             self.generated_qpos36, self.generated_obj_rel, self.generated_contact = self.generate_motion()
 
-
         i = self.generated_frame_idx
         q36 = self.generated_qpos36[i]
         obj_rel = self.generated_obj_rel[i]
         c = float(self.generated_contact[i])
-        
-        # Update object world pose only when predicted contact is active.
-        if self.current_motion_data.has_object:# and c > 0.5:
-            obj_pos, obj_q = object_relative_to_world(
-                q36[:3], q36[3:7], obj_rel, frame_mode=self.object_pose_relative_frame
+        self._apply_generated_frame(q36, obj_rel, c)
+
+    def update_pose_inertialized(self):
+        if self.transition_manager is None:
+            self.transition_manager = create_transition_manager(
+                mode=self.inertialization_mode,
+                frame_dt=self.frame_dt,
+                quat_slice=self.quat_slice,
+                blend_time_rotation=self.blendtime_rotation,
+                blend_time_position=self.blendtime_position,
+                halflife_position=self.spring_halflife_position,
+                halflife_rotation=self.spring_halflife_rotation,
             )
-            self.current_obj_pose_world = np.concatenate([obj_pos, obj_q], axis=0).astype(np.float32)
-        elif self.current_obj_pose_world is None or not self.current_motion_data.has_object:
-            self.current_obj_pose_world = np.array([0.0, 0.0, -10.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
-        q43 = np.concatenate([q36, self.current_obj_pose_world], axis=0).astype(np.float32)
+        if self.generated_frame_idx == 0:
+            print("Generating motion")
+            self.generated_qpos36, self.generated_obj_rel, self.generated_contact = self.generate_motion()
+            # Pass 36D body history to the transition manager
+            body_history = deque(
+                (q[:36] for q in self.qpos_history), maxlen=self.past_frames
+            )
+            self.transition_manager.start_transition(
+                body_history, self.data.qpos[:36].copy(), self.generated_qpos36
+            )
 
-        self.qpos_history.append(q43.copy())
-        self.contact_history.append(np.clip(c, 0.0, 1.0))
-        self.obj_pose_history.append(self.current_obj_pose_world.copy())  # track object world pose
-        self.update_past_trajectory_for_visualization()
-        self.update_future_trajectory()
-        self.data.qpos[:] = q43
-        mujoco.mj_forward(self.model, self.data)
+        i = self.generated_frame_idx
+        raw_target_q36 = self.generated_qpos36[i]
+        final_q36 = self.transition_manager.apply(raw_target_q36)
+
+        obj_rel = self.generated_obj_rel[i]
+        c = float(self.generated_contact[i])
+        self._apply_generated_frame(final_q36, obj_rel, c)
 
     def process_pending_commands(self):
         """Drain the key-callback queue. Call this from the main loop before step()."""
@@ -741,6 +801,15 @@ def get_args():
     parser.add_argument("--applyframes", type=int, default=15)
     parser.add_argument("--traj-bias-pos", type=float, default=0.4)
     parser.add_argument("--traj-bias-rot", type=float, default=2.2)
+    # Inertialization
+    parser.add_argument("--inertialize", type=str, default="on", choices=["on", "off"])
+    parser.add_argument("--inertialization-mode", type=str, default="camdm", choices=["camdm", "spring"])
+    parser.add_argument("--blendtime-rotation", type=float, default=0.2)
+    parser.add_argument("--blendtime-position", type=float, default=0.2)
+    parser.add_argument("--spring-halflife-position", type=float, default=0.12)
+    parser.add_argument("--spring-halflife-rotation", type=float, default=0.12)
+    parser.add_argument("--inertial-quat-start", type=int, default=3)
+    parser.add_argument("--inertial-quat-end", type=int, default=7)
     return parser.parse_args()
 
 
@@ -833,6 +902,14 @@ def main():
         show_trajectory=True, past_frames=args.past_frames, future_frames=args.future_frames,
         applyframes=args.applyframes, cfg_count=args.cfg_count,
         traj_bias_pos=args.traj_bias_pos, traj_bias_rot=args.traj_bias_rot,
+        inertialize=(args.inertialize == "on"),
+        inertialization_mode=args.inertialization_mode,
+        blendtime_rotation=args.blendtime_rotation,
+        blendtime_position=args.blendtime_position,
+        spring_halflife_position=args.spring_halflife_position,
+        spring_halflife_rotation=args.spring_halflife_rotation,
+        inertial_quat_start=args.inertial_quat_start,
+        inertial_quat_end=args.inertial_quat_end,
     )
 
     print_instruction()
