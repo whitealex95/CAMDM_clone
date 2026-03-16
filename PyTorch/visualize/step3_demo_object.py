@@ -260,11 +260,14 @@ class MotionGeneratorObject:
 
         past_body = qpos36_to_body_state(past_q[:, :36])         # [Tp,186]
         if has_object:
-            past_obj_rel = np.stack([compute_object_pose_relative_frame(x, frame_mode=frame_mode) for x in past_q], axis=0)  # [Tp,12]
+            # World-frame-centered object state: [p_world_centered(3), R_world_flat(9)]
+            # past_q[:, 36:39] already XY-centered (curr_root_xy subtracted above)
+            obj_pos_centered = past_q[:, 36:39]
+            obj_r = R.from_quat(past_q[:, 39:43][:, [1, 2, 3, 0]]).as_matrix()  # (Tp,3,3)
+            past_obj_world = np.concatenate([obj_pos_centered, obj_r.reshape(-1, 9)], axis=-1).astype(np.float32)
         else:
-            # Match walk padding used in training data.
-            past_obj_rel = np.zeros((past_q.shape[0], 12), dtype=np.float32)
-        past_state = np.concatenate([past_body, past_obj_rel, past_contact.reshape(-1, 1)], axis=-1)  # [Tp,199]
+            past_obj_world = np.zeros((past_q.shape[0], 12), dtype=np.float32)
+        past_state = np.concatenate([past_body, past_obj_world, past_contact.reshape(-1, 1)], axis=-1)  # [Tp,199]
         past_state = past_state[..., None]                        # [Tp,199,1]
 
         traj_trans_centered = traj_trans.copy()
@@ -368,15 +371,17 @@ class MotionGeneratorObject:
 
         sample_np = sample.squeeze(0).permute(2, 0, 1).cpu().numpy()[:, :, 0]  # [Tf,199]
         pred_body = sample_np[:, :self.body_dim]
-        pred_obj_rel = sample_np[:, self.body_dim:self.body_dim + 12]
+        pred_obj_world = sample_np[:, self.body_dim:self.body_dim + 12].copy()
         pred_contact = sample_np[:, self.body_dim + 12:self.body_dim + 13]
 
         pred_qpos36 = body_state_to_qpos36(pred_body)
         pred_qpos36[:, :2] += curr_root_xy[None, :]
+        # De-center object XY (same convention as body root position)
+        pred_obj_world[:, :2] += curr_root_xy[None, :]
         if not has_object:
-            pred_obj_rel[:] = 0.0
+            pred_obj_world[:] = 0.0
             pred_contact[:] = 0.0
-        return pred_qpos36.astype(np.float32), pred_obj_rel.astype(np.float32), pred_contact.squeeze(-1).astype(np.float32)
+        return pred_qpos36.astype(np.float32), pred_obj_world.astype(np.float32), pred_contact.squeeze(-1).astype(np.float32)
 
 
 class DemoPlayerObject:
@@ -414,7 +419,7 @@ class DemoPlayerObject:
         self.frame_dt = 1.0 / self.fps
 
         self.generated_qpos36 = None
-        self.generated_obj_rel = None
+        self.generated_obj_world = None
         self.generated_contact = None
         self.generated_frame_idx = 0
         self.prev_style_idx = None
@@ -474,7 +479,7 @@ class DemoPlayerObject:
 
         self.current_obj_pose_world = q[36:43].copy()
         self.generated_qpos36 = None
-        self.generated_obj_rel = None
+        self.generated_obj_world = None
         self.generated_contact = None
         self.generated_frame_idx = 0
         self.update_past_trajectory_for_visualization()
@@ -543,20 +548,14 @@ class DemoPlayerObject:
         self.future_orient = blend_orient
 
         # Blend object trajectory the same way as root trajectory.
-        pred_obj_rel_future = self.generated_obj_rel[t_cur + 1:]   # [remaining, 12]
-        pred_q36_future = self.generated_qpos36[t_cur + 1:]        # [remaining, 36]
-        if len(pred_obj_rel_future) > 0 and self.has_object:
-            pred_obj_xyz = []
-            pred_obj_quats = []
-            for j in range(len(pred_obj_rel_future)):
-                obj_pos, obj_q = object_relative_to_world(
-                    pred_q36_future[j, :3], pred_q36_future[j, 3:7],
-                    pred_obj_rel_future[j], frame_mode=self.object_pose_relative_frame,
-                )
-                pred_obj_xyz.append(obj_pos)
-                pred_obj_quats.append(obj_q)
-            pred_obj_xyz = np.array(pred_obj_xyz, dtype=np.float32)    # [remaining, 3]
-            pred_obj_quats = np.array(pred_obj_quats, dtype=np.float32) # [remaining, 4]
+        pred_obj_world_future = self.generated_obj_world[t_cur + 1:]  # [remaining, 12]
+        if len(pred_obj_world_future) > 0 and self.has_object:
+            # Object is already in world frame: [p_world(3), R_world_flat(9)]
+            pred_obj_xyz = pred_obj_world_future[:, :3].copy()
+            pred_obj_quats = np.array(
+                [mat_to_quat_wxyz(r.reshape(3, 3)) for r in pred_obj_world_future[:, 3:]],
+                dtype=np.float32,
+            )
             pred_obj_xyz, pred_obj_quats = match_future_horizon(pred_obj_xyz, pred_obj_quats, self.future_frames)
             self.future_obj_traj, self.future_obj_orient = blend_obj_trajectory(
                 pred_obj_xyz, pred_obj_quats,
@@ -635,7 +634,7 @@ class DemoPlayerObject:
         style_idx = self.current_motion_data.style_idx
         effective_cfg_scale = self.motion_generator.cfg_scale if self.cfg_count > 0 else 1.0
 
-        q36, obj_rel, pred_c = self.motion_generator.generate_motion(
+        q36, obj_world, pred_c = self.motion_generator.generate_motion(
             past_q, past_c, self.future_traj, self.future_orient, desired_contact,
             self.future_obj_traj, self.future_obj_orient,
             style_idx, cfg_scale=effective_cfg_scale,
@@ -644,7 +643,7 @@ class DemoPlayerObject:
         )
         if self.cfg_count > 0:
             self.cfg_count -= 1
-        return q36, obj_rel, pred_c
+        return q36, obj_world, pred_c
 
     def update_pose(self):
         if self.inertialize:
@@ -652,12 +651,12 @@ class DemoPlayerObject:
         else:
             self.update_pose_raw()
 
-    def _apply_generated_frame(self, q36, obj_rel, c):
+    def _apply_generated_frame(self, q36, obj_world, c):
         """Shared logic: given a final q36 (after any smoothing), build q43 and update state."""
         if self.has_object:
-            obj_pos, obj_q = object_relative_to_world(
-                q36[:3], q36[3:7], obj_rel, frame_mode=self.object_pose_relative_frame
-            )
+            # obj_world = [p_world(3), R_world_flat(9)] — already in world frame
+            obj_pos = obj_world[:3]
+            obj_q = mat_to_quat_wxyz(obj_world[3:].reshape(3, 3))
             self.current_obj_pose_world = np.concatenate([obj_pos, obj_q], axis=0).astype(np.float32)
         elif self.current_obj_pose_world is None or not self.has_object:
             self.current_obj_pose_world = np.array([0.0, 0.0, -10.0, 1.0, 0.0, 0.0, 0.0], dtype=np.float32)
@@ -677,13 +676,13 @@ class DemoPlayerObject:
 
         if self.generated_frame_idx == 0:
             print("Generating motion")
-            self.generated_qpos36, self.generated_obj_rel, self.generated_contact = self.generate_motion()
+            self.generated_qpos36, self.generated_obj_world, self.generated_contact = self.generate_motion()
 
         i = self.generated_frame_idx
         q36 = self.generated_qpos36[i]
-        obj_rel = self.generated_obj_rel[i]
+        obj_world = self.generated_obj_world[i]
         c = float(self.generated_contact[i])
-        self._apply_generated_frame(q36, obj_rel, c)
+        self._apply_generated_frame(q36, obj_world, c)
 
     def update_pose_inertialized(self):
         if self.transition_manager is None:
@@ -699,7 +698,7 @@ class DemoPlayerObject:
 
         if self.generated_frame_idx == 0:
             print("Generating motion")
-            self.generated_qpos36, self.generated_obj_rel, self.generated_contact = self.generate_motion()
+            self.generated_qpos36, self.generated_obj_world, self.generated_contact = self.generate_motion()
             # Pass 36D body history to the transition manager
             body_history = deque(
                 (q[:36] for q in self.qpos_history), maxlen=self.past_frames
@@ -712,9 +711,9 @@ class DemoPlayerObject:
         raw_target_q36 = self.generated_qpos36[i]
         final_q36 = self.transition_manager.apply(raw_target_q36)
 
-        obj_rel = self.generated_obj_rel[i]
+        obj_world = self.generated_obj_world[i]
         c = float(self.generated_contact[i])
-        self._apply_generated_frame(final_q36, obj_rel, c)
+        self._apply_generated_frame(final_q36, obj_world, c)
 
     def process_pending_commands(self):
         """Drain the key-callback queue. Call this from the main loop before step()."""

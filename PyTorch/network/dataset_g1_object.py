@@ -14,11 +14,40 @@ from torch.utils.data import Dataset
 import utils.nn_transforms as nn_transforms
 
 
+def _quat_wxyz_to_yaw_mat_batch(q_wxyz):
+    """(T,4) wxyz -> (T,3,3) yaw-only rotation matrices."""
+    rot = R.from_quat(q_wxyz[:, [1, 2, 3, 0]])
+    forward = rot.apply(np.tile([1.0, 0.0, 0.0], (len(q_wxyz), 1)))
+    forward[:, 2] = 0.0
+    norm = np.linalg.norm(forward[:, :2], axis=1, keepdims=True)
+    forward[:, :2] /= np.maximum(norm, 1e-8)
+    yaw = np.arctan2(forward[:, 1], forward[:, 0])
+    return R.from_euler("z", yaw).as_matrix()
+
+
+def _obj_rel_to_world_centered(obj_pose_rel, root_pos_centered, root_q_wxyz):
+    """Convert root-yaw-relative obj pose to world-frame-centered.
+
+    obj_pose_rel:       (T,12) = [p_rel(3), R_rel_flat(9)]
+    root_pos_centered:  (T,3)  XY already centered by ref frame
+    root_q_wxyz:        (T,4)  root quaternions (before rotation aug)
+    Returns:            (T,12) = [p_world_centered(3), R_world_flat(9)]
+    """
+    root_r = _quat_wxyz_to_yaw_mat_batch(root_q_wxyz)          # (T,3,3)
+    p_rel = obj_pose_rel[:, :3]
+    R_rel = obj_pose_rel[:, 3:].reshape(-1, 3, 3)
+    p_world = root_pos_centered + np.einsum("tij,tj->ti", root_r, p_rel)
+    R_world = np.einsum("tij,tjk->tik", root_r, R_rel)
+    return np.concatenate([p_world, R_world.reshape(-1, 9)], axis=-1).astype(np.float32)
+
+
 class SingleObjectMotionDataset(Dataset):
     """
     G1 + single-object dataset.
     Denoising target is concatenated vector:
-    [full_body_state, object_pose_rel(12), contact_mask(1)].
+    [full_body_state, object_pose_world_centered(12), contact_mask(1)].
+    Object pose is stored in world-frame centered by the diffusion reference
+    frame XY — the same convention used for body root position.
     """
 
     rot_feat_dim = {'q': 4, '6d': 6, 'euler': 3}
@@ -39,6 +68,7 @@ class SingleObjectMotionDataset(Dataset):
         self.root_pos_list = []
         self.object_pose_rel_list = []
         self.object_contact_list = []
+        self.has_object_list = []
 
         self.local_conds = {"traj_pose": [], "traj_trans": [], "obj_traj_pose": [], "obj_traj_trans": []}
         self.global_conds = {"style": []}
@@ -76,6 +106,7 @@ class SingleObjectMotionDataset(Dataset):
             self.root_pos_list.append(root_pos)
             self.object_pose_rel_list.append(obj_rel)
             self.object_contact_list.append(obj_contact)
+            self.has_object_list.append(bool(motion.get("has_object", False)))
 
             self.local_conds["traj_pose"].append(np.array(motion["traj_pose"], dtype=dtype))
             self.local_conds["traj_trans"].append(np.array(motion["traj"], dtype=dtype))
@@ -137,6 +168,14 @@ class SingleObjectMotionDataset(Dataset):
 
         root_pos[:, [0, 1]] -= root_ref_xy
 
+        # Convert root-relative object pose to world-frame-centered BEFORE rotation aug.
+        # Use root_q (rotations[:,0]) before augmentation and root_pos already centered.
+        has_object = self.has_object_list[motion_idx]
+        if has_object:
+            obj_pose_world = _obj_rel_to_world_centered(obj_pose_rel, root_pos, rotations[:, 0])
+        else:
+            obj_pose_world = np.zeros_like(obj_pose_rel)  # zeros for walk, consistent with inference
+
         traj_rot = self.local_conds["traj_pose"][motion_idx][random.choice(self.traj_aug_indexs1)][frame_ids]
         traj_pos = self.local_conds["traj_trans"][motion_idx][random.choice(self.traj_aug_indexs2)][frame_ids]
         traj_obj_rot = self.local_conds["obj_traj_pose"][motion_idx][random.choice(self.traj_obj_aug_indexs1)][frame_ids]
@@ -166,7 +205,12 @@ class SingleObjectMotionDataset(Dataset):
         traj_obj_rot = (rot_vec[self.reference_frame_idx:] * R.from_quat(traj_obj_rot_xyzw)).as_quat()[..., [3, 0, 1, 2]]
         root_pos = rot_vec.apply(root_pos)
         traj_obj_pos = rot_vec[self.reference_frame_idx:].apply(traj_obj_pos)
-        # object_pose_relative is in root frame, so do NOT rotate it here.
+        # Apply rotation aug to world-frame object pose (positions + rotations).
+        if has_object:
+            rot_mats = rot_vec.as_matrix()  # (T,3,3)
+            obj_world_pos_aug = np.einsum("tij,tj->ti", rot_mats, obj_pose_world[:, :3])
+            obj_world_R_aug = np.einsum("tij,tjk->tik", rot_mats, obj_pose_world[:, 3:].reshape(-1, 3, 3))
+            obj_pose_world = np.concatenate([obj_world_pos_aug, obj_world_R_aug.reshape(-1, 9)], axis=-1)
 
         rotations = torch.from_numpy(rotations.astype(self.dtype))
         traj_pos = torch.from_numpy(traj_pos.astype(self.dtype))
@@ -176,7 +220,7 @@ class SingleObjectMotionDataset(Dataset):
         traj_obj_rot = self.convert_rot(traj_obj_rot)
         traj_obj_pos = torch.from_numpy(traj_obj_pos.astype(self.dtype))
 
-        obj_pose_rel = torch.from_numpy(obj_pose_rel.astype(self.dtype))
+        obj_pose_world_t = torch.from_numpy(obj_pose_world.astype(self.dtype))
         obj_contact = torch.from_numpy(obj_contact.astype(self.dtype))
 
         root_quat = rotations[:, 0]
@@ -192,7 +236,7 @@ class SingleObjectMotionDataset(Dataset):
         rotations_w_root = torch.cat([rotations_full, root_pos_pad], dim=1)
 
         body_state = rotations_w_root.reshape(rotations_w_root.shape[0], -1)
-        object_state = torch.cat([obj_pose_rel, obj_contact], dim=-1)
+        object_state = torch.cat([obj_pose_world_t, obj_contact], dim=-1)
         full_state = torch.cat([body_state, object_state], dim=-1).unsqueeze(-1)  # [TW, D, 1]
 
         future = full_state[self.reference_frame_idx:]
