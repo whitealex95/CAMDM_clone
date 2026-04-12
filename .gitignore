@@ -85,3 +85,4 @@ venv.bak/
 **/data/
 **/checkpoints/
 **/videos/
+.codex

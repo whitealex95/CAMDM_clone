@@ -34,6 +34,7 @@ DEFAULT_SCENE_XML = Path(
 DEFAULT_WAYPOINT_JSON = Path(
     "/home/jkim3662/Projects/TopTier_Procthor/mujoco_scene_library/train_00017__5-room/navigation_test/navigation_waypoints.json"
 )
+# DEFAULT_CHECKPOINT = ROOT / "save/camdm_g1_object_global_wandb_xyz_lr3e-4_merged_object_motion/best.pt"
 DEFAULT_CHECKPOINT = ROOT / "save/camdm_g1_object_global_wandb_xyz_lr3e-4_merged_object_motion/best.pt"
 DEFAULT_DATASET = ROOT / "data/pkls/merged_object_motion.pkl"
 DEFAULT_ROBOT_XML = ROOT / "visualize/assets/g1_29dof_rev_1_0.xml"
