@@ -47,13 +47,15 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
 
     def __init__(self, pkl_path, rot_req, offset_frame,
                  past_frame, future_frame, dtype=np.float32, limited_num=None,
-                 min_start_velocity: float = None):
+                 min_start_velocity: float = None,
+                 rotation_aug: bool = True):
 
         # ---- base class init (loads rotations, traj, styles, etc.) ----
         super().__init__(
             pkl_path, rot_req, offset_frame,
             past_frame, future_frame, dtype=dtype, limited_num=limited_num,
             min_start_velocity=min_start_velocity,
+            rotation_aug=rotation_aug,
         )
 
         # ---- load sensor metadata and readings ----
@@ -140,36 +142,42 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
         # ----------------------------------------------------------
         # GLOBAL ROTATION AUGMENTATION (same as base class)
         # ----------------------------------------------------------
-        rot_xyzw     = rotations[..., [1, 2, 3, 0]]
-        trajrot_xyzw = traj_rot[..., [1, 2, 3, 0]]
+        if self.rotation_aug:
+            rot_xyzw     = rotations[..., [1, 2, 3, 0]]
+            trajrot_xyzw = traj_rot[..., [1, 2, 3, 0]]
 
-        theta = np.random.uniform(0, 2 * np.pi)
-        theta_arr = np.full(rotations.shape[0], theta)
-        rot_vec = R.from_rotvec(np.stack([0 * theta_arr, 0 * theta_arr, theta_arr], axis=-1))
+            theta = np.random.uniform(0, 2 * np.pi)
+            theta_arr = np.full(rotations.shape[0], theta)
+            rot_vec = R.from_rotvec(np.stack([0 * theta_arr, 0 * theta_arr, theta_arr], axis=-1))
 
-        rotations[:, 0] = (
-            rot_vec * R.from_quat(rot_xyzw[:, 0])
-        ).as_quat()[..., [3, 0, 1, 2]]
+            rotations[:, 0] = (
+                rot_vec * R.from_quat(rot_xyzw[:, 0])
+            ).as_quat()[..., [3, 0, 1, 2]]
 
-        traj_rot = (
-            rot_vec[self.reference_frame_idx:] * R.from_quat(trajrot_xyzw)
-        ).as_quat()[..., [3, 0, 1, 2]]
+            traj_rot = (
+                rot_vec[self.reference_frame_idx:] * R.from_quat(trajrot_xyzw)
+            ).as_quat()[..., [3, 0, 1, 2]]
 
-        root_pos = rot_vec.apply(root_pos)
+            root_pos = rot_vec.apply(root_pos)
 
-        # ---- Rotate sensor reading to match new heading ----
-        # Each ring z has count_z = round(2π*z) spheres uniformly distributed
-        # over 2π.  A heading rotation of theta shifts ring z's angular index by
-        #   k_z = -round(theta * count_z / (2π))
-        rotated = sensor_current.copy()
-        for (start, end) in self._ring_slices:
-            count = end - start
-            if count == 0:
-                continue
-            k = -int(round(theta * count / (2.0 * np.pi)))
-            if k != 0:
-                rotated[start:end] = np.roll(sensor_current[start:end], k)
-        sensor_current = rotated
+            # traj_pos is world-frame XY so it must rotate with everything else
+            cos_t, sin_t = np.cos(theta), np.sin(theta)
+            R2 = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=traj_pos.dtype)
+            traj_pos = (R2 @ traj_pos.T).T
+
+            # ---- Rotate sensor reading to match new heading ----
+            # Each ring z has count_z = round(2π*z) spheres uniformly distributed
+            # over 2π.  A heading rotation of theta shifts ring z's angular index by
+            #   k_z = -round(theta * count_z / (2π))
+            rotated = sensor_current.copy()
+            for (start, end) in self._ring_slices:
+                count = end - start
+                if count == 0:
+                    continue
+                k = -int(round(theta * count / (2.0 * np.pi)))
+                if k != 0:
+                    rotated[start:end] = np.roll(sensor_current[start:end], k)
+            sensor_current = rotated
 
         # ----------------------------------------------------------
         # TORCH CONVERSION (same as base class)

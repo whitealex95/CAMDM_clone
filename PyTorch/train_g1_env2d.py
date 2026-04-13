@@ -49,6 +49,7 @@ def train(config, resume, logger, tb_writer):
         dtype=np_dtype,
         limited_num=config.trainer.load_num,
         min_start_velocity=config.trainer.min_start_velocity,
+        rotation_aug=config.trainer.rotation_aug,
     )
     train_dataloader = DataLoader(
         train_data,

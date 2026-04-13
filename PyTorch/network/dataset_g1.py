@@ -26,7 +26,8 @@ class HumanoidMotionDataset(Dataset):
 
     def __init__(self, pkl_path, rot_req, offset_frame,
                  past_frame, future_frame, dtype=np.float32, limited_num=None,
-                 min_start_velocity: float = None):
+                 min_start_velocity: float = None,
+                 rotation_aug: bool = True):
         """
         Args:
             min_start_velocity: If set, skip the initial T-pose / low-motion
@@ -35,10 +36,14 @@ class HumanoidMotionDataset(Dataset):
                 (m/frame, 5-frame rolling mean) exceeds this threshold.
                 Recommended value for LAFAN data: 0.008 (≈ 0.24 m/s @ 30 fps).
                 Set to None (default) to disable and use all frames.
+            rotation_aug: If True (default), randomly rotate each sample around
+                the Z axis during __getitem__.  Applies consistently to root
+                rotation, root position, trajectory XY, and trajectory rotation.
         """
         self.pkl_path = pkl_path
         self.rot_req = rot_req.lower()
         self.dtype    = dtype
+        self.rotation_aug = rotation_aug
 
         window_size = past_frame + future_frame
         self.past_frame = past_frame
@@ -170,24 +175,30 @@ class HumanoidMotionDataset(Dataset):
         # -----------------------------
         # GLOBAL ROTATION AUGMENTATION
         # -----------------------------
-        rot_xyzw     = rotations[..., [1,2,3,0]] # (TW, 1+29, 4)
-        trajrot_xyzw = traj_rot[...,     [1,2,3,0]] # (TF, 4)
+        if self.rotation_aug:
+            rot_xyzw     = rotations[..., [1,2,3,0]] # (TW, 1+29, 4)
+            trajrot_xyzw = traj_rot[...,     [1,2,3,0]] # (TF, 4)
 
-        # Random global rotation around Up-axis (Z axis for G1, originally Y axis from Unity)
-        theta = np.repeat(np.random.uniform(0,2*np.pi), rotations.shape[0])
-        rot_vec = R.from_rotvec(np.stack([0*theta, 0*theta, theta], axis=-1))
+            # Random global rotation around Up-axis (Z axis for G1, originally Y axis from Unity)
+            theta = np.repeat(np.random.uniform(0,2*np.pi), rotations.shape[0])
+            rot_vec = R.from_rotvec(np.stack([0*theta, 0*theta, theta], axis=-1))
 
-        # Rotate first rotation(root)
-        rotations[:,0] = (rot_vec * R.from_quat(rot_xyzw[:,0])) \
-                            .as_quat()[..., [3,0,1,2]]
+            # Rotate first rotation(root)
+            rotations[:,0] = (rot_vec * R.from_quat(rot_xyzw[:,0])) \
+                                .as_quat()[..., [3,0,1,2]]
 
-        # Rotate trajectory rotations
-        traj_rot = (rot_vec[self.reference_frame_idx:] *
-                    R.from_quat(trajrot_xyzw)) \
-                    .as_quat()[..., [3,0,1,2]]
+            # Rotate trajectory rotations
+            traj_rot = (rot_vec[self.reference_frame_idx:] *
+                        R.from_quat(trajrot_xyzw)) \
+                        .as_quat()[..., [3,0,1,2]]
 
-        # Rotate root positions
-        root_pos = rot_vec.apply(root_pos)
+            # Rotate root positions
+            root_pos = rot_vec.apply(root_pos)
+
+            # traj_pos is world-frame XY so it must rotate with everything else
+            cos_t, sin_t = np.cos(theta[0]), np.sin(theta[0])
+            R2 = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=traj_pos.dtype)
+            traj_pos = (R2 @ traj_pos.T).T
 
         # -----------------------------
         # TORCH CONVERSION
