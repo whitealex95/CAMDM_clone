@@ -14,7 +14,7 @@ Usage:
 """
 
 import numpy as np
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -256,3 +256,208 @@ class EnvironmentSensor:
     def feature_dim(self) -> int:
         """Sensor output dimensionality (= n_rays)."""
         return self.n_rays
+
+
+# ---------------------------------------------------------------------------
+# Obstacle generator (data augmentation)
+# ---------------------------------------------------------------------------
+
+class ObstacleGenerator:
+    """
+    Generates random 2-D obstacles for data augmentation.
+
+    Obstacles are placed in an annular region around the robot's trajectory
+    window and are guaranteed NOT to intersect the robot's safe zone.
+
+    Design guarantees
+    -----------------
+    * No obstacle centre is closer than ``robot_safe_radius`` to any robot
+      position in the current trajectory window.
+    * Obstacles are within ``placement_radius`` of the window centroid, which
+      keeps them within sensor range of at least some frames.
+    * When placement fails after ``max_attempts`` tries the obstacle is skipped
+      (fewer obstacles than requested is acceptable).
+
+    Usage
+    -----
+    >>> gen = ObstacleGenerator(seed=42)
+    >>> obstacles = gen.generate_for_window(robot_xy_window)
+    >>> readings, hit_pts = sensor.compute(robot_pos, yaw, obstacles)
+    """
+
+    def __init__(
+        self,
+        n_obstacles_range: Tuple[int, int] = (3, 8),
+        robot_safe_radius: float = 0.5,
+        circle_radius_range: Tuple[float, float] = (0.15, 0.55),
+        box_halfextent_range: Tuple[float, float] = (0.12, 0.45),
+        placement_radius: float = 4.5,
+        max_attempts: int = 40,
+        circle_prob: float = 0.5,
+        seed: Optional[int] = None,
+    ):
+        """
+        Args:
+            n_obstacles_range:    (min, max) number of obstacles per window.
+            robot_safe_radius:    Minimum clear distance around robot path (m).
+            circle_radius_range:  (min, max) circle obstacle radius (m).
+            box_halfextent_range: (min, max) box half-extent per axis (m).
+            placement_radius:     Max distance from trajectory centroid (m).
+            max_attempts:         Rejection-sampling attempts per obstacle.
+            circle_prob:          Probability of placing a circle vs a box.
+            seed:                 Optional RNG seed for reproducibility.
+        """
+        self.n_min, self.n_max = n_obstacles_range
+        self.robot_safe_radius = float(robot_safe_radius)
+        self.r_min, self.r_max = circle_radius_range
+        self.b_min, self.b_max = box_halfextent_range
+        self.placement_radius = float(placement_radius)
+        self.max_attempts = int(max_attempts)
+        self.circle_prob = float(circle_prob)
+        self._rng = np.random.default_rng(seed)
+
+    def seed(self, s: int):
+        """Re-seed the internal RNG."""
+        self._rng = np.random.default_rng(s)
+
+    def generate_for_window(
+        self,
+        robot_xy: np.ndarray,
+        lookahead_xy: Optional[np.ndarray] = None,
+    ) -> List[Obstacle2D]:
+        """
+        Generate a set of obstacles compatible with the given trajectory window.
+
+        Args:
+            robot_xy:      (T, 2) XY positions of the robot during this window.
+                           Used for collision checking.
+            lookahead_xy:  Optional (T2, 2) *future* positions to also check
+                           (so obstacles do not block the near-future path).
+
+        Returns:
+            List of Obstacle2D (may be shorter than requested if placement fails).
+        """
+        robot_xy = np.asarray(robot_xy, dtype=np.float64)
+        if lookahead_xy is not None:
+            check_xy = np.concatenate([robot_xy, np.asarray(lookahead_xy, dtype=np.float64)], axis=0)
+        else:
+            check_xy = robot_xy
+
+        centroid = robot_xy.mean(axis=0)
+        n_want = int(self._rng.integers(self.n_min, self.n_max + 1))
+        obstacles: List[Obstacle2D] = []
+
+        for _ in range(n_want):
+            obs = self._try_place(centroid, check_xy)
+            if obs is not None:
+                obstacles.append(obs)
+
+        return obstacles
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _try_place(
+        self,
+        centroid: np.ndarray,
+        check_xy: np.ndarray,
+    ) -> Optional[Obstacle2D]:
+        """Rejection-sample one obstacle that does not collide with check_xy."""
+        for _ in range(self.max_attempts):
+            # Random polar placement around centroid
+            r = self._rng.uniform(
+                self.robot_safe_radius * 1.2,
+                self.placement_radius,
+            )
+            theta = self._rng.uniform(0.0, 2.0 * np.pi)
+            cx = centroid[0] + r * np.cos(theta)
+            cy = centroid[1] + r * np.sin(theta)
+            center = np.array([cx, cy])
+
+            if self._rng.random() < self.circle_prob:
+                radius = self._rng.uniform(self.r_min, self.r_max)
+                obs: Obstacle2D = CircleObstacle(center, radius)
+                # Collision check: obstacle surface must stay > safe_radius from path
+                min_gap = self.robot_safe_radius + radius
+            else:
+                hx = self._rng.uniform(self.b_min, self.b_max)
+                hy = self._rng.uniform(self.b_min, self.b_max)
+                yaw = self._rng.uniform(0.0, np.pi)
+                obs = BoxObstacle(center, np.array([hx, hy]), yaw)
+                # For boxes use their own min-distance method
+                min_gap = self.robot_safe_radius
+
+            # Vectorised safety check
+            if self._is_safe(obs, check_xy, min_gap):
+                return obs
+
+        return None  # Could not place within max_attempts
+
+    def _is_safe(
+        self,
+        obs: Obstacle2D,
+        check_xy: np.ndarray,
+        min_gap: float,
+    ) -> bool:
+        """Return True if the obstacle is collision-free with every check point."""
+        for pt in check_xy:
+            if obs.min_distance_to_point(pt) < min_gap:
+                return False
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Per-clip sensor augmentation (used by the dataset builder)
+# ---------------------------------------------------------------------------
+
+def compute_clip_sensor_readings(
+    all_qpos: np.ndarray,
+    sensor: EnvironmentSensor,
+    generator: ObstacleGenerator,
+    obstacle_interval: int = 30,
+    lookahead_frames: int = 30,
+) -> Tuple[np.ndarray, List]:
+    """
+    Compute sensor readings for an entire motion clip with time-varying obstacles.
+
+    Obstacles are regenerated every ``obstacle_interval`` frames.
+    Each window's obstacles are checked against the robot path in that window
+    plus ``lookahead_frames`` into the future so the obstacles don't block the
+    immediately upcoming path.
+
+    Args:
+        all_qpos:          (T, 36) qpos sequence for the full clip.
+        sensor:            EnvironmentSensor instance.
+        generator:         ObstacleGenerator instance.
+        obstacle_interval: Frames between obstacle regeneration.
+        lookahead_frames:  Future frames included in collision check.
+
+    Returns:
+        readings:          (T, n_rays) float32 sensor readings.
+        window_obstacles:  List of (start, end, List[Obstacle2D]) for visualisation.
+    """
+    T = all_qpos.shape[0]
+    readings = np.zeros((T, sensor.n_rays), dtype=np.float32)
+    window_obstacles = []
+
+    starts = list(range(0, T, obstacle_interval))
+    for w_start in starts:
+        w_end = min(w_start + obstacle_interval, T)
+        la_end = min(w_end + lookahead_frames, T)
+
+        # Robot XY in this window (for collision check)
+        window_xy = all_qpos[w_start:w_end, :2]
+        lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
+
+        obstacles = generator.generate_for_window(window_xy, lookahead_xy)
+        window_obstacles.append((w_start, w_end, obstacles))
+
+        # Compute readings for every frame in this window
+        for t in range(w_start, w_end):
+            pos = all_qpos[t, :3]
+            yaw = quat_wxyz_to_yaw(all_qpos[t, 3:7])
+            r, _ = sensor.compute(pos, yaw, obstacles)
+            readings[t] = r
+
+    return readings, window_obstacles
