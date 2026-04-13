@@ -91,6 +91,7 @@ class SensorMotionPlayer:
         n_rays: int = 36,
         max_range: float = 3.0,
         obstacle_interval: int = 30,
+        obstacle_mode: str = 'sparse',
         show_trajectory: bool = True,
         show_sensor: bool = True,
         show_obstacles: bool = True,
@@ -103,7 +104,7 @@ class SensorMotionPlayer:
 
         # sensor
         self.sensor = EnvironmentSensor(n_rays=n_rays, max_range=max_range)
-        self.generator = ObstacleGenerator()
+        self.generator = ObstacleGenerator(mode=obstacle_mode)
         self.obstacles = []
         self.readings = np.zeros(n_rays, dtype=np.float32)
         self.hit_points = np.zeros((n_rays, 2), dtype=np.float64)
@@ -377,6 +378,7 @@ def create_env_dataset(
     robot_safe_radius: float = 0.5,
     lookahead_frames: int = 30,
     seed: int = 0,
+    mode: str = 'sparse',
 ):
     """
     Build an obstacle-augmented dataset.
@@ -403,7 +405,7 @@ def create_env_dataset(
         data_dict = pickle.load(f)
 
     sensor = EnvironmentSensor(n_rays=n_rays, max_range=max_range)
-    generator = ObstacleGenerator(robot_safe_radius=robot_safe_radius, seed=seed)
+    generator = ObstacleGenerator(mode=mode, robot_safe_radius=robot_safe_radius, seed=seed)
 
     motions = data_dict["motions"]
     print(f"Processing {len(motions)} motion clips …")
@@ -437,6 +439,7 @@ def create_env_dataset(
     data_dict["sensor_n_rays"] = n_rays
     data_dict["sensor_max_range"] = max_range
     data_dict["obstacle_interval"] = obstacle_interval
+    data_dict["obstacle_mode"] = mode
 
     os.makedirs(os.path.dirname(output_pkl) or ".", exist_ok=True)
     with open(output_pkl, "wb") as f:
@@ -471,6 +474,9 @@ def get_args():
     p.add_argument("--robot-safe-radius", type=float, default=0.5,
                    help="Minimum clear gap around robot path in metres (default: 0.5)")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--mode", default="sparse",
+                   choices=["sparse", "dense", "packed"],
+                   help="Obstacle density mode (default: sparse)")
 
     # visualisation-only
     p.add_argument("--motion",   type=int, default=0)
@@ -522,7 +528,7 @@ def main():
     #  Dataset creation mode                                              #
     # ------------------------------------------------------------------ #
     if args.create_dataset:
-        output = args.output or f"data/pkls/{args.dataset}_env.pkl"
+        output = args.output or f"data/pkls/{args.dataset}_env_{args.mode}.pkl"
         if not os.path.exists(dataset_path):
             print(f"Source dataset not found: {dataset_path}")
             return
@@ -535,6 +541,7 @@ def main():
             robot_safe_radius=args.robot_safe_radius,
             lookahead_frames=args.lookahead_frames,
             seed=args.seed,
+            mode=args.mode,
         )
         return
 
@@ -568,6 +575,7 @@ def main():
         n_rays=args.n_rays,
         max_range=args.max_range,
         obstacle_interval=args.obstacle_interval,
+        obstacle_mode=args.mode,
         show_trajectory=not args.no_trajectory,
         show_sensor=not args.no_sensor,
         show_obstacles=not args.no_obstacles,

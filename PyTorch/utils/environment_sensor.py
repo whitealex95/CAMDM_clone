@@ -264,57 +264,117 @@ class EnvironmentSensor:
 
 class ObstacleGenerator:
     """
-    Generates random 2-D obstacles for data augmentation.
+    Generates random 2-D obstacles for data augmentation in three density modes.
 
-    Obstacles are placed in an annular region around the robot's trajectory
-    window and are guaranteed NOT to intersect the robot's safe zone.
+    Modes
+    -----
+    ``sparse``
+        A small number of randomly placed obstacles scattered within the
+        sensor range.  The robot walks through mostly open space.
 
-    Design guarantees
-    -----------------
-    * No obstacle centre is closer than ``robot_safe_radius`` to any robot
-      position in the current trajectory window.
-    * Obstacles are within ``placement_radius`` of the window centroid, which
-      keeps them within sensor range of at least some frames.
-    * When placement fails after ``max_attempts`` tries the obstacle is skipped
-      (fewer obstacles than requested is acceptable).
+    ``dense``
+        Many randomly placed obstacles fill most of the reachable area around
+        the robot's path.  The path remains clear but obstacles are tightly
+        packed.
+
+    ``packed``
+        Grid-based filling: obstacles are placed on a regular grid across the
+        entire sensing area.  Every grid cell that does NOT overlap with the
+        robot's safe corridor gets an obstacle, producing a tight "hallway"
+        effect.
+
+    Design guarantees (all modes)
+    ------------------------------
+    * No obstacle comes within ``robot_safe_radius`` of any robot position in
+      the trajectory window (including an optional look-ahead window).
 
     Usage
     -----
-    >>> gen = ObstacleGenerator(seed=42)
+    >>> gen = ObstacleGenerator(mode='packed', seed=42)
     >>> obstacles = gen.generate_for_window(robot_xy_window)
     >>> readings, hit_pts = sensor.compute(robot_pos, yaw, obstacles)
     """
 
+    MODES = {'sparse', 'dense', 'packed'}
+
+    # ---- Per-mode defaults -------------------------------------------------
+    _MODE_DEFAULTS = {
+        'sparse': dict(
+            n_obstacles_range=(3, 8),
+            circle_radius_range=(0.15, 0.55),
+            box_halfextent_range=(0.12, 0.45),
+            placement_radius=4.5,
+        ),
+        'dense': dict(
+            n_obstacles_range=(12, 25),
+            circle_radius_range=(0.12, 0.40),
+            box_halfextent_range=(0.10, 0.35),
+            placement_radius=5.0,
+        ),
+        'packed': dict(
+            grid_spacing=0.70,       # distance between grid-cell centres (m)
+            obs_half_extent=0.28,    # half-extent of each box in the grid (m)
+            fill_radius=6.0,         # grid extends this far from trajectory centroid
+        ),
+    }
+
     def __init__(
         self,
-        n_obstacles_range: Tuple[int, int] = (3, 8),
+        mode: str = 'sparse',
         robot_safe_radius: float = 0.5,
-        circle_radius_range: Tuple[float, float] = (0.15, 0.55),
-        box_halfextent_range: Tuple[float, float] = (0.12, 0.45),
-        placement_radius: float = 4.5,
         max_attempts: int = 40,
         circle_prob: float = 0.5,
         seed: Optional[int] = None,
+        # Override per-mode defaults (optional)
+        n_obstacles_range: Optional[Tuple[int, int]] = None,
+        circle_radius_range: Optional[Tuple[float, float]] = None,
+        box_halfextent_range: Optional[Tuple[float, float]] = None,
+        placement_radius: Optional[float] = None,
+        grid_spacing: Optional[float] = None,
+        obs_half_extent: Optional[float] = None,
+        fill_radius: Optional[float] = None,
     ):
         """
         Args:
-            n_obstacles_range:    (min, max) number of obstacles per window.
-            robot_safe_radius:    Minimum clear distance around robot path (m).
-            circle_radius_range:  (min, max) circle obstacle radius (m).
-            box_halfextent_range: (min, max) box half-extent per axis (m).
-            placement_radius:     Max distance from trajectory centroid (m).
-            max_attempts:         Rejection-sampling attempts per obstacle.
-            circle_prob:          Probability of placing a circle vs a box.
-            seed:                 Optional RNG seed for reproducibility.
+            mode:              Obstacle density mode: ``'sparse'``, ``'dense'``, or
+                               ``'packed'``.
+            robot_safe_radius: Minimum clearance between any obstacle and any
+                               robot position in the trajectory window (m).
+            max_attempts:      Rejection-sampling retries per obstacle (sparse/dense).
+            circle_prob:       Probability of placing a circle rather than a box
+                               (sparse/dense modes only).
+            seed:              Optional RNG seed for reproducibility.
+            n_obstacles_range, circle_radius_range, box_halfextent_range,
+            placement_radius:  Overrides for sparse/dense mode parameters.
+            grid_spacing, obs_half_extent, fill_radius:
+                               Overrides for packed mode parameters.
         """
-        self.n_min, self.n_max = n_obstacles_range
+        if mode not in self.MODES:
+            raise ValueError(f"mode must be one of {self.MODES}, got '{mode}'")
+
+        self.mode = mode
         self.robot_safe_radius = float(robot_safe_radius)
-        self.r_min, self.r_max = circle_radius_range
-        self.b_min, self.b_max = box_halfextent_range
-        self.placement_radius = float(placement_radius)
         self.max_attempts = int(max_attempts)
         self.circle_prob = float(circle_prob)
         self._rng = np.random.default_rng(seed)
+
+        # Merge mode defaults with caller overrides
+        defaults = dict(self._MODE_DEFAULTS[mode])
+
+        if mode in ('sparse', 'dense'):
+            nr = n_obstacles_range or defaults['n_obstacles_range']
+            self.n_min, self.n_max = nr
+            self.r_min, self.r_max = circle_radius_range or defaults['circle_radius_range']
+            self.b_min, self.b_max = box_halfextent_range or defaults['box_halfextent_range']
+            self.placement_radius  = float(placement_radius or defaults['placement_radius'])
+        else:  # packed
+            self.grid_spacing    = float(grid_spacing    or defaults['grid_spacing'])
+            self.obs_half_extent = float(obs_half_extent or defaults['obs_half_extent'])
+            self.fill_radius     = float(fill_radius     or defaults['fill_radius'])
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def seed(self, s: int):
         """Re-seed the internal RNG."""
@@ -330,69 +390,109 @@ class ObstacleGenerator:
 
         Args:
             robot_xy:      (T, 2) XY positions of the robot during this window.
-                           Used for collision checking.
-            lookahead_xy:  Optional (T2, 2) *future* positions to also check
-                           (so obstacles do not block the near-future path).
+            lookahead_xy:  Optional (T2, 2) future positions for extra safety.
 
         Returns:
-            List of Obstacle2D (may be shorter than requested if placement fails).
+            List of Obstacle2D guaranteed to be collision-free with the path.
         """
         robot_xy = np.asarray(robot_xy, dtype=np.float64)
-        if lookahead_xy is not None:
-            check_xy = np.concatenate([robot_xy, np.asarray(lookahead_xy, dtype=np.float64)], axis=0)
-        else:
-            check_xy = robot_xy
+        check_xy = robot_xy if lookahead_xy is None else np.concatenate(
+            [robot_xy, np.asarray(lookahead_xy, dtype=np.float64)], axis=0
+        )
 
+        if self.mode == 'packed':
+            return self._generate_packed(robot_xy, check_xy)
+        else:
+            return self._generate_random(robot_xy, check_xy)
+
+    # ------------------------------------------------------------------
+    # Random placement (sparse / dense)
+    # ------------------------------------------------------------------
+
+    def _generate_random(
+        self,
+        robot_xy: np.ndarray,
+        check_xy: np.ndarray,
+    ) -> List[Obstacle2D]:
         centroid = robot_xy.mean(axis=0)
         n_want = int(self._rng.integers(self.n_min, self.n_max + 1))
         obstacles: List[Obstacle2D] = []
-
         for _ in range(n_want):
-            obs = self._try_place(centroid, check_xy)
+            obs = self._try_place_random(centroid, check_xy)
             if obs is not None:
                 obstacles.append(obs)
-
         return obstacles
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _try_place(
+    def _try_place_random(
         self,
         centroid: np.ndarray,
         check_xy: np.ndarray,
     ) -> Optional[Obstacle2D]:
         """Rejection-sample one obstacle that does not collide with check_xy."""
         for _ in range(self.max_attempts):
-            # Random polar placement around centroid
-            r = self._rng.uniform(
-                self.robot_safe_radius * 1.2,
-                self.placement_radius,
-            )
-            theta = self._rng.uniform(0.0, 2.0 * np.pi)
-            cx = centroid[0] + r * np.cos(theta)
-            cy = centroid[1] + r * np.sin(theta)
-            center = np.array([cx, cy])
+            r     = self._rng.uniform(self.robot_safe_radius * 1.2, self.placement_radius)
+            angle = self._rng.uniform(0.0, 2.0 * np.pi)
+            center = centroid + r * np.array([np.cos(angle), np.sin(angle)])
 
             if self._rng.random() < self.circle_prob:
                 radius = self._rng.uniform(self.r_min, self.r_max)
                 obs: Obstacle2D = CircleObstacle(center, radius)
-                # Collision check: obstacle surface must stay > safe_radius from path
                 min_gap = self.robot_safe_radius + radius
             else:
-                hx = self._rng.uniform(self.b_min, self.b_max)
-                hy = self._rng.uniform(self.b_min, self.b_max)
+                hx  = self._rng.uniform(self.b_min, self.b_max)
+                hy  = self._rng.uniform(self.b_min, self.b_max)
                 yaw = self._rng.uniform(0.0, np.pi)
                 obs = BoxObstacle(center, np.array([hx, hy]), yaw)
-                # For boxes use their own min-distance method
                 min_gap = self.robot_safe_radius
 
-            # Vectorised safety check
             if self._is_safe(obs, check_xy, min_gap):
                 return obs
 
-        return None  # Could not place within max_attempts
+        return None
+
+    # ------------------------------------------------------------------
+    # Grid-based packed generation
+    # ------------------------------------------------------------------
+
+    def _generate_packed(
+        self,
+        robot_xy: np.ndarray,
+        check_xy: np.ndarray,
+    ) -> List[Obstacle2D]:
+        """
+        Fill a grid with box obstacles, leaving the robot's corridor clear.
+
+        A regular grid is created centred at the trajectory centroid.  Every
+        cell whose centre is outside the ``robot_safe_radius + obs_half_extent``
+        exclusion zone around every trajectory point gets an obstacle.
+        """
+        centroid = robot_xy.mean(axis=0)
+        step     = self.grid_spacing
+        R        = self.fill_radius
+        hx = hy  = self.obs_half_extent
+        min_gap  = self.robot_safe_radius  # uses BoxObstacle.min_distance_to_point
+
+        xs = np.arange(-R, R + step * 0.5, step)
+        ys = np.arange(-R, R + step * 0.5, step)
+
+        obstacles: List[Obstacle2D] = []
+        for dx in xs:
+            for dy in ys:
+                center = centroid + np.array([dx, dy])
+                # Add small random jitter so the grid doesn't look perfectly regular
+                jitter = self._rng.uniform(-step * 0.15, step * 0.15, size=2)
+                center = center + jitter
+
+                obs = BoxObstacle(center, np.array([hx, hy]),
+                                  yaw=self._rng.uniform(0.0, np.pi * 0.25))
+                if self._is_safe(obs, check_xy, min_gap):
+                    obstacles.append(obs)
+
+        return obstacles
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
 
     def _is_safe(
         self,
