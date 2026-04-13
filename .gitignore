@@ -85,4 +85,7 @@ venv.bak/
 **/data/
 **/checkpoints/
 **/videos/
+
+## AI
 .codex
+.claude
