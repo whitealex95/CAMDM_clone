@@ -47,12 +47,14 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
     """
 
     def __init__(self, pkl_path, rot_req, offset_frame,
-                 past_frame, future_frame, dtype=np.float32, limited_num=None):
+                 past_frame, future_frame, dtype=np.float32, limited_num=None,
+                 min_start_velocity: float = None):
 
         # ---- base class init (loads rotations, traj, styles, etc.) ----
         super().__init__(
             pkl_path, rot_req, offset_frame,
             past_frame, future_frame, dtype=dtype, limited_num=limited_num,
+            min_start_velocity=min_start_velocity,
         )
 
         # ---- load sensor metadata and readings ----

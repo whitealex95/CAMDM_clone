@@ -24,9 +24,10 @@ def train(config, resume, logger, tb_writer):
     np_dtype = common.select_platform(32)
     
     print("Loading dataset..")
-    train_data = HumanoidMotionDataset(config.data, config.arch.rot_req, 
-                                  config.arch.offset_frame,  config.arch.past_frame, 
-                                  config.arch.future_frame, dtype=np_dtype, limited_num=config.trainer.load_num)
+    train_data = HumanoidMotionDataset(config.data, config.arch.rot_req,
+                                  config.arch.offset_frame, config.arch.past_frame,
+                                  config.arch.future_frame, dtype=np_dtype, limited_num=config.trainer.load_num,
+                                  min_start_velocity=config.trainer.min_start_velocity)
     train_dataloader = DataLoader(train_data, batch_size=config.trainer.batch_size, shuffle=True, num_workers=config.trainer.workers, drop_last=False, pin_memory=True)
     logger.info('\nTraining Dataset including %d clip, with %d frame per clip;' % (len(train_data), config.arch.clip_len))
     

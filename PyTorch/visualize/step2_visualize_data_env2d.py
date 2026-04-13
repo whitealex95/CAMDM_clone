@@ -98,6 +98,7 @@ class SensorMotionPlayer:
         show_obstacles: bool = True,
         past_frames: int = 10,
         future_frames: int = 45,
+        min_start_velocity: float = None,
     ):
         self.model = model
         self.data = data
@@ -130,6 +131,7 @@ class SensorMotionPlayer:
 
         self.past_frames = past_frames
         self.future_frames = future_frames
+        self.min_start_velocity = min_start_velocity
 
         self.load_motion(0)
 
@@ -140,8 +142,17 @@ class SensorMotionPlayer:
     def load_motion(self, motion_idx: int):
         self.current_motion_idx = motion_idx % len(self.dataset)
         self.current_motion = self.dataset[self.current_motion_idx]
-        self.current_frame = 0
         self._last_obstacle_window = -1  # force regeneration
+
+        # Skip initial T-pose / low-velocity frames
+        if self.min_start_velocity is not None:
+            root_xy = self.current_motion.global_root_positions[:, :2].astype(np.float64)
+            vel = np.linalg.norm(np.diff(root_xy, axis=0), axis=1)
+            smoothed = np.convolve(vel, np.ones(5) / 5, mode='same')
+            active = np.where(smoothed > self.min_start_velocity)[0]
+            self.current_frame = int(active[0]) if len(active) > 0 else 0
+        else:
+            self.current_frame = 0
 
         print(f"\n{'='*60}")
         print(f"Motion {self.current_motion_idx + 1}/{len(self.dataset)}")
@@ -487,6 +498,12 @@ def get_args():
                         "Multiple modes cycle on each obstacle window. "
                         "Default: 'sparse|dense|packed'")
 
+    p.add_argument("--min-start-velocity", type=float, default=0.008,
+                   help="Skip initial T-pose frames: first frame whose 5-frame "
+                        "smoothed root-XY speed (m/frame) exceeds this threshold "
+                        "is used as the start frame. Set 0 to disable. "
+                        "(default: 0.008 ≈ 0.24 m/s @ 30 fps)")
+
     # visualisation-only
     p.add_argument("--motion",   type=int, default=0)
     p.add_argument("--past-frames",   type=int, default=10)
@@ -611,6 +628,7 @@ def main():
         show_obstacles=not args.no_obstacles,
         past_frames=args.past_frames,
         future_frames=args.future_frames,
+        min_start_velocity=args.min_start_velocity if args.min_start_velocity > 0 else None,
     )
 
     if args.motion > 0:

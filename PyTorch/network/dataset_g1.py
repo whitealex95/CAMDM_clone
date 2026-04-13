@@ -25,8 +25,17 @@ class HumanoidMotionDataset(Dataset):
     rot_feat_dim = {'q': 4, '6d': 6, 'euler': 3}
 
     def __init__(self, pkl_path, rot_req, offset_frame,
-                 past_frame, future_frame, dtype=np.float32, limited_num=None):
-
+                 past_frame, future_frame, dtype=np.float32, limited_num=None,
+                 min_start_velocity: float = None):
+        """
+        Args:
+            min_start_velocity: If set, skip the initial T-pose / low-motion
+                frames at the start of each clip.  Windows are only generated
+                starting from the first frame whose smoothed root-XY speed
+                (m/frame, 5-frame rolling mean) exceeds this threshold.
+                Recommended value for LAFAN data: 0.008 (≈ 0.24 m/s @ 30 fps).
+                Set to None (default) to disable and use all frames.
+        """
         self.pkl_path = pkl_path
         self.rot_req = rot_req.lower()
         self.dtype    = dtype
@@ -64,7 +73,19 @@ class HumanoidMotionDataset(Dataset):
             )
             self.global_conds["style"].append(motion["style"])
 
-            clips = np.arange(0, N - window_size + 1, offset_frame)[:, None] \
+            # Find first active frame (skip initial T-pose / low-velocity frames)
+            if min_start_velocity is not None:
+                root_xy = motion["global_root_positions"][:, :2].astype(np.float64)
+                vel = np.linalg.norm(np.diff(root_xy, axis=0), axis=1)  # (N-1,) m/frame
+                # 5-frame rolling mean to smooth out noise
+                smoothed = np.convolve(vel, np.ones(5) / 5, mode='same')
+                active = np.where(smoothed > min_start_velocity)[0]
+                first_active = int(active[0]) if len(active) > 0 else (N - window_size + 1)
+            else:
+                first_active = 0
+
+            start = min(first_active, N - window_size)  # clamp: at least one window
+            clips = np.arange(start, N - window_size + 1, offset_frame)[:, None] \
                     + np.arange(window_size)
             clips = np.hstack((np.full((len(clips),1), motion_idx), clips))
             item_indices.append(clips)

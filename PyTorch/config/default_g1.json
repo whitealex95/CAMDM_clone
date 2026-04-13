@@ -26,6 +26,7 @@
         "use_geometric_losses": true,
         "loss_geo_pos_weight": 1.0,
         "loss_geo_foot_weight": 1.0,
-        "loss_geo_vel_weight": 1.0
+        "loss_geo_vel_weight": 1.0,
+        "min_start_velocity": 0.008
     }
 }
