@@ -295,35 +295,6 @@ class EnvironmentSensor:
 
 
 # ---------------------------------------------------------------------------
-# Trajectory geometry helpers
-# ---------------------------------------------------------------------------
-
-def _trajectory_tangents(robot_xy: np.ndarray) -> np.ndarray:
-    """
-    Compute unit tangent vectors at each point of a 2-D trajectory.
-
-    Uses forward differences with a copy of the last tangent at the final
-    point, then normalises to unit length.
-
-    Args:
-        robot_xy: (T, 2) world-frame XY positions.
-
-    Returns:
-        (T, 2) unit tangent vectors.
-    """
-    T = len(robot_xy)
-    tangents = np.zeros((T, 2), dtype=np.float64)
-    if T == 1:
-        tangents[0] = [1.0, 0.0]
-        return tangents
-    tangents[:-1] = robot_xy[1:] - robot_xy[:-1]
-    tangents[-1]  = tangents[-2]
-    norms = np.linalg.norm(tangents, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-8)
-    return tangents / norms
-
-
-# ---------------------------------------------------------------------------
 # Obstacle generator (data augmentation)
 # ---------------------------------------------------------------------------
 
@@ -342,11 +313,10 @@ class ObstacleGenerator:
         the robot's path.  The path remains clear but obstacles are tightly
         packed.
 
-    ``packed``
-        A small number of large elongated boxes are placed alongside the
-        trajectory, alternating left and right.  Each box's long axis is
-        aligned with the local trajectory direction, creating a tight
-        corridor/hallway feel while requiring very few obstacles.
+    ``compact``
+        Flood-fill the entire sensor area with flush square box obstacles,
+        leaving only a clear corridor along the trajectory.  Every sensor
+        sphere not near the robot path reads as fully occupied.
 
     Design guarantees (all modes)
     ------------------------------
@@ -355,12 +325,12 @@ class ObstacleGenerator:
 
     Usage
     -----
-    >>> gen = ObstacleGenerator(mode='packed', seed=42)
+    >>> gen = ObstacleGenerator(mode='compact', seed=42)
     >>> obstacles = gen.generate_for_window(robot_xy_window)
     >>> occupancy, centers = sensor.compute(robot_pos, yaw, obstacles)
     """
 
-    MODES = {'sparse', 'dense', 'packed', 'compact'}
+    MODES = {'sparse', 'dense', 'compact'}
 
     _MODE_DEFAULTS = {
         'sparse': dict(
@@ -374,12 +344,6 @@ class ObstacleGenerator:
             circle_radius_range=(0.08, 0.30),
             box_halfextent_range=(0.08, 0.25),
             placement_radius=3.5,
-        ),
-        # Packed: a few large elongated boxes lining the trajectory corridor.
-        'packed': dict(
-            n_obstacles_range=(4, 8),
-            box_halfextent_range=(0.25, 0.80),
-            placement_radius=2.5,
         ),
         # Compact: flood-fill the entire sensor area with square box obstacles,
         # leaving only a clear corridor along the trajectory.  Every sensor
@@ -429,13 +393,12 @@ class ObstacleGenerator:
             self._box_half_extent = float(defaults['box_half_extent'])
             self._sensor_buffer   = float(defaults['sensor_buffer'])
             self.placement_radius = self._sensor_buffer  # kept for API consistency
-        else:
+        else:  # sparse / dense
             self.placement_radius = float(placement_radius or defaults['placement_radius'])
             nr = n_obstacles_range or defaults['n_obstacles_range']
             self.n_min, self.n_max = nr
             self.b_min, self.b_max = box_halfextent_range or defaults['box_halfextent_range']
-            if mode in ('sparse', 'dense'):
-                self.r_min, self.r_max = circle_radius_range or defaults['circle_radius_range']
+            self.r_min, self.r_max = circle_radius_range or defaults['circle_radius_range']
 
     # ------------------------------------------------------------------
     # Public API
@@ -465,9 +428,7 @@ class ObstacleGenerator:
             [robot_xy, np.asarray(lookahead_xy, dtype=np.float64)], axis=0
         )
 
-        if self.mode == 'packed':
-            return self._generate_packed(robot_xy, check_xy)
-        elif self.mode == 'compact':
+        if self.mode == 'compact':
             return self._generate_compact(robot_xy, check_xy)
         else:
             return self._generate_random(robot_xy, check_xy)
@@ -504,94 +465,6 @@ class ObstacleGenerator:
                 min_gap = self.robot_safe_radius
 
             if self._is_safe(obs, check_xy, min_gap):
-                return obs
-
-        return None
-
-    # ------------------------------------------------------------------
-    # Large-box packed generation (trajectory-corridor hugging)
-    # ------------------------------------------------------------------
-
-    def _generate_packed(self, robot_xy, check_xy):
-        """
-        Place a small number of large boxes that line the sides of the
-        trajectory corridor.
-
-        Strategy
-        --------
-        1. Compute a unit tangent and inward-normal at each trajectory point.
-        2. Distribute ``n_want * 3`` candidate anchor indices uniformly along
-           the trajectory, alternating left/right sides.
-        3. For each anchor, rejection-sample a box placed just beside the path
-           (perpendicular offset ≥ robot_safe_radius), with the box's long axis
-           roughly aligned with the local trajectory direction.
-        4. Stop once ``n_want`` valid boxes are placed.
-
-        This ensures boxes cluster around the actual path rather than being
-        scattered randomly, creating a natural corridor/hallway feel.
-        """
-        n_want   = int(self._rng.integers(self.n_min, self.n_max + 1))
-        obstacles: List[Obstacle2D] = []
-
-        T        = len(robot_xy)
-        tangents = _trajectory_tangents(robot_xy)          # (T, 2)
-        centroid = robot_xy.mean(axis=0)
-
-        # Try up to n_want*3 candidates spread along the trajectory
-        n_cands    = n_want * 3
-        t_indices  = np.round(np.linspace(0, T - 1, n_cands)).astype(int)
-
-        for i, idx in enumerate(t_indices):
-            if len(obstacles) >= n_want:
-                break
-            side = 1 if i % 2 == 0 else -1          # alternate left / right
-            obs  = self._try_place_alongside(
-                robot_xy, check_xy, tangents, idx, side, centroid
-            )
-            if obs is not None:
-                obstacles.append(obs)
-
-        return obstacles
-
-    def _try_place_alongside(self, robot_xy, check_xy, tangents, anchor_idx,
-                              side, centroid):
-        """
-        Try to place one large box alongside the trajectory at ``anchor_idx``.
-
-        The box centre is offset perpendicular to the local tangent direction
-        by a random distance in [safe_radius + b_min, safe_radius + b_max + 0.3].
-        A small jitter along the tangent direction is also applied so boxes
-        don't always sit exactly abreast of each other.
-        """
-        anchor  = robot_xy[anchor_idx]
-        tangent = tangents[anchor_idx]                           # (2,) unit vec
-        normal  = np.array([-tangent[1], tangent[0]])            # 90° CCW
-
-        for _ in range(self.max_attempts):
-            # Perpendicular offset places box just outside the safe radius
-            perp_dist = self._rng.uniform(
-                self.robot_safe_radius + self.b_min * 0.5,
-                self.robot_safe_radius + self.b_max + 0.3,
-            )
-            # Small along-tangent jitter keeps boxes from stacking exactly
-            tang_jitter = self._rng.uniform(-self.b_max, self.b_max)
-
-            center = anchor + side * normal * perp_dist + tangent * tang_jitter
-
-            # Reject if too far from the trajectory centroid
-            if np.linalg.norm(center - centroid) > self.placement_radius:
-                continue
-
-            # Long axis ≈ trajectory direction, ±45° random rotation
-            yaw_base = np.arctan2(tangent[1], tangent[0])
-            yaw      = yaw_base + self._rng.uniform(-np.pi / 4, np.pi / 4)
-
-            # Elongated box: one axis longer to act as a wall segment
-            h_along = self._rng.uniform(self.b_min, self.b_max)
-            h_perp  = self._rng.uniform(self.b_min * 0.5, self.b_min)
-            obs      = BoxObstacle(center, np.array([h_along, h_perp]), yaw)
-
-            if self._is_safe(obs, check_xy, self.robot_safe_radius):
                 return obs
 
         return None
@@ -670,18 +543,18 @@ class CyclingObstacleGenerator:
     Wraps multiple ObstacleGenerators and cycles through their modes on each
     successive ``generate_for_window`` call.
 
-    This lets training / visualisation see sparse, dense, and packed obstacles
+    This lets training / visualisation see sparse, dense, and compact obstacles
     in a single session without any manual intervention.
 
     Example
     -------
-    >>> gen = CyclingObstacleGenerator(['sparse', 'dense', 'packed'], seed=0)
-    >>> # window 0 → sparse, window 1 → dense, window 2 → packed, window 3 → sparse …
+    >>> gen = CyclingObstacleGenerator(['sparse', 'dense', 'compact'], seed=0)
+    >>> # window 0 → sparse, window 1 → dense, window 2 → compact, window 3 → sparse …
     >>> obstacles = gen.generate_for_window(robot_xy)
 
     Args:
         modes:             List of mode strings (any subset of
-                           ``{'sparse', 'dense', 'packed'}``).
+                           ``{'sparse', 'dense', 'compact'}``).
         robot_safe_radius: Forwarded to every underlying ObstacleGenerator.
         seed:              Optional base seed; each generator gets ``seed + i``.
         **kwargs:          Additional keyword arguments forwarded to every

@@ -490,13 +490,13 @@ def get_args():
     p.add_argument("--robot-safe-radius", type=float, default=0.5,
                    help="Minimum clear gap around robot path in metres (default: 0.5)")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--mode", default="sparse|dense|packed",
+    p.add_argument("--mode", default="sparse|dense|compact",
                    help="Obstacle density mode(s), separated by '|'. "
-                        "Choices: sparse, dense, packed, compact. "
-                        "'compact' flood-fills the sensor area with small circles, "
+                        "Choices: sparse, dense, compact. "
+                        "'compact' flood-fills the sensor area with flush square boxes, "
                         "leaving only the trajectory corridor clear. "
                         "Multiple modes cycle on each obstacle window. "
-                        "Default: 'sparse|dense|packed'")
+                        "Default: 'sparse|dense|compact'")
 
     p.add_argument("--min-start-velocity", type=float, default=0.008,
                    help="Skip initial T-pose frames: first frame whose 5-frame "
@@ -545,7 +545,7 @@ def print_instructions():
 # Main
 # ---------------------------------------------------------------------------
 
-_VALID_MODES = {"sparse", "dense", "packed", "compact"}
+_VALID_MODES = {"sparse", "dense", "compact"}
 
 
 def _parse_modes(raw: str) -> List[str]:
