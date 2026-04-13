@@ -33,11 +33,11 @@ Controls (visualisation mode)
 Usage
 -----
   # Visualise with obstacles
-  python visualize/step2_visualize_data_env.py
+  python visualize/step2_visualize_data_env2d.py
 
   # Create augmented dataset
-  python visualize/step2_visualize_data_env.py --create-dataset
-  python visualize/step2_visualize_data_env.py --create-dataset --output data/pkls/lafan1_g1_env.pkl
+  python visualize/step2_visualize_data_env2d.py --create-dataset
+  python visualize/step2_visualize_data_env2d.py --create-dataset --output data/pkls/lafan1_g1_env2d.pkl
 """
 
 import os
@@ -47,6 +47,7 @@ import time
 import pickle
 
 import numpy as np
+from typing import List, Union
 import mujoco
 import mujoco.viewer
 from tqdm import tqdm
@@ -62,7 +63,7 @@ from visualize.utils.geometry import (
 )
 from utils.environment_sensor import (
     EnvironmentSensor,
-    ObstacleGenerator,
+    make_generator,
     compute_clip_sensor_readings,
     CircleObstacle,
     BoxObstacle,
@@ -88,10 +89,10 @@ class SensorMotionPlayer:
         model,
         data,
         dataset,
-        n_rays: int = 36,
-        max_range: float = 3.0,
+        max_range: float = 2.0,
+        resolution: int = 9,
         obstacle_interval: int = 30,
-        obstacle_mode: str = 'sparse',
+        obstacle_mode: Union[str, List[str]] = 'sparse',
         show_trajectory: bool = True,
         show_sensor: bool = True,
         show_obstacles: bool = True,
@@ -103,11 +104,11 @@ class SensorMotionPlayer:
         self.dataset = dataset
 
         # sensor
-        self.sensor = EnvironmentSensor(n_rays=n_rays, max_range=max_range)
-        self.generator = ObstacleGenerator(mode=obstacle_mode)
+        self.sensor = EnvironmentSensor(max_range=max_range, resolution=resolution)
+        self.generator = make_generator(obstacle_mode)
         self.obstacles = []
-        self.readings = np.zeros(n_rays, dtype=np.float32)
-        self.hit_points = np.zeros((n_rays, 2), dtype=np.float64)
+        self.readings = np.zeros(self.sensor.feature_dim, dtype=np.float32)
+        self.sphere_centers = np.zeros((self.sensor.feature_dim, 2), dtype=np.float64)
 
         self.obstacle_interval = obstacle_interval
         self._last_obstacle_window = -1   # window index that was last generated
@@ -234,7 +235,7 @@ class SensorMotionPlayer:
         # Compute sensor readings
         robot_pos = qpos[:3]
         robot_yaw = quat_wxyz_to_yaw(qpos[3:7])
-        self.readings, self.hit_points = self.sensor.compute(
+        self.readings, self.sphere_centers = self.sensor.compute(
             robot_pos, robot_yaw, self.obstacles
         )
 
@@ -284,11 +285,11 @@ class SensorMotionPlayer:
                 elif isinstance(obs, BoxObstacle):
                     draw_obstacle_box(scene, obs.center, obs.half_extents, obs.yaw, height=0.2)
 
-        # sensor rays + dots
+        # sensor spheres
         if self.show_sensor:
             robot_pos = self.data.qpos[:3]
             draw_sensor_readings(
-                scene, robot_pos, self.readings, self.hit_points,
+                scene, robot_pos, self.readings, self.sphere_centers,
                 z_height=0.08, dot_radius=0.04,
                 draw_lines=self.draw_sensor_lines,
             )
@@ -314,13 +315,13 @@ class SensorMotionPlayer:
         print(f"Obstacles: {'ON' if self.show_obstacles else 'OFF'}")
 
     def print_status(self):
-        n_hits = int(self.readings.sum())
+        n_active = int((self.readings > 0).sum())
         print(
             f"Motion {self.current_motion_idx+1}/{len(self.dataset)} | "
             f"Frame {self.current_frame}/{self.current_motion.num_frames} | "
             f"Style: {self.current_motion.style} | "
             f"{'Playing' if self.playing else 'Paused'} ({self.playback_speed}×) | "
-            f"Sensor hits: {n_hits}/{self.sensor.n_rays} | "
+            f"Sensor active: {n_active}/{self.sensor.feature_dim} | "
             f"Obstacles: {len(self.obstacles)}"
         )
 
@@ -372,58 +373,59 @@ def key_callback(player: SensorMotionPlayer, keycode: int):
 def create_env_dataset(
     source_pkl: str,
     output_pkl: str,
-    n_rays: int = 36,
-    max_range: float = 3.0,
+    max_range: float = 2.0,
+    resolution: int = 9,
     obstacle_interval: int = 30,
     robot_safe_radius: float = 0.5,
     lookahead_frames: int = 30,
     seed: int = 0,
-    mode: str = 'sparse',
+    mode: Union[str, List[str]] = 'sparse',
 ):
     """
-    Build an obstacle-augmented dataset.
+    Build an obstacle-augmented dataset with NSM Cylindrical sensor readings.
 
     Loads ``source_pkl``, generates time-varying obstacles for each clip,
-    computes per-frame binary sensor readings, and writes ``output_pkl`` with
-    a ``sensor_readings`` field added to every motion dict.
+    computes per-frame continuous occupancy readings, and writes ``output_pkl``
+    with a ``sensor_readings`` field added to every motion dict.
 
     The top-level dict gains metadata keys:
-        ``sensor_n_rays``, ``sensor_max_range``, ``obstacle_interval``
+        ``sensor_feature_dim``, ``sensor_resolution``, ``sensor_max_range``,
+        ``sensor_sphere_radius``, ``obstacle_interval``
 
     Args:
         source_pkl:        Path to source motion pkl (e.g. lafan1_g1.pkl).
         output_pkl:        Where to write the augmented pkl.
-        n_rays:            Number of sensor rays.
-        max_range:         Sensor maximum range (m).
+        max_range:         Sensor maximum range in metres (= Size/2 in paper).
+        resolution:        Number of radial rings (paper default: 10).
         obstacle_interval: Frames between obstacle regeneration.
         robot_safe_radius: Minimum gap between obstacle surface and robot (m).
         lookahead_frames:  Future window also checked for collisions.
         seed:              Base RNG seed for reproducibility.
+        mode:              Single mode string or list of modes to cycle through.
     """
     print(f"\nLoading source dataset: {source_pkl}")
     with open(source_pkl, "rb") as f:
         data_dict = pickle.load(f)
 
-    sensor = EnvironmentSensor(n_rays=n_rays, max_range=max_range)
-    generator = ObstacleGenerator(mode=mode, robot_safe_radius=robot_safe_radius, seed=seed)
+    sensor    = EnvironmentSensor(max_range=max_range, resolution=resolution)
+    generator = make_generator(mode, robot_safe_radius=robot_safe_radius, seed=seed)
 
     motions = data_dict["motions"]
     print(f"Processing {len(motions)} motion clips …")
+    print(f"  Sensor: max_range={max_range}m, resolution={resolution}, "
+          f"coverage={sensor._coverage:.4f}m, sphere_r={sensor.sphere_radius:.4f}m, "
+          f"feature_dim={sensor.feature_dim}")
 
     for clip_idx, motion in enumerate(tqdm(motions)):
-        # Build full qpos array for this clip
         local_rot = motion["local_joint_rotations"]   # (T, 30, 4)
         root_pos  = motion["global_root_positions"]   # (T, 3)
-        T = root_pos.shape[0]
 
-        # qpos[t] = [xyz(3), wxyz(4), joint_angles(29)]
         all_qpos = np.concatenate([
             root_pos,
-            local_rot[:, 0, :],        # root quaternion wxyz
-            local_rot[:, 1:, 0],       # 29 joint angles
+            local_rot[:, 0, :],
+            local_rot[:, 1:, 0],
         ], axis=1).astype(np.float64)  # (T, 36)
 
-        # Seed per clip for reproducibility
         generator.seed(seed * 10_000 + clip_idx)
 
         readings, _ = compute_clip_sensor_readings(
@@ -433,26 +435,28 @@ def create_env_dataset(
             obstacle_interval=obstacle_interval,
             lookahead_frames=lookahead_frames,
         )
-        motion["sensor_readings"] = readings.astype(np.float32)  # (T, n_rays)
+        motion["sensor_readings"] = readings.astype(np.float32)  # (T, feature_dim)
 
     # Store metadata at top level
-    data_dict["sensor_n_rays"] = n_rays
-    data_dict["sensor_max_range"] = max_range
-    data_dict["obstacle_interval"] = obstacle_interval
-    data_dict["obstacle_mode"] = mode
+    data_dict["sensor_feature_dim"]  = sensor.feature_dim
+    data_dict["sensor_resolution"]   = resolution
+    data_dict["sensor_max_range"]    = max_range
+    data_dict["sensor_sphere_radius"] = sensor.sphere_radius
+    data_dict["obstacle_interval"]   = obstacle_interval
+    data_dict["obstacle_mode"]       = mode
 
     os.makedirs(os.path.dirname(output_pkl) or ".", exist_ok=True)
     with open(output_pkl, "wb") as f:
         pickle.dump(data_dict, f)
 
-    # Summary
-    total_frames = sum(len(m["sensor_readings"]) for m in motions)
-    hit_frames = sum(int((m["sensor_readings"].sum(axis=1) > 0).sum()) for m in motions)
+    total_frames  = sum(len(m["sensor_readings"]) for m in motions)
+    active_frames = sum(int((m["sensor_readings"].max(axis=1) > 0).sum()) for m in motions)
     print(f"\nSaved augmented dataset → {output_pkl}")
-    print(f"  Clips:              {len(motions)}")
-    print(f"  Total frames:       {total_frames}")
-    print(f"  Frames with ≥1 hit: {hit_frames} ({100*hit_frames/total_frames:.1f} %)")
-    print(f"  Sensor:             {n_rays} rays, {max_range} m range")
+    print(f"  Clips:                 {len(motions)}")
+    print(f"  Total frames:          {total_frames}")
+    print(f"  Frames with occupancy: {active_frames} ({100*active_frames/total_frames:.1f} %)")
+    print(f"  Sensor: max_range={max_range}m, resolution={resolution} "
+          f"→ {sensor.feature_dim} spheres")
 
 
 # ---------------------------------------------------------------------------
@@ -466,17 +470,22 @@ def get_args():
     # general
     p.add_argument("--dataset",  default="lafan1_g1",
                    help="Source dataset name (default: lafan1_g1)")
-    p.add_argument("--n-rays",   type=int,   default=36)
-    p.add_argument("--max-range",type=float, default=3.0,
-                   help="Sensor max range in metres (default: 3.0)")
+    p.add_argument("--resolution", type=int, default=9,
+                   help="Number of radial rings (paper: 9)")
+    p.add_argument("--max-range", type=float, default=2.0,
+                   help="Sensor max range in metres = Size/2 (paper: Size=4 → 2.0m)")
     p.add_argument("--obstacle-interval", type=int, default=30,
                    help="Frames between obstacle regeneration (default: 30 = 1 s)")
     p.add_argument("--robot-safe-radius", type=float, default=0.5,
                    help="Minimum clear gap around robot path in metres (default: 0.5)")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--mode", default="sparse",
-                   choices=["sparse", "dense", "packed"],
-                   help="Obstacle density mode (default: sparse)")
+    p.add_argument("--mode", default="sparse|dense|packed",
+                   help="Obstacle density mode(s), separated by '|'. "
+                        "Choices: sparse, dense, packed, compact. "
+                        "'compact' flood-fills the sensor area with small circles, "
+                        "leaving only the trajectory corridor clear. "
+                        "Multiple modes cycle on each obstacle window. "
+                        "Default: 'sparse|dense|packed'")
 
     # visualisation-only
     p.add_argument("--motion",   type=int, default=0)
@@ -519,8 +528,23 @@ def print_instructions():
 # Main
 # ---------------------------------------------------------------------------
 
+_VALID_MODES = {"sparse", "dense", "packed", "compact"}
+
+
+def _parse_modes(raw: str) -> List[str]:
+    """Parse a '|'-delimited mode string and validate each token."""
+    modes = [m.strip() for m in raw.split("|") if m.strip()]
+    invalid = [m for m in modes if m not in _VALID_MODES]
+    if invalid:
+        raise ValueError(f"Unknown mode(s): {invalid}. Valid: {sorted(_VALID_MODES)}")
+    return modes
+
+
 def main():
     args = get_args()
+
+    # Parse '|'-delimited mode string → list
+    modes = _parse_modes(args.mode)
 
     dataset_path = f"data/pkls/{args.dataset}.pkl"
 
@@ -528,20 +552,21 @@ def main():
     #  Dataset creation mode                                              #
     # ------------------------------------------------------------------ #
     if args.create_dataset:
-        output = args.output or f"data/pkls/{args.dataset}_env_{args.mode}.pkl"
+        mode_tag = args.mode.replace("|", "_")
+        output = args.output or f"data/pkls/{args.dataset}_env2d_{mode_tag}.pkl"
         if not os.path.exists(dataset_path):
             print(f"Source dataset not found: {dataset_path}")
             return
         create_env_dataset(
             source_pkl=dataset_path,
             output_pkl=output,
-            n_rays=args.n_rays,
             max_range=args.max_range,
+            resolution=args.resolution,
             obstacle_interval=args.obstacle_interval,
             robot_safe_radius=args.robot_safe_radius,
             lookahead_frames=args.lookahead_frames,
             seed=args.seed,
-            mode=args.mode,
+            mode=modes,
         )
         return
 
@@ -565,17 +590,22 @@ def main():
     dataset = MotionDataset(dataset_path)
     dataset.print_summary()
 
-    print(f"\nEnvironment Sensor: {args.n_rays} rays, {args.max_range} m range")
+    tmp_sensor = EnvironmentSensor(max_range=args.max_range, resolution=args.resolution)
+    mode_str = " | ".join(modes)
+    print(f"\nNSM Cylindrical Sensor: max_range={args.max_range}m  resolution={args.resolution}  "
+          f"coverage={tmp_sensor._coverage:.4f}m  sphere_r={tmp_sensor.sphere_radius:.4f}m  "
+          f"→ {tmp_sensor.feature_dim} spheres")
+    print(f"Obstacle mode:      {mode_str}{' (cycling)' if len(modes) > 1 else ''}")
     print(f"Obstacle interval:  {args.obstacle_interval} frames  "
           f"({args.obstacle_interval/30:.1f} s)")
     print(f"Robot safe radius:  {args.robot_safe_radius} m\n")
 
     player = SensorMotionPlayer(
         model, mj_data, dataset,
-        n_rays=args.n_rays,
         max_range=args.max_range,
+        resolution=args.resolution,
         obstacle_interval=args.obstacle_interval,
-        obstacle_mode=args.mode,
+        obstacle_mode=modes,
         show_trajectory=not args.no_trajectory,
         show_sensor=not args.no_sensor,
         show_obstacles=not args.no_obstacles,

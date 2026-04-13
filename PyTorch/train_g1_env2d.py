@@ -2,17 +2,17 @@
 Train G1 Humanoid Motion Diffusion with Environment-Sensor Conditioning
 ------------------------------------------------------------------------
 Identical to train_g1.py but uses:
-  * HumanoidEnvMotionDataset  (network/dataset_g1_env.py)
-  * MotionDiffusionEnv        (network/models_env.py)
+  * HumanoidEnvMotionDataset  (network/dataset_g1_env2d.py)
+  * MotionDiffusionEnv        (network/models_env2d.py)
 
 The training dataset must have been created with:
-    python visualize/step2_visualize_data_env.py --create-dataset [--mode sparse|dense|packed]
+    python visualize/step2_visualize_data_env2d.py --create-dataset [--mode sparse|dense|packed]
 
 Usage
 -----
-    python train_g1_env.py -n my_env_run \\
+    python train_g1_env2d.py -n my_env2d_run \\
         -c config/default_g1_env.json \\
-        -i data/pkls/lafan1_g1_env_sparse.pkl
+        -i data/pkls/lafan1_g1_env2d_sparse.pkl
 """
 
 import os
@@ -26,9 +26,9 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from utils.logger import Logger
-from network.models_env import MotionDiffusionEnv
+from network.models_env2d import MotionDiffusionEnv
 from network.training import HumanoidTrainingPortal
-from network.dataset_g1_env import HumanoidEnvMotionDataset
+from network.dataset_g1_env2d import HumanoidEnvMotionDataset
 
 from diffusion.create_diffusion import create_gaussian_diffusion
 from config.option import add_model_args, add_train_args, add_diffusion_args, config_parse
@@ -65,7 +65,7 @@ def train(config, resume, logger, tb_writer):
     diffusion = create_gaussian_diffusion(config)
 
     # Sensor dimension from config (default 36)
-    sensor_dim = getattr(config.arch, "sensor_dim", train_data.sensor_n_rays)
+    sensor_dim = getattr(config.arch, "sensor_dim", train_data.sensor_feature_dim)
 
     input_feats = (train_data.joint_num + 1) * train_data.per_rot_feat
 

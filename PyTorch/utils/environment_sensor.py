@@ -1,20 +1,44 @@
 """
-Environment Sensor for 2D Obstacle Avoidance
----------------------------------------------
-Implements a spherical (2D circular) scan-dot sensor inspired by
-Neural State Machine's sensing approach.
+NSM Cylindrical Environment Sensor
+------------------------------------
+Implements the exact cylindrical sensor from the Neural State Machine paper
+(Starke et al., SIGGRAPH Asia 2019).  Sampling spheres are placed on a
+cylindrical-polar grid centred at the robot's root and each sphere returns a
+**continuous** occupancy value in [0, 1].
 
-Each sensor ray is cast in the robot's local frame (yaw-aligned),
-uniformly distributed around 360 degrees. Returns binary 0/1 occupancy
-per ray.
+Sensor Topology (2D mode, Layers = 1)
+--------------------------------------
+    Resolution : number of radial rings  (paper default: 10)
+    max_range  : outermost ring radius   (paper: Size/2)
+    Layers     : height layers (1 = 2D, 10 = 3D as in the paper)
+    Overlap    : True = overlapping spheres (recommended)
 
-Usage:
-    sensor = EnvironmentSensor(n_rays=36, max_range=3.0)
-    readings, hit_points = sensor.compute(robot_pos, robot_yaw, obstacles)
+    Derived quantities
+    ------------------
+    coverage   = 0.5 * (2*max_range) / (Resolution - 1)    [ring spacing]
+    Ring z has radius  = z * coverage,  z = 0 … Resolution-1
+    Ring z has count   = round(2π * z)  spheres             (0 at z=0)
+    sphere_radius      = 0.5 * √2 * coverage  (Overlap=True)
+                       = 0.5   * coverage      (Overlap=False)
+
+    Example (max_range=3.0, Resolution=10):
+        coverage  = 0.333 m
+        feature_dim = 283 spheres per layer  (6+13+19+25+31+38+44+50+57)
+
+Continuous Occupancy Formula
+-----------------------------
+    s = max(0, min(1, 1 - d / sphere_radius))
+
+    d : min distance from sphere centre to the nearest obstacle surface
+
+Usage
+-----
+    sensor = EnvironmentSensor(max_range=3.0, resolution=10)
+    occupancy, centers = sensor.compute(robot_pos, robot_yaw, obstacles)
 """
 
 import numpy as np
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 
 # ---------------------------------------------------------------------------
@@ -44,29 +68,23 @@ def quat_wxyz_to_yaw(quat_wxyz: np.ndarray) -> float:
 # ---------------------------------------------------------------------------
 
 class Obstacle2D:
-    """Abstract 2D obstacle for ray-casting intersection tests."""
-
-    def intersect_ray(
-        self,
-        origin: np.ndarray,
-        direction: np.ndarray,
-        max_dist: float,
-    ) -> Tuple[bool, float]:
-        """
-        Test whether a ray hits this obstacle.
-
-        Args:
-            origin:    (2,) world-frame ray origin [x, y]
-            direction: (2,) unit ray direction [dx, dy]  (must be normalised)
-            max_dist:  maximum ray distance to test
-
-        Returns:
-            (hit, distance)  –  distance is np.inf when there is no hit.
-        """
-        raise NotImplementedError
+    """Abstract 2D obstacle."""
 
     def min_distance_to_point(self, point: np.ndarray) -> float:
-        """Minimum distance from the obstacle surface to a 2-D point."""
+        """Minimum distance from the obstacle surface to a single 2-D point.
+        Returns 0 when the point is inside the obstacle."""
+        raise NotImplementedError
+
+    def batch_min_distance(self, points: np.ndarray) -> np.ndarray:
+        """
+        Vectorised minimum distances from the obstacle surface to N points.
+
+        Args:
+            points: (N, 2) array of query points.
+
+        Returns:
+            (N,) float64 array of distances (0 when inside).
+        """
         raise NotImplementedError
 
 
@@ -82,31 +100,17 @@ class CircleObstacle(Obstacle2D):
         self.center = np.asarray(center, dtype=np.float64)
         self.radius = float(radius)
 
-    def intersect_ray(self, origin, direction, max_dist):
-        origin = np.asarray(origin, dtype=np.float64)
-        direction = np.asarray(direction, dtype=np.float64)
-        oc = origin - self.center
-        # Quadratic: t^2 + 2*b*t + c = 0  (a == 1 because direction is unit)
-        b = float(np.dot(oc, direction))
-        c = float(np.dot(oc, oc)) - self.radius ** 2
-        disc = b * b - c
-        if disc < 0.0:
-            return False, np.inf
-        sqrtd = np.sqrt(disc)
-        t = -b - sqrtd          # smaller root first
-        if 0.0 < t <= max_dist:
-            return True, float(t)
-        t = -b + sqrtd
-        if 0.0 < t <= max_dist:
-            return True, float(t)
-        return False, np.inf
-
     def min_distance_to_point(self, point):
         return max(
             0.0,
             float(np.linalg.norm(np.asarray(point, dtype=np.float64) - self.center))
             - self.radius,
         )
+
+    def batch_min_distance(self, points: np.ndarray) -> np.ndarray:
+        # (N,) = ||points - center|| - radius, clipped to 0
+        dists = np.linalg.norm(points - self.center, axis=1) - self.radius
+        return np.maximum(dists, 0.0)
 
 
 class BoxObstacle(Obstacle2D):
@@ -128,7 +132,6 @@ class BoxObstacle(Obstacle2D):
         self.half_extents = np.asarray(half_extents, dtype=np.float64)
         self.yaw = float(yaw)
         c, s = np.cos(yaw), np.sin(yaw)
-        # Inverse rotation: world → local  (= R^T)
         self._R_inv = np.array([[c, s], [-s, c]], dtype=np.float64)
 
     def _to_local(self, v: np.ndarray, is_point: bool = True) -> np.ndarray:
@@ -137,71 +140,104 @@ class BoxObstacle(Obstacle2D):
             return self._R_inv @ (v - self.center)
         return self._R_inv @ v
 
-    def intersect_ray(self, origin, direction, max_dist):
-        o = self._to_local(origin, is_point=True)
-        d = self._to_local(direction, is_point=False)
-
-        tmin, tmax = -np.inf, np.inf
-        for i in range(2):
-            if abs(d[i]) < 1e-10:
-                if abs(o[i]) > self.half_extents[i]:
-                    return False, np.inf
-            else:
-                t1 = (-self.half_extents[i] - o[i]) / d[i]
-                t2 = (self.half_extents[i] - o[i]) / d[i]
-                tmin = max(tmin, min(t1, t2))
-                tmax = min(tmax, max(t1, t2))
-
-        if tmin > tmax or tmax < 0.0:
-            return False, np.inf
-        t = tmin if tmin >= 0.0 else tmax
-        if t > max_dist:
-            return False, np.inf
-        return True, float(t)
-
     def min_distance_to_point(self, point):
         p = self._to_local(point, is_point=True)
         dx = max(abs(p[0]) - self.half_extents[0], 0.0)
         dy = max(abs(p[1]) - self.half_extents[1], 0.0)
         return float(np.sqrt(dx * dx + dy * dy))
 
+    def batch_min_distance(self, points: np.ndarray) -> np.ndarray:
+        # Rotate all points into the box's local frame at once: (N, 2)
+        local = (points - self.center) @ self._R_inv.T
+        # Per-axis excess beyond half-extents, clamped to 0
+        d = np.maximum(np.abs(local) - self.half_extents, 0.0)  # (N, 2)
+        return np.sqrt((d * d).sum(axis=1))                      # (N,)
+
 
 # ---------------------------------------------------------------------------
-# Environment Sensor
+# NSM Polar Environment Sensor
 # ---------------------------------------------------------------------------
 
 class EnvironmentSensor:
     """
-    2-D circular scan-dot environment sensor.
+    NSM Cylindrical Environment Sensor (Starke et al., SIGGRAPH Asia 2019).
 
-    N rays are distributed uniformly around the robot in the horizontal (XY)
-    plane.  Ray 0 points along the robot's local +X axis (forward); rays
-    proceed counter-clockwise.
+    Replicates CylinderMap.cs exactly.  Sampling spheres are placed on a
+    cylindrical-polar grid where each ring z has ``round(2π*z)`` spheres
+    (outer rings are denser), and the sphere radius is derived from the grid
+    spacing so spheres always overlap their neighbours.
 
-    Binary readings (0 = free, 1 = occupied) are returned together with the
-    world-space 2-D hit-points (or the max-range endpoints when free).
+    Parameters
+    ----------
+    max_range  : outermost sensing radius in metres  (= Size/2 in the paper)
+    resolution : number of radial rings              (paper default: 10)
+    layers     : height layers (1 = 2D flat sensor)  (paper default: 10 for 3D)
+    overlap    : True = sphere_radius = √2/2 * coverage  (recommended)
+                 False = sphere_radius = 0.5   * coverage  (no overlap)
+
+    Derived
+    -------
+    coverage      = max_range / (resolution - 1)
+    sphere_radius = 0.5 * √2 * coverage  (Overlap=True)
+    ring_slices   : list of (start, end) index ranges, one per ring z
 
     Example
     -------
-    >>> sensor = EnvironmentSensor(n_rays=36, max_range=3.0)
-    >>> readings, hit_pts = sensor.compute(qpos[:3], quat_wxyz_to_yaw(qpos[3:7]), obstacles)
+    >>> sensor = EnvironmentSensor(max_range=3.0, resolution=10)
+    >>> occupancy, centers = sensor.compute(qpos[:3], quat_wxyz_to_yaw(qpos[3:7]), obstacles)
+    >>> occupancy.shape   # (283,)  for resolution=10
     """
 
-    def __init__(self, n_rays: int = 36, max_range: float = 3.0):
+    def __init__(
+        self,
+        max_range: float = 2.0,
+        resolution: int = 9,
+        layers: int = 1,
+        overlap: bool = True,
+    ):
         """
         Args:
-            n_rays:    Number of scan rays (evenly spaced in 360°).
-            max_range: Maximum sensing distance in metres.
+            max_range:  Outermost ring radius in metres (= Size/2 in paper).
+                        Paper uses Size=4 → max_range=2.0m.
+            resolution: Number of radial rings (= paper's Resolution).
+                        Paper default: 9.
+            layers:     Height layers (1 for 2D, 9 for full 3D as in paper).
+            overlap:    Whether spheres overlap their neighbours.
         """
-        self.n_rays = int(n_rays)
-        self.max_range = float(max_range)
+        self.max_range  = float(max_range)
+        self.resolution = int(resolution)
+        self.layers     = int(layers)
+        self.overlap    = bool(overlap)
 
-        angles = np.linspace(0.0, 2.0 * np.pi, n_rays, endpoint=False)
-        # Local frame directions (robot forward = local +X)
-        self.ray_dirs_local = np.stack(
-            [np.cos(angles), np.sin(angles)], axis=1
-        ).astype(np.float64)   # (n_rays, 2)
-        self.ray_angles_local = angles  # (n_rays,) – useful for visualisation
+        # Paper's CylinderMap.cs:
+        #   diameter = Size / (Resolution - 1)   where Size = 2 * max_range
+        #   coverage = 0.5 * diameter             (half sphere-diameter step)
+        size     = 2.0 * self.max_range
+        diameter = size / max(self.resolution - 1, 1)
+        coverage = 0.5 * diameter
+        self._coverage = coverage
+
+        # Sphere radius derived from coverage (not an independent parameter)
+        r_scale = np.sqrt(2.0) if overlap else 1.0
+        self.sphere_radius = 0.5 * r_scale * coverage
+
+        # Build 2D polar grid: ring z has round(2π*z) spheres at radius z*coverage
+        points: List[Tuple[float, float]] = []
+        ring_slices: List[Tuple[int, int]] = []
+
+        for z in range(self.resolution):
+            distance = z * coverage
+            arc      = 2.0 * np.pi * distance
+            count    = int(round(arc / coverage)) if z > 0 else 0
+
+            start = len(points)
+            for x in range(count):
+                angle = x / count * 2.0 * np.pi
+                points.append((distance * np.cos(angle), distance * np.sin(angle)))
+            ring_slices.append((start, len(points)))
+
+        self._centers_local = np.array(points, dtype=np.float64)  # (N, 2)
+        self.ring_slices    = ring_slices   # per-ring index ranges in _centers_local
 
     # ------------------------------------------------------------------
     # Core API
@@ -214,48 +250,77 @@ class EnvironmentSensor:
         obstacles: List[Obstacle2D],
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute sensor readings at the robot's current pose.
+        Compute continuous occupancy for every sphere at the robot's current pose.
 
         Args:
             robot_pos:  (2,) or (3,) world-frame robot position.
-            robot_yaw:  Heading angle in radians (Z-up, CCW from world +X).
+            robot_yaw:  Heading in radians (Z-up, CCW from world +X).
             obstacles:  List of Obstacle2D objects in the world.
 
         Returns:
-            readings:   (n_rays,) float32 – 0.0 = free, 1.0 = occupied.
-            hit_points: (n_rays, 2) world XY of each ray's endpoint
-                        (actual hit position, or max-range point if free).
+            occupancy:      (feature_dim,) float32 values in [0, 1].
+                            0 = clear, 1 = fully inside an obstacle.
+            sphere_centers: (feature_dim, 2) world XY of each sphere centre.
         """
         pos_2d = np.asarray(robot_pos[:2], dtype=np.float64)
-        ray_dirs = self._world_ray_dirs(robot_yaw)  # (n_rays, 2)
 
-        distances = np.full(self.n_rays, self.max_range, dtype=np.float64)
-        readings = np.zeros(self.n_rays, dtype=np.float32)
+        # Rotate local sphere centres into the world frame
+        c, s = np.cos(robot_yaw), np.sin(robot_yaw)
+        R_mat = np.array([[c, -s], [s, c]], dtype=np.float64)
+        centers_world = pos_2d + (R_mat @ self._centers_local.T).T  # (N, 2)
+
+        # Compute min distance from each sphere centre to any obstacle surface.
+        # batch_min_distance processes all N centres in one vectorised call,
+        # replacing the previous Python-level loop over centres.
+        n = len(centers_world)
+        min_dists = np.full(n, np.inf, dtype=np.float64)
 
         for obs in obstacles:
-            for i, ray_dir in enumerate(ray_dirs):
-                hit, dist = obs.intersect_ray(pos_2d, ray_dir, distances[i])
-                if hit:
-                    readings[i] = 1.0
-                    distances[i] = min(distances[i], dist)
+            np.minimum(min_dists, obs.batch_min_distance(centers_world), out=min_dists)
 
-        hit_points = pos_2d[np.newaxis, :] + ray_dirs * distances[:, np.newaxis]
-        return readings, hit_points   # (n_rays,), (n_rays, 2)
+        # Continuous occupancy: s = clamp(1 - d/r, 0, 1)
+        r = self.sphere_radius
+        occupancy = np.clip(1.0 - min_dists / r, 0.0, 1.0).astype(np.float32)
+
+        return occupancy, centers_world
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _world_ray_dirs(self, robot_yaw: float) -> np.ndarray:
-        """Transform local ray directions to world frame."""
-        c, s = np.cos(robot_yaw), np.sin(robot_yaw)
-        R = np.array([[c, -s], [s, c]], dtype=np.float64)  # local → world
-        return (R @ self.ray_dirs_local.T).T  # (n_rays, 2)
-
     @property
     def feature_dim(self) -> int:
-        """Sensor output dimensionality (= n_rays)."""
-        return self.n_rays
+        """Total sensor output dimension = number of spheres per height layer."""
+        return len(self._centers_local)
+
+
+# ---------------------------------------------------------------------------
+# Trajectory geometry helpers
+# ---------------------------------------------------------------------------
+
+def _trajectory_tangents(robot_xy: np.ndarray) -> np.ndarray:
+    """
+    Compute unit tangent vectors at each point of a 2-D trajectory.
+
+    Uses forward differences with a copy of the last tangent at the final
+    point, then normalises to unit length.
+
+    Args:
+        robot_xy: (T, 2) world-frame XY positions.
+
+    Returns:
+        (T, 2) unit tangent vectors.
+    """
+    T = len(robot_xy)
+    tangents = np.zeros((T, 2), dtype=np.float64)
+    if T == 1:
+        tangents[0] = [1.0, 0.0]
+        return tangents
+    tangents[:-1] = robot_xy[1:] - robot_xy[:-1]
+    tangents[-1]  = tangents[-2]
+    norms = np.linalg.norm(tangents, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-8)
+    return tangents / norms
 
 
 # ---------------------------------------------------------------------------
@@ -278,10 +343,10 @@ class ObstacleGenerator:
         packed.
 
     ``packed``
-        Grid-based filling: obstacles are placed on a regular grid across the
-        entire sensing area.  Every grid cell that does NOT overlap with the
-        robot's safe corridor gets an obstacle, producing a tight "hallway"
-        effect.
+        A small number of large elongated boxes are placed alongside the
+        trajectory, alternating left and right.  Each box's long axis is
+        aligned with the local trajectory direction, creating a tight
+        corridor/hallway feel while requiring very few obstacles.
 
     Design guarantees (all modes)
     ------------------------------
@@ -292,29 +357,47 @@ class ObstacleGenerator:
     -----
     >>> gen = ObstacleGenerator(mode='packed', seed=42)
     >>> obstacles = gen.generate_for_window(robot_xy_window)
-    >>> readings, hit_pts = sensor.compute(robot_pos, yaw, obstacles)
+    >>> occupancy, centers = sensor.compute(robot_pos, yaw, obstacles)
     """
 
-    MODES = {'sparse', 'dense', 'packed'}
+    MODES = {'sparse', 'dense', 'packed', 'compact'}
 
-    # ---- Per-mode defaults -------------------------------------------------
     _MODE_DEFAULTS = {
         'sparse': dict(
             n_obstacles_range=(3, 8),
-            circle_radius_range=(0.15, 0.55),
-            box_halfextent_range=(0.12, 0.45),
-            placement_radius=4.5,
+            circle_radius_range=(0.10, 0.40),
+            box_halfextent_range=(0.08, 0.35),
+            placement_radius=3.0,
         ),
         'dense': dict(
             n_obstacles_range=(12, 25),
-            circle_radius_range=(0.12, 0.40),
-            box_halfextent_range=(0.10, 0.35),
-            placement_radius=5.0,
+            circle_radius_range=(0.08, 0.30),
+            box_halfextent_range=(0.08, 0.25),
+            placement_radius=3.5,
         ),
+        # Packed: a few large elongated boxes lining the trajectory corridor.
         'packed': dict(
-            grid_spacing=0.70,       # distance between grid-cell centres (m)
-            obs_half_extent=0.28,    # half-extent of each box in the grid (m)
-            fill_radius=6.0,         # grid extends this far from trajectory centroid
+            n_obstacles_range=(4, 8),
+            box_halfextent_range=(0.25, 0.80),
+            placement_radius=2.5,
+        ),
+        # Compact: flood-fill the entire sensor area with square box obstacles,
+        # leaving only a clear corridor along the trajectory.  Every sensor
+        # sphere that is not near the robot path will read as fully occupied.
+        #
+        # Coverage guarantee (box version):
+        #   coverage_zone = h + sphere_radius = 0.255 + 0.177 = 0.432 m
+        #   max grid gap   = spacing * √2 / 2 = 0.50 * 0.707 = 0.354 m
+        #   0.354 < 0.432  →  every non-corridor sphere is covered ✓
+        #   h = spacing/2 + ε → boxes are flush (no visible gaps between them)
+        #
+        # Grid bounds are computed from the trajectory AABB + sensor_buffer so
+        # that the full 2.0 m sensor range is filled for every frame, even when
+        # the robot travels far from the window centroid.
+        'compact': dict(
+            grid_spacing=0.50,      # distance between box centres (m)
+            box_half_extent=0.255,  # square half-size (m); slightly > spacing/2 → boxes flush
+            sensor_buffer=2.2,      # grid extends this many metres beyond traj AABB
         ),
     }
 
@@ -325,30 +408,11 @@ class ObstacleGenerator:
         max_attempts: int = 40,
         circle_prob: float = 0.5,
         seed: Optional[int] = None,
-        # Override per-mode defaults (optional)
         n_obstacles_range: Optional[Tuple[int, int]] = None,
         circle_radius_range: Optional[Tuple[float, float]] = None,
         box_halfextent_range: Optional[Tuple[float, float]] = None,
         placement_radius: Optional[float] = None,
-        grid_spacing: Optional[float] = None,
-        obs_half_extent: Optional[float] = None,
-        fill_radius: Optional[float] = None,
     ):
-        """
-        Args:
-            mode:              Obstacle density mode: ``'sparse'``, ``'dense'``, or
-                               ``'packed'``.
-            robot_safe_radius: Minimum clearance between any obstacle and any
-                               robot position in the trajectory window (m).
-            max_attempts:      Rejection-sampling retries per obstacle (sparse/dense).
-            circle_prob:       Probability of placing a circle rather than a box
-                               (sparse/dense modes only).
-            seed:              Optional RNG seed for reproducibility.
-            n_obstacles_range, circle_radius_range, box_halfextent_range,
-            placement_radius:  Overrides for sparse/dense mode parameters.
-            grid_spacing, obs_half_extent, fill_radius:
-                               Overrides for packed mode parameters.
-        """
         if mode not in self.MODES:
             raise ValueError(f"mode must be one of {self.MODES}, got '{mode}'")
 
@@ -358,19 +422,20 @@ class ObstacleGenerator:
         self.circle_prob = float(circle_prob)
         self._rng = np.random.default_rng(seed)
 
-        # Merge mode defaults with caller overrides
         defaults = dict(self._MODE_DEFAULTS[mode])
 
-        if mode in ('sparse', 'dense'):
+        if mode == 'compact':
+            self._grid_spacing    = float(defaults['grid_spacing'])
+            self._box_half_extent = float(defaults['box_half_extent'])
+            self._sensor_buffer   = float(defaults['sensor_buffer'])
+            self.placement_radius = self._sensor_buffer  # kept for API consistency
+        else:
+            self.placement_radius = float(placement_radius or defaults['placement_radius'])
             nr = n_obstacles_range or defaults['n_obstacles_range']
             self.n_min, self.n_max = nr
-            self.r_min, self.r_max = circle_radius_range or defaults['circle_radius_range']
             self.b_min, self.b_max = box_halfextent_range or defaults['box_halfextent_range']
-            self.placement_radius  = float(placement_radius or defaults['placement_radius'])
-        else:  # packed
-            self.grid_spacing    = float(grid_spacing    or defaults['grid_spacing'])
-            self.obs_half_extent = float(obs_half_extent or defaults['obs_half_extent'])
-            self.fill_radius     = float(fill_radius     or defaults['fill_radius'])
+            if mode in ('sparse', 'dense'):
+                self.r_min, self.r_max = circle_radius_range or defaults['circle_radius_range']
 
     # ------------------------------------------------------------------
     # Public API
@@ -402,6 +467,8 @@ class ObstacleGenerator:
 
         if self.mode == 'packed':
             return self._generate_packed(robot_xy, check_xy)
+        elif self.mode == 'compact':
+            return self._generate_compact(robot_xy, check_xy)
         else:
             return self._generate_random(robot_xy, check_xy)
 
@@ -409,11 +476,7 @@ class ObstacleGenerator:
     # Random placement (sparse / dense)
     # ------------------------------------------------------------------
 
-    def _generate_random(
-        self,
-        robot_xy: np.ndarray,
-        check_xy: np.ndarray,
-    ) -> List[Obstacle2D]:
+    def _generate_random(self, robot_xy, check_xy):
         centroid = robot_xy.mean(axis=0)
         n_want = int(self._rng.integers(self.n_min, self.n_max + 1))
         obstacles: List[Obstacle2D] = []
@@ -423,12 +486,7 @@ class ObstacleGenerator:
                 obstacles.append(obs)
         return obstacles
 
-    def _try_place_random(
-        self,
-        centroid: np.ndarray,
-        check_xy: np.ndarray,
-    ) -> Optional[Obstacle2D]:
-        """Rejection-sample one obstacle that does not collide with check_xy."""
+    def _try_place_random(self, centroid, check_xy):
         for _ in range(self.max_attempts):
             r     = self._rng.uniform(self.robot_safe_radius * 1.2, self.placement_radius)
             angle = self._rng.uniform(0.0, 2.0 * np.pi)
@@ -451,60 +509,258 @@ class ObstacleGenerator:
         return None
 
     # ------------------------------------------------------------------
-    # Grid-based packed generation
+    # Large-box packed generation (trajectory-corridor hugging)
     # ------------------------------------------------------------------
 
-    def _generate_packed(
-        self,
-        robot_xy: np.ndarray,
-        check_xy: np.ndarray,
-    ) -> List[Obstacle2D]:
+    def _generate_packed(self, robot_xy, check_xy):
         """
-        Fill a grid with box obstacles, leaving the robot's corridor clear.
+        Place a small number of large boxes that line the sides of the
+        trajectory corridor.
 
-        A regular grid is created centred at the trajectory centroid.  Every
-        cell whose centre is outside the ``robot_safe_radius + obs_half_extent``
-        exclusion zone around every trajectory point gets an obstacle.
+        Strategy
+        --------
+        1. Compute a unit tangent and inward-normal at each trajectory point.
+        2. Distribute ``n_want * 3`` candidate anchor indices uniformly along
+           the trajectory, alternating left/right sides.
+        3. For each anchor, rejection-sample a box placed just beside the path
+           (perpendicular offset ≥ robot_safe_radius), with the box's long axis
+           roughly aligned with the local trajectory direction.
+        4. Stop once ``n_want`` valid boxes are placed.
+
+        This ensures boxes cluster around the actual path rather than being
+        scattered randomly, creating a natural corridor/hallway feel.
         """
-        centroid = robot_xy.mean(axis=0)
-        step     = self.grid_spacing
-        R        = self.fill_radius
-        hx = hy  = self.obs_half_extent
-        min_gap  = self.robot_safe_radius  # uses BoxObstacle.min_distance_to_point
-
-        xs = np.arange(-R, R + step * 0.5, step)
-        ys = np.arange(-R, R + step * 0.5, step)
-
+        n_want   = int(self._rng.integers(self.n_min, self.n_max + 1))
         obstacles: List[Obstacle2D] = []
-        for dx in xs:
-            for dy in ys:
-                center = centroid + np.array([dx, dy])
-                # Add small random jitter so the grid doesn't look perfectly regular
-                jitter = self._rng.uniform(-step * 0.15, step * 0.15, size=2)
-                center = center + jitter
 
-                obs = BoxObstacle(center, np.array([hx, hy]),
-                                  yaw=self._rng.uniform(0.0, np.pi * 0.25))
-                if self._is_safe(obs, check_xy, min_gap):
-                    obstacles.append(obs)
+        T        = len(robot_xy)
+        tangents = _trajectory_tangents(robot_xy)          # (T, 2)
+        centroid = robot_xy.mean(axis=0)
+
+        # Try up to n_want*3 candidates spread along the trajectory
+        n_cands    = n_want * 3
+        t_indices  = np.round(np.linspace(0, T - 1, n_cands)).astype(int)
+
+        for i, idx in enumerate(t_indices):
+            if len(obstacles) >= n_want:
+                break
+            side = 1 if i % 2 == 0 else -1          # alternate left / right
+            obs  = self._try_place_alongside(
+                robot_xy, check_xy, tangents, idx, side, centroid
+            )
+            if obs is not None:
+                obstacles.append(obs)
 
         return obstacles
+
+    def _try_place_alongside(self, robot_xy, check_xy, tangents, anchor_idx,
+                              side, centroid):
+        """
+        Try to place one large box alongside the trajectory at ``anchor_idx``.
+
+        The box centre is offset perpendicular to the local tangent direction
+        by a random distance in [safe_radius + b_min, safe_radius + b_max + 0.3].
+        A small jitter along the tangent direction is also applied so boxes
+        don't always sit exactly abreast of each other.
+        """
+        anchor  = robot_xy[anchor_idx]
+        tangent = tangents[anchor_idx]                           # (2,) unit vec
+        normal  = np.array([-tangent[1], tangent[0]])            # 90° CCW
+
+        for _ in range(self.max_attempts):
+            # Perpendicular offset places box just outside the safe radius
+            perp_dist = self._rng.uniform(
+                self.robot_safe_radius + self.b_min * 0.5,
+                self.robot_safe_radius + self.b_max + 0.3,
+            )
+            # Small along-tangent jitter keeps boxes from stacking exactly
+            tang_jitter = self._rng.uniform(-self.b_max, self.b_max)
+
+            center = anchor + side * normal * perp_dist + tangent * tang_jitter
+
+            # Reject if too far from the trajectory centroid
+            if np.linalg.norm(center - centroid) > self.placement_radius:
+                continue
+
+            # Long axis ≈ trajectory direction, ±45° random rotation
+            yaw_base = np.arctan2(tangent[1], tangent[0])
+            yaw      = yaw_base + self._rng.uniform(-np.pi / 4, np.pi / 4)
+
+            # Elongated box: one axis longer to act as a wall segment
+            h_along = self._rng.uniform(self.b_min, self.b_max)
+            h_perp  = self._rng.uniform(self.b_min * 0.5, self.b_min)
+            obs      = BoxObstacle(center, np.array([h_along, h_perp]), yaw)
+
+            if self._is_safe(obs, check_xy, self.robot_safe_radius):
+                return obs
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Compact generation (flood-fill with trajectory corridor)
+    # ------------------------------------------------------------------
+
+    def _generate_compact(self, robot_xy, check_xy):
+        """
+        Flood-fill the entire sensor area with square box obstacles, leaving
+        only the trajectory corridor clear.
+
+        Algorithm
+        ---------
+        1. Compute the axis-aligned bounding box (AABB) of ``check_xy`` and
+           extend it by ``_sensor_buffer`` in every direction.  This ensures
+           that the grid covers the full sensor range (2.0 m) from *any* robot
+           position in the window, even when the robot travels far from the
+           window centroid.
+        2. Build a uniform Cartesian grid with step ``_grid_spacing`` inside
+           those extended bounds.
+        3. Vectorised O(T×N) min-distance check: skip any grid point whose
+           closest trajectory point is within ``robot_safe_radius + h``
+           (conservative surface-to-path clearance for a box of half-extent h).
+        4. Place a square ``BoxObstacle`` (axis-aligned) at each remaining point.
+
+        Coverage guarantee
+        ------------------
+        For box half-extent h and sphere_radius r_s:
+          coverage_zone  = h + r_s  = 0.20 + 0.177 = 0.377 m
+          max grid gap   = spacing * √2 / 2 = 0.50 * 0.707 = 0.354 m
+          0.354 < 0.377  →  every non-corridor sphere is guaranteed to read > 0
+        """
+        gs  = self._grid_spacing
+        h   = self._box_half_extent
+        buf = self._sensor_buffer
+
+        # Grid bounds: trajectory AABB expanded by sensor_buffer
+        x_lo = check_xy[:, 0].min() - buf
+        x_hi = check_xy[:, 0].max() + buf
+        y_lo = check_xy[:, 1].min() - buf
+        y_hi = check_xy[:, 1].max() + buf
+
+        xs = np.arange(x_lo, x_hi + gs * 0.5, gs)
+        ys = np.arange(y_lo, y_hi + gs * 0.5, gs)
+        gx, gy = np.meshgrid(xs, ys)
+        grid_points = np.stack([gx.ravel(), gy.ravel()], axis=1)  # (N, 2)
+
+        # Vectorised min-distance from each grid point to any trajectory point
+        # (T, 1, 2) - (1, N, 2) → (T, N) norms → (N,) min over T
+        diffs     = check_xy[:, np.newaxis, :] - grid_points[np.newaxis, :, :]
+        min_dists = np.linalg.norm(diffs, axis=2).min(axis=0)  # (N,)
+
+        safe_mask   = min_dists >= (self.robot_safe_radius + h)
+        safe_points = grid_points[safe_mask]
+
+        half = np.array([h, h], dtype=np.float64)
+        return [BoxObstacle(pt, half) for pt in safe_points]
 
     # ------------------------------------------------------------------
     # Shared helpers
     # ------------------------------------------------------------------
 
-    def _is_safe(
+    def _is_safe(self, obs, check_xy, min_gap):
+        dists = obs.batch_min_distance(check_xy)
+        return bool(np.all(dists >= min_gap))
+
+
+# ---------------------------------------------------------------------------
+# Multi-mode cycling generator
+# ---------------------------------------------------------------------------
+
+class CyclingObstacleGenerator:
+    """
+    Wraps multiple ObstacleGenerators and cycles through their modes on each
+    successive ``generate_for_window`` call.
+
+    This lets training / visualisation see sparse, dense, and packed obstacles
+    in a single session without any manual intervention.
+
+    Example
+    -------
+    >>> gen = CyclingObstacleGenerator(['sparse', 'dense', 'packed'], seed=0)
+    >>> # window 0 → sparse, window 1 → dense, window 2 → packed, window 3 → sparse …
+    >>> obstacles = gen.generate_for_window(robot_xy)
+
+    Args:
+        modes:             List of mode strings (any subset of
+                           ``{'sparse', 'dense', 'packed'}``).
+        robot_safe_radius: Forwarded to every underlying ObstacleGenerator.
+        seed:              Optional base seed; each generator gets ``seed + i``.
+        **kwargs:          Additional keyword arguments forwarded to every
+                           ObstacleGenerator (e.g. ``max_attempts``).
+    """
+
+    def __init__(
         self,
-        obs: Obstacle2D,
-        check_xy: np.ndarray,
-        min_gap: float,
-    ) -> bool:
-        """Return True if the obstacle is collision-free with every check point."""
-        for pt in check_xy:
-            if obs.min_distance_to_point(pt) < min_gap:
-                return False
-        return True
+        modes: List[str],
+        robot_safe_radius: float = 0.5,
+        seed: Optional[int] = None,
+        **kwargs,
+    ):
+        if not modes:
+            raise ValueError("modes must be a non-empty list")
+        for m in modes:
+            if m not in ObstacleGenerator.MODES:
+                raise ValueError(f"Unknown mode '{m}'. Choose from {ObstacleGenerator.MODES}.")
+
+        self._generators = [
+            ObstacleGenerator(
+                mode=m,
+                robot_safe_radius=robot_safe_radius,
+                seed=(seed + i) if seed is not None else None,
+                **kwargs,
+            )
+            for i, m in enumerate(modes)
+        ]
+        self.modes = list(modes)
+        self._call_count = 0
+
+    @property
+    def current_mode(self) -> str:
+        return self.modes[self._call_count % len(self.modes)]
+
+    def seed(self, s: int):
+        """Re-seed all underlying generators."""
+        for i, g in enumerate(self._generators):
+            g.seed(s + i)
+
+    def generate_for_window(
+        self,
+        robot_xy: np.ndarray,
+        lookahead_xy: Optional[np.ndarray] = None,
+    ) -> List[Obstacle2D]:
+        """
+        Generate obstacles using the next mode in the cycle.
+
+        The mode advances by one on every call, wrapping around when the end
+        of the list is reached.
+        """
+        gen = self._generators[self._call_count % len(self._generators)]
+        self._call_count += 1
+        return gen.generate_for_window(robot_xy, lookahead_xy)
+
+
+def make_generator(
+    modes: Union[str, List[str]],
+    robot_safe_radius: float = 0.5,
+    seed: Optional[int] = None,
+    **kwargs,
+) -> Union[ObstacleGenerator, CyclingObstacleGenerator]:
+    """
+    Factory: return a plain ObstacleGenerator for a single mode, or a
+    CyclingObstacleGenerator when multiple modes are requested.
+
+    Args:
+        modes:  A single mode string *or* a list of mode strings.
+        robot_safe_radius, seed, **kwargs: forwarded to the generator(s).
+    """
+    if isinstance(modes, str):
+        modes = [modes]
+    if len(modes) == 1:
+        return ObstacleGenerator(
+            mode=modes[0], robot_safe_radius=robot_safe_radius, seed=seed, **kwargs
+        )
+    return CyclingObstacleGenerator(
+        modes=modes, robot_safe_radius=robot_safe_radius, seed=seed, **kwargs
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -514,7 +770,7 @@ class ObstacleGenerator:
 def compute_clip_sensor_readings(
     all_qpos: np.ndarray,
     sensor: EnvironmentSensor,
-    generator: ObstacleGenerator,
+    generator: Union[ObstacleGenerator, CyclingObstacleGenerator],
     obstacle_interval: int = 30,
     lookahead_frames: int = 30,
 ) -> Tuple[np.ndarray, List]:
@@ -534,11 +790,11 @@ def compute_clip_sensor_readings(
         lookahead_frames:  Future frames included in collision check.
 
     Returns:
-        readings:          (T, n_rays) float32 sensor readings.
+        readings:          (T, feature_dim) float32 continuous occupancy readings.
         window_obstacles:  List of (start, end, List[Obstacle2D]) for visualisation.
     """
     T = all_qpos.shape[0]
-    readings = np.zeros((T, sensor.n_rays), dtype=np.float32)
+    readings = np.zeros((T, sensor.feature_dim), dtype=np.float32)
     window_obstacles = []
 
     starts = list(range(0, T, obstacle_interval))
@@ -546,18 +802,16 @@ def compute_clip_sensor_readings(
         w_end = min(w_start + obstacle_interval, T)
         la_end = min(w_end + lookahead_frames, T)
 
-        # Robot XY in this window (for collision check)
         window_xy = all_qpos[w_start:w_end, :2]
         lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
 
         obstacles = generator.generate_for_window(window_xy, lookahead_xy)
         window_obstacles.append((w_start, w_end, obstacles))
 
-        # Compute readings for every frame in this window
         for t in range(w_start, w_end):
             pos = all_qpos[t, :3]
             yaw = quat_wxyz_to_yaw(all_qpos[t, 3:7])
-            r, _ = sensor.compute(pos, yaw, obstacles)
-            readings[t] = r
+            occ, _ = sensor.compute(pos, yaw, obstacles)
+            readings[t] = occ
 
     return readings, window_obstacles

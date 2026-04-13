@@ -67,46 +67,48 @@ def draw_sensor_readings(
     scene,
     robot_pos: np.ndarray,
     readings: np.ndarray,
-    hit_points: np.ndarray,
+    sphere_centers: np.ndarray,
     z_height: float = 0.08,
     dot_radius: float = 0.04,
-    draw_lines: bool = True,
+    draw_lines: bool = False,
 ):
     """
-    Visualise EnvironmentSensor scan-dot readings in a MuJoCo scene.
+    Visualise NSM Polar Environment Sensor readings in a MuJoCo scene.
 
-    Draws:
-      - A thin line from the robot to each ray endpoint.
-      - A small sphere (dot) at each ray endpoint.
-    Color: green = free (0), red = occupied (1).
+    Each sampling sphere is drawn as a small dot at its world-frame centre,
+    coloured by its continuous occupancy value:
+        s = 0   →  green  (clear)
+        s = 1   →  red    (fully occupied)
+        0 < s < 1  →  yellow-orange gradient (boundary)
 
     Args:
-        scene:      MuJoCo viewer user scene.
-        robot_pos:  (3,) or (2,) world-frame robot position.
-        readings:   (n_rays,) float array, 0 = free, 1 = occupied.
-        hit_points: (n_rays, 2) world XY of ray endpoints.
-        z_height:   Height above ground at which rays are drawn.
-        dot_radius: Radius of the scan-dot spheres.
-        draw_lines: Whether to draw the ray lines (can be toggled off for
-                    a cleaner dot-only display).
+        scene:          MuJoCo viewer user scene.
+        robot_pos:      (3,) or (2,) world-frame robot position.
+        readings:       (N,) float array, continuous occupancy in [0, 1].
+        sphere_centers: (N, 2) world XY of each sphere centre.
+        z_height:       Height above ground at which spheres are drawn.
+        dot_radius:     Radius of the visualisation spheres.
+        draw_lines:     Draw a thin line from robot to each sphere centre
+                        (off by default – too cluttered for the polar grid).
     """
     pos_3d = np.array([robot_pos[0], robot_pos[1], z_height], dtype=np.float64)
 
-    for reading, hp in zip(readings, hit_points):
-        is_hit = reading > 0.5
-        line_rgba = np.array([1.0, 0.2, 0.2, 0.5], dtype=np.float32) if is_hit \
-               else np.array([0.2, 1.0, 0.2, 0.2], dtype=np.float32)
-        dot_rgba  = np.array([1.0, 0.1, 0.1, 1.0], dtype=np.float32) if is_hit \
-               else np.array([0.1, 0.9, 0.1, 0.9], dtype=np.float32)
+    for s, center in zip(readings, sphere_centers):
+        # Green → yellow → red gradient based on occupancy
+        r_ch  = float(min(1.0, 2.0 * s))
+        g_ch  = float(min(1.0, 2.0 * (1.0 - s)))
+        alpha = 0.25 + 0.75 * float(s)   # transparent when free, opaque when occupied
+        dot_rgba = np.array([r_ch, g_ch, 0.0, alpha], dtype=np.float32)
 
-        hp_3d = np.array([hp[0], hp[1], z_height], dtype=np.float64)
+        center_3d = np.array([center[0], center[1], z_height], dtype=np.float64)
 
         if draw_lines and scene.ngeom < scene.maxgeom:
+            line_rgba = np.array([r_ch, g_ch, 0.0, 0.15], dtype=np.float32)
             init_geom(scene.geoms[scene.ngeom], line_rgba)
             mujoco.mjv_connector(
                 scene.geoms[scene.ngeom],
-                mujoco.mjtGeom.mjGEOM_LINE, 1.5,
-                pos_3d, hp_3d,
+                mujoco.mjtGeom.mjGEOM_LINE, 1.0,
+                pos_3d, center_3d,
             )
             scene.ngeom += 1
 
@@ -115,7 +117,7 @@ def draw_sensor_readings(
                 scene.geoms[scene.ngeom],
                 type=mujoco.mjtGeom.mjGEOM_SPHERE,
                 size=np.array([dot_radius, dot_radius, dot_radius], dtype=np.float64),
-                pos=hp_3d,
+                pos=center_3d,
                 mat=np.eye(3).flatten(),
                 rgba=dot_rgba,
             )

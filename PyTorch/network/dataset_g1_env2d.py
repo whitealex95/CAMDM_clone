@@ -1,21 +1,22 @@
 """
-HumanoidEnvMotionDataset – G1 dataset with 2-D environment-sensor readings.
+HumanoidEnvMotionDataset – G1 dataset with NSM Polar Environment Sensor readings.
 
-Extends the base G1 dataset (dataset_g1.py) by loading pre-computed binary
-scan-dot sensor readings from an augmented pkl file (produced by
-visualize/step2_visualize_data_env.py --create-dataset).
+Extends the base G1 dataset (dataset_g1.py) by loading pre-computed continuous
+occupancy readings from an augmented pkl file (produced by
+visualize/step2_visualize_data_env2d.py --create-dataset).
 
 Key addition
 ------------
-* ``sensor_readings_list``: per-clip (T, n_rays) float32 arrays loaded from
-  the pkl field ``sensor_readings``.
+* ``sensor_readings_list``: per-clip (T, feature_dim) float32 arrays of
+  continuous occupancy values in [0, 1].
 * ``__getitem__`` slices the future window of sensor readings and applies the
   same global-rotation-augmentation cyclic shift that is applied to the
-  trajectory / pose data.
+  trajectory / pose data.  The shift is applied per-ring (n_r rings × n_theta
+  angles) so that the polar grid rotates correctly.
 
 The returned condition dict gains:
-    ``sensor``: (future_frames, n_rays) float32 tensor
-which is permuted to (bs, n_rays, future_frames) in the training loop.
+    ``sensor``: (future_frames, feature_dim) float32 tensor
+which is permuted to (bs, feature_dim, future_frames) in the training loop.
 """
 
 import sys
@@ -56,7 +57,25 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
 
         # ---- load sensor metadata and readings ----
         data_source = pickle.load(open(pkl_path, "rb"))
-        self.sensor_n_rays = int(data_source.get("sensor_n_rays", 36))
+
+        # Support new (sensor_resolution / sensor_max_range) and legacy pkls
+        self.sensor_feature_dim = int(
+            data_source.get("sensor_feature_dim",
+            data_source.get("sensor_n_rays", 36))
+        )
+        sensor_resolution = int(data_source.get("sensor_resolution", 10))
+        sensor_max_range  = float(data_source.get("sensor_max_range", 0.5))
+
+        # Recompute per-ring slices using the same formula as EnvironmentSensor
+        size     = 2.0 * sensor_max_range
+        coverage = 0.5 * size / max(sensor_resolution - 1, 1)
+        ring_slices: list = []
+        n_pts = 0
+        for z in range(sensor_resolution):
+            count = int(round(2.0 * np.pi * z)) if z > 0 else 0
+            ring_slices.append((n_pts, n_pts + count))
+            n_pts += count
+        self._ring_slices = ring_slices
 
         window_size = past_frame + future_frame
         n_missing = 0
@@ -70,14 +89,15 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
                 readings = np.asarray(motion["sensor_readings"], dtype=dtype)
             else:
                 n_missing += 1
-                readings = np.zeros((N, self.sensor_n_rays), dtype=dtype)
+                readings = np.zeros((N, self.sensor_feature_dim), dtype=dtype)
             self.sensor_readings_list.append(readings)
 
         if n_missing:
             print(f"[HumanoidEnvMotionDataset] WARNING: {n_missing} clips had no "
                   f"sensor_readings field; using all-zero readings for those clips.")
 
-        print(f"[HumanoidEnvMotionDataset] sensor_n_rays={self.sensor_n_rays}, "
+        print(f"[HumanoidEnvMotionDataset] sensor_feature_dim={self.sensor_feature_dim}, "
+              f"resolution={sensor_resolution}, max_range={sensor_max_range}m, "
               f"{len(self.sensor_readings_list)} clips loaded.")
 
     # ------------------------------------------------------------------
@@ -140,12 +160,19 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
         root_pos = rot_vec.apply(root_pos)
 
         # ---- Rotate sensor readings to match new heading ----
-        # When robot heading increases by theta (CCW), obstacles appear
-        # at a smaller local-frame angle, so ray indices shift by
-        #   shift = -round(theta * n_rays / (2π))
-        shift = -int(round(theta * self.sensor_n_rays / (2.0 * np.pi)))
-        if shift != 0:
-            sensor_future = np.roll(sensor_future, shift, axis=1)  # (TF, n_rays)
+        # Each ring z has count_z = round(2π*z) spheres uniformly distributed
+        # over 2π.  A heading rotation of theta shifts ring z's angular index by
+        #   k_z = -round(theta * count_z / (2π))
+        # We apply the roll per-ring independently (variable count per ring).
+        rotated = sensor_future.copy()
+        for (start, end) in self._ring_slices:
+            count = end - start
+            if count == 0:
+                continue
+            k = -int(round(theta * count / (2.0 * np.pi)))
+            if k != 0:
+                rotated[:, start:end] = np.roll(sensor_future[:, start:end], k, axis=1)
+        sensor_future = rotated
 
         # ----------------------------------------------------------
         # TORCH CONVERSION (same as base class)

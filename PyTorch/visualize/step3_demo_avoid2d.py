@@ -2,7 +2,7 @@
 Step 3: Avoid2D Demo – Environment-Sensor-Conditioned Motion Generation
 ------------------------------------------------------------------------
 Like step3_demo.py but uses a model trained with 2-D scan-dot sensor
-conditioning (MotionDiffusionEnv / train_g1_env.py).
+conditioning (MotionDiffusionEnv / train_g1_env2d.py).
 
 Obstacles are auto-generated around the robot's near-future trajectory and
 shown as semi-transparent boxes/cylinders.  Per-frame sensor readings are
@@ -49,7 +49,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import utils.common as common
 import utils.nn_transforms as nn_transforms
-from network.models_env import MotionDiffusionEnv
+from network.models_env2d import MotionDiffusionEnv
 from diffusion.create_diffusion import create_gaussian_diffusion
 
 from visualize.motion_loader import MotionDataset
@@ -146,10 +146,10 @@ def _compute_future_sensor(
         (T, n_rays) float32 readings.
     """
     T = len(future_xy)
-    readings = np.zeros((T, sensor.n_rays), dtype=np.float32)
+    readings = np.zeros((T, sensor.feature_dim), dtype=np.float32)
     for t in range(T):
-        r, _ = sensor.compute(future_xy[t], future_yaw[t], obstacles)
-        readings[t] = r
+        occ, _ = sensor.compute(future_xy[t], future_yaw[t], obstacles)
+        readings[t] = occ
     return readings
 
 
@@ -351,8 +351,8 @@ class DemoPlayerEnv:
         self.qpos_history = deque(maxlen=past_frames)
 
         # sensor state (current frame)
-        self.readings   = np.zeros(self.sensor.n_rays, dtype=np.float32)
-        self.hit_points = np.zeros((self.sensor.n_rays, 2), dtype=np.float64)
+        self.readings       = np.zeros(self.sensor.feature_dim, dtype=np.float32)
+        self.sphere_centers = np.zeros((self.sensor.feature_dim, 2), dtype=np.float64)
 
         self.load_motion(0)
 
@@ -511,7 +511,7 @@ class DemoPlayerEnv:
             self._maybe_regenerate()
             # Update sensor at current position
             qpos = self.data.qpos
-            self.readings, self.hit_points = self.sensor.compute(
+            self.readings, self.sphere_centers = self.sensor.compute(
                 qpos[:3], quat_wxyz_to_yaw(qpos[3:7]), self.obstacles
             )
             self.update_pose()
@@ -585,7 +585,7 @@ class DemoPlayerEnv:
 
         if self.show_sensor:
             draw_sensor_readings(
-                scene, self.data.qpos[:3], self.readings, self.hit_points,
+                scene, self.data.qpos[:3], self.readings, self.sphere_centers,
                 z_height=0.08, dot_radius=0.04, draw_lines=self.draw_lines,
             )
 
@@ -613,13 +613,13 @@ class DemoPlayerEnv:
         print(f"Camera follow: {'ON' if self.camera_follow else 'OFF'}")
 
     def print_status(self):
-        n_hits = int(self.readings.sum())
+        n_active = int((self.readings > 0).sum())
         print(
             f"Motion {self.current_motion_idx+1}/{len(self.dataset)} | "
             f"Frame {self.current_frame} | "
             f"style={self.current_motion_data.style} | "
             f"{'Playing' if self.playing else 'Paused'} ({self.playback_speed}×) | "
-            f"sensor hits {n_hits}/{self.sensor.n_rays} | "
+            f"sensor active {n_active}/{self.sensor.feature_dim} | "
             f"obstacles {len(self.obstacles)} ({self.obstacle_mode})"
         )
 
@@ -674,8 +674,8 @@ def get_args():
     p.add_argument("--mode",  default="sparse", choices=["sparse", "dense", "packed"],
                    help="Obstacle density mode (default: sparse)")
     p.add_argument("--obstacle-interval", type=int, default=30)
-    p.add_argument("--n-rays",    type=int,   default=36)
-    p.add_argument("--max-range", type=float, default=3.0)
+    p.add_argument("--resolution", type=int,   default=9)
+    p.add_argument("--max-range",  type=float, default=2.0)
     p.add_argument("--traj-bias-pos",  type=float, default=0.4)
     p.add_argument("--traj-bias-rot",  type=float, default=2.2)
     p.add_argument("--past-frames",    type=int,   default=10)
@@ -746,12 +746,12 @@ def main():
     print(f"\nLoading checkpoint: {args.checkpoint}")
     if not os.path.exists(args.checkpoint):
         print(f"Checkpoint not found: {args.checkpoint}")
-        print("Train a model first with train_g1_env.py")
+        print("Train a model first with train_g1_env2d.py")
         return
     checkpoint = torch.load(args.checkpoint, map_location=device)
     config = checkpoint["config"]
 
-    sensor_dim = getattr(config.arch, "sensor_dim", args.n_rays)
+    sensor_dim = getattr(config.arch, "sensor_dim", 283)
 
     diffusion       = create_gaussian_diffusion(config)
     input_feats     = 31 * 6
@@ -772,7 +772,7 @@ def main():
     diffusion_model.load_state_dict(checkpoint["state_dict"])
     diffusion_model.eval()
 
-    sensor = EnvironmentSensor(n_rays=args.n_rays, max_range=args.max_range)
+    sensor = EnvironmentSensor(max_range=args.max_range, resolution=args.resolution)
 
     generator = SensorMotionGenerator(
         diffusion_model, diffusion, config, sensor,
