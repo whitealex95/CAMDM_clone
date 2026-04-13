@@ -405,7 +405,7 @@ def create_env_dataset(
     intentionally avoided here — each output clip has a single consistent mode.
 
     The top-level dict gains metadata keys:
-        ``sensor_feature_dim``, ``sensor_resolution``, ``sensor_max_range``,
+        ``env_sensor_dim``, ``sensor_resolution``, ``sensor_max_range``,
         ``sensor_sphere_radius``, ``obstacle_interval``
 
     Args:
@@ -471,7 +471,7 @@ def create_env_dataset(
     data_dict["motions"] = output_motions
 
     # Store metadata at top level
-    data_dict["sensor_feature_dim"]   = sensor.feature_dim
+    data_dict["env_sensor_dim"]        = sensor.feature_dim
     data_dict["sensor_resolution"]    = resolution
     data_dict["sensor_max_range"]     = max_range
     data_dict["sensor_sphere_radius"] = sensor.sphere_radius

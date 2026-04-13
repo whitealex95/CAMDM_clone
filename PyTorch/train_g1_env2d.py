@@ -65,8 +65,8 @@ def train(config, resume, logger, tb_writer):
 
     diffusion = create_gaussian_diffusion(config)
 
-    # Sensor dimension from config (default 36)
-    sensor_dim = getattr(config.arch, "sensor_dim", train_data.sensor_feature_dim)
+    # env_sensor_dim from config, falling back to the value stored in the dataset
+    env_sensor_dim = getattr(config.arch, "env_sensor_dim", train_data.env_sensor_dim)
 
     input_feats = (train_data.joint_num + 1) * train_data.per_rot_feat
 
@@ -77,7 +77,7 @@ def train(config, resume, logger, tb_writer):
         train_data.per_rot_feat,
         config.arch.rot_req,
         config.arch.clip_len,
-        sensor_dim=sensor_dim,
+        env_sensor_dim=env_sensor_dim,
         latent_dim=config.arch.latent_dim,
         ff_size=config.arch.ff_size,
         num_layers=config.arch.num_layers,
@@ -87,7 +87,7 @@ def train(config, resume, logger, tb_writer):
         device=config.device,
     ).to(config.device)
 
-    logger.info(f"MotionDiffusionEnv: sensor_dim={sensor_dim}")
+    logger.info(f"MotionDiffusionEnv: env_sensor_dim={env_sensor_dim}")
 
     # HumanoidTrainingPortal handles the training loop and geometric losses.
     # It reads 'sensor' from cond dict and permutes it before passing to the model.
@@ -112,16 +112,11 @@ class _EnvTrainingPortal(HumanoidTrainingPortal):
     """
     Extends HumanoidTrainingPortal to handle the 'sensor' condition.
 
-    In the base class, ``diffuse()`` permutes traj_pose / traj_trans before
-    calling model.interface().  We add the same permutation for sensor:
-        (bs, TF, n_rays) → (bs, n_rays, TF)
+    The sensor tensor from the DataLoader is already (bs, env_sensor_dim)
+    and requires no permutation before being passed to model.interface().
     """
 
-    def diffuse(self, x_start, t, cond, noise=None, return_loss=False):
-        # Permute sensor: (bs, TF, n_rays) → (bs, n_rays, TF)
-        if "sensor" in cond and cond["sensor"] is not None:
-            cond["sensor"] = cond["sensor"].permute(0, 2, 1)
-        return super().diffuse(x_start, t, cond, noise=noise, return_loss=return_loss)
+    pass
 
 
 # ---------------------------------------------------------------------------

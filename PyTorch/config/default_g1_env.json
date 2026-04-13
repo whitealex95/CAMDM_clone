@@ -11,7 +11,7 @@
         "future_frame": 45,
         "local_cond": "traj_sensor",
         "global_cond": "style",
-        "sensor_dim": 226
+        "env_sensor_dim": 226
     },
     "diff": {
         "noise_schedule": "cosine",

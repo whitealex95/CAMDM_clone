@@ -126,32 +126,6 @@ class ModelWrapper(torch.nn.Module):
         )
 
 
-def _compute_future_sensor(
-    sensor: EnvironmentSensor,
-    obstacles,
-    future_xy: np.ndarray,
-    future_yaw: np.ndarray,
-) -> np.ndarray:
-    """
-    Compute expected sensor readings at each future trajectory position.
-
-    Assumes obstacles are static (valid when they change slowly relative to
-    the planning horizon).
-
-    Args:
-        future_xy:  (T, 2) future XY positions in world frame.
-        future_yaw: (T,)   future heading angles in radians.
-
-    Returns:
-        (T, n_rays) float32 readings.
-    """
-    T = len(future_xy)
-    readings = np.zeros((T, sensor.feature_dim), dtype=np.float32)
-    for t in range(T):
-        occ, _ = sensor.compute(future_xy[t], future_yaw[t], obstacles)
-        readings[t] = occ
-    return readings
-
 
 class SensorMotionGenerator:
     """
@@ -210,14 +184,13 @@ class SensorMotionGenerator:
         traj_pose_t = torch.from_numpy(traj_pose_repr).float() \
             .unsqueeze(0).permute(0, 2, 1).to(self.device)     # (1, 6, future)
 
-        # ── Future sensor readings ────────────────────────────────────────
-        # Compute yaw at each future point from traj_pose quaternions
-        future_yaw = np.array([quat_wxyz_to_yaw(traj_pose[t]) for t in range(len(traj_trans))])
-        sensor_readings = _compute_future_sensor(
-            self.sensor, obstacles, traj_trans, future_yaw
-        )  # (future, n_rays)
+        # ── Current-frame sensor reading ─────────────────────────────────
+        curr_yaw = quat_wxyz_to_yaw(past_qpos[-1, 3:7])
+        sensor_readings, _ = self.sensor.compute(
+            past_qpos[-1, :3], curr_yaw, obstacles
+        )  # (env_sensor_dim,)
         sensor_t = torch.from_numpy(sensor_readings).float() \
-            .unsqueeze(0).permute(0, 2, 1).to(self.device)     # (1, n_rays, future)
+            .unsqueeze(0).to(self.device)                       # (1, env_sensor_dim)
 
         style_idx_t = torch.tensor([style_idx]).to(self.device)
 
@@ -751,7 +724,7 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location=device)
     config = checkpoint["config"]
 
-    sensor_dim = getattr(config.arch, "sensor_dim", 283)
+    env_sensor_dim = config.arch.env_sensor_dim
 
     diffusion       = create_gaussian_diffusion(config)
     input_feats     = 31 * 6
@@ -760,7 +733,7 @@ def main():
     diffusion_model = MotionDiffusionEnv(
         input_feats, len(style_set), 31, 6,
         config.arch.rot_req, config.arch.clip_len,
-        sensor_dim=sensor_dim,
+        env_sensor_dim=env_sensor_dim,
         latent_dim=config.arch.latent_dim,
         ff_size=config.arch.ff_size,
         num_layers=config.arch.num_layers,

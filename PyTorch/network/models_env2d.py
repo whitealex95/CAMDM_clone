@@ -1,31 +1,73 @@
 """
 MotionDiffusionEnv – motion diffusion model with environment-sensor conditioning.
 
-Extends MotionDiffusion (models.py) by adding a TrajProcess for the binary
-scan-dot sensor readings.  The sensor embedding is concatenated into the
-transformer sequence alongside the trajectory embeddings.
+Extends MotionDiffusion (models.py) by adding an NSM-style EnvSensorEncoder for
+the cylindrical occupancy sensor readings.  The sensor embedding is concatenated
+into the transformer sequence alongside the trajectory embeddings.
+
+Architecture reference:
+    Starke et al. "Neural State Machine for Character-Scene Interaction"
+    SIGGRAPH Asia 2019 — environment encoder: MLP [env_sensor_dim → hidden → latent]
+    with ELU activations.
 
 Sensor condition tensor shape at inference time:
-    sensor: (batch, n_rays, future_frames)
+    sensor: (batch, env_sensor_dim)  – current-frame snapshot
 """
 
 import torch
-from network.models import MotionDiffusion, TrajProcess
+import torch.nn as nn
+from network.models import MotionDiffusion
+
+
+class EnvSensorEncoder(nn.Module):
+    """
+    NSM-style MLP encoder for cylindrical environment-sensor readings.
+
+    Maps per-frame sensor feature vectors to latent vectors via a 2-layer MLP
+    with ELU activations, matching the environment encoder in the NSM paper.
+
+    Args:
+        env_sensor_dim: Number of sensor occupancy values per frame
+                        (= EnvironmentSensor.feature_dim).
+        latent_dim:     Output dimension (same as transformer latent_dim).
+        hidden_dims:    Hidden layer sizes. Default [512] matches NSM paper.
+    """
+
+    def __init__(self, env_sensor_dim: int, latent_dim: int, hidden_dims: list = [512]):
+        super().__init__()
+        dims = [env_sensor_dim] + list(hidden_dims) + [latent_dim]
+        layers = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(nn.ELU())
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (bs, env_sensor_dim) – current-frame sensor snapshot.
+
+        Returns:
+            (1, bs, latent_dim) – single environment token,
+            ready to concat into the transformer input sequence.
+        """
+        return self.net(x).unsqueeze(0)  # (1, bs, latent_dim)
 
 
 class MotionDiffusionEnv(MotionDiffusion):
     """
-    Motion diffusion model conditioned on 2-D environment-sensor readings.
+    Motion diffusion model conditioned on 2-D cylindrical environment-sensor readings.
 
-    Identical to MotionDiffusion except for an extra ``sensor_process`` that
-    embeds the per-frame binary scan-dot readings into the latent space.
+    Identical to MotionDiffusion except for an extra ``sensor_encoder`` (NSM-style
+    2-layer MLP with ELU) that embeds the per-frame occupancy readings into the
+    latent space.
 
     Args (additions to MotionDiffusion):
-        sensor_dim: Number of sensor rays (= EnvironmentSensor.n_rays).
+        env_sensor_dim: Number of sensor occupancy values (= EnvironmentSensor.feature_dim).
     """
 
     def __init__(self, input_feats, nstyles, njoints, nfeats, rot_req, clip_len,
-                 sensor_dim: int = 36,
+                 env_sensor_dim: int = 226,
                  latent_dim=256, ff_size=1024, num_layers=8, num_heads=4,
                  dropout=0.2, ablation=None, activation="gelu", legacy=False,
                  arch='trans_enc', cond_mask_prob=0, device=None):
@@ -38,9 +80,9 @@ class MotionDiffusionEnv(MotionDiffusion):
             cond_mask_prob=cond_mask_prob, device=device,
         )
 
-        self.sensor_dim = sensor_dim
-        # Sensor readings share the same TrajProcess embedding structure as traj_trans/traj_pose
-        self.sensor_process = TrajProcess(sensor_dim, self.latent_dim)
+        self.env_sensor_dim = env_sensor_dim
+        # NSM-style environment encoder: 2-layer MLP with ELU
+        self.sensor_encoder = EnvSensorEncoder(env_sensor_dim, self.latent_dim)
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -49,22 +91,22 @@ class MotionDiffusionEnv(MotionDiffusion):
     def forward(self, x, timesteps, past_motion, traj_pose, traj_trans, style_idx, sensor=None):
         """
         Args:
-            sensor: (batch, sensor_dim, future_frames) float tensor, or None.
+            sensor: (batch, env_sensor_dim) float tensor – current-frame snapshot, or None.
                     When None the sensor embedding is zeroed out (unconditional).
         """
         bs, njoints, nfeats, nframes = x.shape
 
         time_emb        = self.embed_timestep(timesteps)               # (1, bs, L)
         style_emb       = self.embed_style(style_idx).unsqueeze(0)     # (1, bs, L)
-        traj_trans_emb  = self.traj_trans_process(traj_trans)          # (N, bs, L)
-        traj_pose_emb   = self.traj_pose_process(traj_pose)            # (N, bs, L)
-        past_motion_emb = self.past_motion_process(past_motion)        # (past, bs, L)
-        future_motion_emb = self.future_motion_process(x)              # (future, bs, L)
+        traj_trans_emb  = self.traj_trans_process(traj_trans)          # (TF, bs, L)
+        traj_pose_emb   = self.traj_pose_process(traj_pose)            # (TF, bs, L)
+        past_motion_emb = self.past_motion_process(past_motion)        # (TP, bs, L)
+        future_motion_emb = self.future_motion_process(x)              # (TF, bs, L)
 
         if sensor is not None:
-            sensor_emb = self.sensor_process(sensor)                   # (N, bs, L)
+            sensor_emb = self.sensor_encoder(sensor)                   # (1, bs, L)
         else:
-            sensor_emb = torch.zeros_like(traj_trans_emb)
+            sensor_emb = torch.zeros(1, bs, self.latent_dim, device=x.device, dtype=x.dtype)
 
         xseq = torch.cat((
             time_emb, style_emb,
@@ -88,7 +130,7 @@ class MotionDiffusionEnv(MotionDiffusion):
             traj_pose:   (bs, 6, future_frames)
             traj_trans:  (bs, 2, future_frames)
             style_idx:   (bs,)
-            sensor:      (bs, sensor_dim, future_frames)  – optional
+            sensor:      (bs, env_sensor_dim)  – current-frame snapshot, optional
         """
         bs = x.shape[0]
 
