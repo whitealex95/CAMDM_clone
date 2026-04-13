@@ -330,7 +330,7 @@ class ObstacleGenerator:
     >>> occupancy, centers = sensor.compute(robot_pos, yaw, obstacles)
     """
 
-    MODES = {'sparse', 'dense', 'compact'}
+    MODES = {'sparse', 'dense', 'compact', 'none'}
 
     _MODE_DEFAULTS = {
         'sparse': dict(
@@ -345,6 +345,8 @@ class ObstacleGenerator:
             box_halfextent_range=(0.08, 0.25),
             placement_radius=3.5,
         ),
+        # None: no obstacles placed; all sensor readings will be 0.
+        'none': dict(),
         # Compact: flood-fill the entire sensor area with square box obstacles,
         # leaving only a clear corridor along the trajectory.  Every sensor
         # sphere that is not near the robot path will read as fully occupied.
@@ -388,7 +390,9 @@ class ObstacleGenerator:
 
         defaults = dict(self._MODE_DEFAULTS[mode])
 
-        if mode == 'compact':
+        if mode == 'none':
+            pass  # no obstacle parameters needed
+        elif mode == 'compact':
             self._grid_spacing    = float(defaults['grid_spacing'])
             self._box_half_extent = float(defaults['box_half_extent'])
             self._sensor_buffer   = float(defaults['sensor_buffer'])
@@ -428,7 +432,9 @@ class ObstacleGenerator:
             [robot_xy, np.asarray(lookahead_xy, dtype=np.float64)], axis=0
         )
 
-        if self.mode == 'compact':
+        if self.mode == 'none':
+            return []
+        elif self.mode == 'compact':
             return self._generate_compact(robot_xy, check_xy)
         else:
             return self._generate_random(robot_xy, check_xy)

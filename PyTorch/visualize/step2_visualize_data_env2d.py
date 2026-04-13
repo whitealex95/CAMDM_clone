@@ -399,6 +399,11 @@ def create_env_dataset(
     computes per-frame continuous occupancy readings, and writes ``output_pkl``
     with a ``sensor_readings`` field added to every motion dict.
 
+    When multiple modes are given (e.g. ``['sparse', 'dense', 'compact', 'none']``),
+    each source clip is duplicated once per mode so every motion is represented with
+    every obstacle configuration.  Cycling across modes within a single clip is
+    intentionally avoided here — each output clip has a single consistent mode.
+
     The top-level dict gains metadata keys:
         ``sensor_feature_dim``, ``sensor_resolution``, ``sensor_max_range``,
         ``sensor_sphere_radius``, ``obstacle_interval``
@@ -412,58 +417,76 @@ def create_env_dataset(
         robot_safe_radius: Minimum gap between obstacle surface and robot (m).
         lookahead_frames:  Future window also checked for collisions.
         seed:              Base RNG seed for reproducibility.
-        mode:              Single mode string or list of modes to cycle through.
+        mode:              Single mode string or '|'-joined / list of modes.
+                           Multiple modes → each clip is duplicated per mode.
     """
     print(f"\nLoading source dataset: {source_pkl}")
     with open(source_pkl, "rb") as f:
         data_dict = pickle.load(f)
 
-    sensor    = EnvironmentSensor(max_range=max_range, resolution=resolution)
-    generator = make_generator(mode, robot_safe_radius=robot_safe_radius, seed=seed)
+    sensor = EnvironmentSensor(max_range=max_range, resolution=resolution)
 
-    motions = data_dict["motions"]
-    print(f"Processing {len(motions)} motion clips …")
+    # Normalise mode to a list
+    if isinstance(mode, str):
+        modes = [m.strip() for m in mode.split("|") if m.strip()]
+    else:
+        modes = list(mode)
+
+    source_motions = data_dict["motions"]
+    print(f"Source clips: {len(source_motions)}, modes: {modes}")
+    print(f"  → output clips: {len(source_motions) * len(modes)}")
     print(f"  Sensor: max_range={max_range}m, resolution={resolution}, "
           f"coverage={sensor._coverage:.4f}m, sphere_r={sensor.sphere_radius:.4f}m, "
           f"feature_dim={sensor.feature_dim}")
 
-    for clip_idx, motion in enumerate(tqdm(motions)):
-        local_rot = motion["local_joint_rotations"]   # (T, 30, 4)
-        root_pos  = motion["global_root_positions"]   # (T, 3)
+    output_motions = []
+    for m_idx, mode_str in enumerate(modes):
+        generator = make_generator(mode_str, robot_safe_radius=robot_safe_radius,
+                                   seed=seed)
+        print(f"\n[{m_idx+1}/{len(modes)}] mode='{mode_str}' …")
+        for clip_idx, motion in enumerate(tqdm(source_motions)):
+            local_rot = motion["local_joint_rotations"]   # (T, 30, 4)
+            root_pos  = motion["global_root_positions"]   # (T, 3)
 
-        all_qpos = np.concatenate([
-            root_pos,
-            local_rot[:, 0, :],
-            local_rot[:, 1:, 0],
-        ], axis=1).astype(np.float64)  # (T, 36)
+            all_qpos = np.concatenate([
+                root_pos,
+                local_rot[:, 0, :],
+                local_rot[:, 1:, 0],
+            ], axis=1).astype(np.float64)  # (T, 36)
 
-        generator.seed(seed * 10_000 + clip_idx)
+            generator.seed(seed + clip_idx)
 
-        readings, _ = compute_clip_sensor_readings(
-            all_qpos,
-            sensor,
-            generator,
-            obstacle_interval=obstacle_interval,
-            lookahead_frames=lookahead_frames,
-        )
-        motion["sensor_readings"] = readings.astype(np.float32)  # (T, feature_dim)
+            readings, _ = compute_clip_sensor_readings(
+                all_qpos,
+                sensor,
+                generator,
+                obstacle_interval=obstacle_interval,
+                lookahead_frames=lookahead_frames,
+            )
+            new_motion = dict(motion)
+            new_motion["sensor_readings"] = readings.astype(np.float32)
+            new_motion["obstacle_mode"]   = mode_str
+            output_motions.append(new_motion)
+
+    data_dict["motions"] = output_motions
 
     # Store metadata at top level
-    data_dict["sensor_feature_dim"]  = sensor.feature_dim
-    data_dict["sensor_resolution"]   = resolution
-    data_dict["sensor_max_range"]    = max_range
+    data_dict["sensor_feature_dim"]   = sensor.feature_dim
+    data_dict["sensor_resolution"]    = resolution
+    data_dict["sensor_max_range"]     = max_range
     data_dict["sensor_sphere_radius"] = sensor.sphere_radius
-    data_dict["obstacle_interval"]   = obstacle_interval
-    data_dict["obstacle_mode"]       = mode
+    data_dict["obstacle_interval"]    = obstacle_interval
+    data_dict["obstacle_mode"]        = modes
 
     os.makedirs(os.path.dirname(output_pkl) or ".", exist_ok=True)
     with open(output_pkl, "wb") as f:
         pickle.dump(data_dict, f)
 
-    total_frames  = sum(len(m["sensor_readings"]) for m in motions)
-    active_frames = sum(int((m["sensor_readings"].max(axis=1) > 0).sum()) for m in motions)
+    total_frames  = sum(len(m["sensor_readings"]) for m in output_motions)
+    active_frames = sum(int((m["sensor_readings"].max(axis=1) > 0).sum()) for m in output_motions)
     print(f"\nSaved augmented dataset → {output_pkl}")
-    print(f"  Clips:                 {len(motions)}")
+    print(f"  Source clips:          {len(source_motions)}")
+    print(f"  Output clips:          {len(output_motions)}  ({len(modes)} modes × {len(source_motions)})")
     print(f"  Total frames:          {total_frames}")
     print(f"  Frames with occupancy: {active_frames} ({100*active_frames/total_frames:.1f} %)")
     print(f"  Sensor: max_range={max_range}m, resolution={resolution} "
@@ -490,13 +513,15 @@ def get_args():
     p.add_argument("--robot-safe-radius", type=float, default=0.5,
                    help="Minimum clear gap around robot path in metres (default: 0.5)")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--mode", default="sparse|dense|compact",
+    p.add_argument("--mode", default="sparse|dense|compact|none",
                    help="Obstacle density mode(s), separated by '|'. "
-                        "Choices: sparse, dense, compact. "
+                        "Choices: sparse, dense, compact, none. "
+                        "'none' places no obstacles (all sensor readings = 0). "
                         "'compact' flood-fills the sensor area with flush square boxes, "
                         "leaving only the trajectory corridor clear. "
-                        "Multiple modes cycle on each obstacle window. "
-                        "Default: 'sparse|dense|compact'")
+                        "Visualiser: cycles modes across obstacle windows. "
+                        "Dataset creation: each clip is duplicated once per mode. "
+                        "Default: 'sparse|dense|compact|none'")
 
     p.add_argument("--min-start-velocity", type=float, default=0.008,
                    help="Skip initial T-pose frames: first frame whose 5-frame "
@@ -516,8 +541,11 @@ def get_args():
     # dataset creation
     p.add_argument("--create-dataset", action="store_true",
                    help="Create augmented dataset pkl instead of launching viewer")
+    p.add_argument("--input", default=None,
+                   help="Source pkl path for dataset creation "
+                        "(overrides --dataset; default: data/pkls/<dataset>.pkl)")
     p.add_argument("--output", default=None,
-                   help="Output pkl path (default: data/pkls/<dataset>_env.pkl)")
+                   help="Output pkl path (default: data/pkls/<dataset>_env2d_<modes>.pkl)")
     p.add_argument("--lookahead-frames", type=int, default=30)
     return p.parse_args()
 
@@ -545,7 +573,7 @@ def print_instructions():
 # Main
 # ---------------------------------------------------------------------------
 
-_VALID_MODES = {"sparse", "dense", "compact"}
+_VALID_MODES = {"sparse", "dense", "compact", "none"}
 
 
 def _parse_modes(raw: str) -> List[str]:
@@ -569,13 +597,15 @@ def main():
     #  Dataset creation mode                                              #
     # ------------------------------------------------------------------ #
     if args.create_dataset:
+        source_pkl = args.input or dataset_path
         mode_tag = args.mode.replace("|", "_")
-        output = args.output or f"data/pkls/{args.dataset}_env2d_{mode_tag}.pkl"
-        if not os.path.exists(dataset_path):
-            print(f"Source dataset not found: {dataset_path}")
+        stem = os.path.splitext(os.path.basename(source_pkl))[0]
+        output = args.output or f"data/pkls/{stem}_env2d_{mode_tag}.pkl"
+        if not os.path.exists(source_pkl):
+            print(f"Source dataset not found: {source_pkl}")
             return
         create_env_dataset(
-            source_pkl=dataset_path,
+            source_pkl=source_pkl,
             output_pkl=output,
             max_range=args.max_range,
             resolution=args.resolution,
