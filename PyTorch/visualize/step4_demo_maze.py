@@ -64,6 +64,7 @@ from visualize.utils.geometry import (
 )
 from visualize.utils.transition_manager import create_transition_manager
 from visualize.utils.trajectory import blend_trajectory, extend_future_traj_heusristic
+from visualize.utils.sdf_guidance import make_obstacle_cond_fn
 from utils.environment_sensor import (
     EnvironmentSensor,
     BoxObstacle,
@@ -514,6 +515,8 @@ class SensorMotionGenerator:
         style_idx: int,
         obstacles: list,
         zero_sensor: bool = False,
+        guidance_scale: float = 0.0,
+        guidance_margin: float = 0.3,
     ) -> np.ndarray:
         """
         Args
@@ -565,19 +568,30 @@ class SensorMotionGenerator:
             y={},
         )
 
+        # SDF guidance: build cond_fn if guidance_scale > 0
+        cond_fn = None
+        if guidance_scale > 0.0 and obstacles:
+            cond_fn = make_obstacle_cond_fn(
+                obstacles, curr_xy, device=self.device,
+                margin=guidance_margin, scale=guidance_scale,
+            )
+
         shape = (1, 31, self.per_rot_feat, self.future_frames)
+        use_grad = cond_fn is not None
         with torch.no_grad():
             if self.sampler == 'ddim':
                 out = self.diffusion.ddim_sample_loop(
                     self.model, shape, clip_denoised=False,
                     model_kwargs=model_kwargs, progress=False, eta=0.0,
                     device=self.device,
+                    cond_fn=cond_fn, cond_fn_with_grad=use_grad,
                 )
             else:
                 out = self.diffusion.p_sample_loop(
                     self.model, shape, clip_denoised=False,
                     model_kwargs=model_kwargs, progress=False,
                     device=self.device,
+                    cond_fn=cond_fn, cond_fn_with_grad=use_grad,
                 )
 
         out = out.squeeze(0).permute(2, 0, 1).cpu().numpy()
@@ -611,6 +625,8 @@ class DemoPlayerMaze:
         blend: bool = True,            # False = skip blending, use raw waypoint
         traj_bias_pos: float = 0.4,   # position blend exponent (higher = more waypoint-biased)
         traj_bias_rot: float = 2.2,   # rotation blend exponent
+        guidance_scale: float = 0.0,  # SDF guidance strength (0 = off)
+        guidance_margin: float = 0.3, # minimum clearance in metres for guidance
         cfg_count: int = 2,
         applyframes: int = 15,
         inertialize: bool = True,
@@ -673,7 +689,9 @@ class DemoPlayerMaze:
         # Blend parameters
         self.blend         = bool(blend)
         self.traj_bias_pos = float(traj_bias_pos)
-        self.traj_bias_rot = float(traj_bias_rot)
+        self.traj_bias_rot    = float(traj_bias_rot)
+        self.guidance_scale   = float(guidance_scale)
+        self.guidance_margin  = float(guidance_margin)
 
         # Trajectory state (filled by _update_traj)
         self.future_traj_waypoint = None   # raw waypoint path  (red)
@@ -760,6 +778,8 @@ class DemoPlayerMaze:
             self.style_idx,
             self.obstacles,
             zero_sensor=self.zero_sensor,
+            guidance_scale=self.guidance_scale,
+            guidance_margin=self.guidance_margin,
         )
 
     def update_pose(self):
@@ -1017,6 +1037,8 @@ def run_comparison(args, mj_model, dataset, generator, maze: MazeLayout):
             blend=not args.no_blend,
             traj_bias_pos=args.traj_bias_pos,
             traj_bias_rot=args.traj_bias_rot,
+            guidance_scale=args.guidance_scale,
+            guidance_margin=args.guidance_margin,
             cfg_count=args.cfg_count,
             applyframes=args.applyframes,
             inertialize=(args.inertialize == "on"),
@@ -1240,8 +1262,14 @@ def get_args():
     p.add_argument("--max-range",     type=float, default=2.0)
     p.add_argument("--past-frames",   type=int,   default=10)
     p.add_argument("--future-frames", type=int,   default=45)
-    p.add_argument("--no-blend",       action="store_true",
+    p.add_argument("--no-blend",        action="store_true",
                    help="Disable trajectory blending; feed raw waypoint path directly to the model")
+    p.add_argument("--guidance-scale",  type=float, default=0.0,
+                   help="SDF obstacle-avoidance guidance strength (0 = off). "
+                        "Adds ∇_x(−E) to each denoising step where E is the "
+                        "hinge-loss penetration energy. Try 1–10.")
+    p.add_argument("--guidance-margin", type=float, default=0.3,
+                   help="Minimum clearance in metres used by SDF guidance (default 0.3)")
     p.add_argument("--traj-bias-pos",  type=float, default=0.4,
                    help="Position blend exponent: higher = trajectory pulled more toward waypoints")
     p.add_argument("--traj-bias-rot",  type=float, default=2.2,
@@ -1378,6 +1406,8 @@ def main():
         blend=not args.no_blend,
         traj_bias_pos=args.traj_bias_pos,
         traj_bias_rot=args.traj_bias_rot,
+        guidance_scale=args.guidance_scale,
+        guidance_margin=args.guidance_margin,
         cfg_count=args.cfg_count,
         applyframes=args.applyframes,
         inertialize=(args.inertialize == "on"),
