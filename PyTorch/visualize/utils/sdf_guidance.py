@@ -143,11 +143,21 @@ def make_obstacle_cond_fn(
 
     def cond_fn(x, t, p_mean_var, **kwargs):
         """
-        Compute  ∇_x log p(safe | x_t)  for obstacle avoidance.
+        Compute  ∇ log p(safe | x_t)  for obstacle avoidance.
+
+        Strategy: detach pred_xstart from the model's computation graph and
+        re-attach it as a fresh leaf.  This means the gradient flows only
+        through the SDF computation (a few tensor ops), NOT through the entire
+        transformer – avoids vanishing gradients over many attention layers.
+
+        The approximation is:
+            ∂E/∂x_t  ≈  ∂E/∂pred_xstart          (Jacobian-free approximation)
+        which is accurate up to a timestep-dependent scalar (sqrt_recip_alpha)
+        that is absorbed into the guidance scale.
 
         Parameters
         ----------
-        x          : (B, 31, 6, T)  noisy sample with requires_grad=True
+        x          : (B, 31, 6, T)  noisy sample
         t          : timestep tensor
         p_mean_var : dict from p_mean_variance(); must contain 'pred_xstart'
         **kwargs   : ignored extra model conditioning inputs
@@ -157,20 +167,24 @@ def make_obstacle_cond_fn(
         gradient : tensor matching x.shape
             Added to the denoising mean as  new_mean += variance * gradient.
         """
-        pred_xstart = p_mean_var["pred_xstart"]   # (B, 31, 6, T)
+        with torch.enable_grad():
+            # Detach from model graph; only SDF path contributes to gradient.
+            pred = p_mean_var["pred_xstart"].detach().requires_grad_(True)
 
-        # Joint slot 30, features 0–1 = relative XY (see qpos_to_model_format)
-        xy_rel   = pred_xstart[:, 30, :2, :]              # (B, 2, T)
-        xy_world = xy_rel + curr_xy_t.view(1, 2, 1)       # (B, 2, T) world coords
+            # Joint slot 30, features 0–1 = relative XY (qpos_to_model_format)
+            xy_rel   = pred[:, 30, :2, :]                # (B, 2, T)
+            xy_world = xy_rel + curr_xy_t.view(1, 2, 1)  # (B, 2, T) world coords
 
-        sdf_min = _min_box_sdf(xy_world)                   # (B, T)
+            sdf_min   = _min_box_sdf(xy_world)            # (B, T)
+            violation = torch.clamp(margin - sdf_min, min=0.0) ** 2
+            energy    = violation.sum()
 
-        # Hinge loss: squared penalty for any point inside the safety margin
-        violation = torch.clamp(margin - sdf_min, min=0.0) ** 2
-        energy    = violation.sum()
+            if energy.item() == 0.0:
+                return torch.zeros_like(x)   # no violation – skip backward
 
-        # ∇_x (−E)  →  guidance nudges denoising away from obstacles
-        (grad,) = torch.autograd.grad(energy, x)
-        return -scale * grad
+            (grad_pred,) = torch.autograd.grad(energy, pred)
+
+        # grad_pred has same shape as x; non-zero only at [:, 30, :2, :]
+        return -scale * grad_pred
 
     return cond_fn

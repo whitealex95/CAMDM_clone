@@ -576,9 +576,13 @@ class SensorMotionGenerator:
                 margin=guidance_margin, scale=guidance_scale,
             )
 
-        shape = (1, 31, self.per_rot_feat, self.future_frames)
+        shape    = (1, 31, self.per_rot_feat, self.future_frames)
         use_grad = cond_fn is not None
-        with torch.no_grad():
+        # When cond_fn is active we need enable_grad (p_sample_with_grad rebuilds
+        # the graph inside its own th.enable_grad block).  When guidance is off,
+        # use no_grad for speed.
+        grad_ctx = torch.enable_grad() if use_grad else torch.no_grad()
+        with grad_ctx:
             if self.sampler == 'ddim':
                 out = self.diffusion.ddim_sample_loop(
                     self.model, shape, clip_denoised=False,
