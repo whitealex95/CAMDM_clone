@@ -44,6 +44,7 @@ import numpy as np
 import mujoco
 import mujoco.viewer
 import torch
+import imageio.v2 as imageio
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -378,12 +379,11 @@ class DemoPlayerEnv:
         w = self._window_idx()
         if w == self._last_obs_window:
             return
-        w_start = w * self.obstacle_interval
-        w_end   = min(w_start + self.obstacle_interval, self.current_motion_data.num_frames)
-        la_end  = min(w_end + self.obstacle_interval, self.current_motion_data.num_frames)
-        all_q   = self.current_motion_data.get_all_qpos()
-        win_xy  = all_q[w_start:w_end, :2]
-        la_xy   = all_q[w_end:la_end, :2] if la_end > w_end else None
+        # Use actual robot positions (qpos_history) as safe zone,
+        # with future_traj waypoints as lookahead — avoids placing
+        # obstacles where the robot actually is, not where GT says it is.
+        win_xy = np.array(self.qpos_history)[:, :2]
+        la_xy  = self.future_traj[:, :2] if hasattr(self, 'future_traj') and self.future_traj is not None else None
 
         self.generator_obs.seed(self.current_motion_idx * 1000 + w)
         self.obstacles = self.generator_obs.generate_for_window(win_xy, la_xy)
@@ -391,12 +391,8 @@ class DemoPlayerEnv:
 
     def force_new_obstacles(self):
         self.generator_obs.seed(int(time.time() * 1000) % 1_000_000)
-        w_start = self._window_idx() * self.obstacle_interval
-        w_end   = min(w_start + self.obstacle_interval, self.current_motion_data.num_frames)
-        la_end  = min(w_end + self.obstacle_interval, self.current_motion_data.num_frames)
-        all_q   = self.current_motion_data.get_all_qpos()
-        win_xy  = all_q[w_start:w_end, :2]
-        la_xy   = all_q[w_end:la_end, :2] if la_end > w_end else None
+        win_xy = np.array(self.qpos_history)[:, :2]
+        la_xy  = self.future_traj[:, :2] if hasattr(self, 'future_traj') and self.future_traj is not None else None
         self.obstacles = self.generator_obs.generate_for_window(win_xy, la_xy)
         print(f"Regenerated {len(self.obstacles)} obstacles  (mode={self.obstacle_mode})")
 
@@ -534,8 +530,9 @@ class DemoPlayerEnv:
     # Rendering
     # ------------------------------------------------------------------
 
-    def render(self, scene):
-        scene.ngeom = 0
+    def render(self, scene, clear=True):
+        if clear:
+            scene.ngeom = 0
 
         if self.show_trajectory and hasattr(self, 'past_traj'):
             draw_trajectory(scene, self.past_traj, self.past_orient,
@@ -644,7 +641,7 @@ def get_args():
     p.add_argument("--dataset",    default="lafan1_g1")
     p.add_argument("--checkpoint", default="save/camdm_g1_env_lafan1_g1_env/best.pt",
                    help="Path to MotionDiffusionEnv checkpoint")
-    p.add_argument("--mode",  default="sparse", choices=["sparse", "dense", "packed"],
+    p.add_argument("--mode",  default="sparse", choices=["sparse", "dense", "compact"],
                    help="Obstacle density mode (default: sparse)")
     p.add_argument("--obstacle-interval", type=int, default=30)
     p.add_argument("--resolution", type=int,   default=9)
@@ -776,21 +773,45 @@ def main():
     if args.motion > 0:
         player.load_motion(args.motion)
 
+    # ── Video recording (always on) ────────────────────────────────────────
+    os.makedirs("videos", exist_ok=True)
+    video_path = "videos/demo_avoid2d.mp4"
+    W, H = 640, 320
+    FPS  = player.fps
+    writer   = imageio.get_writer(video_path, fps=FPS, codec="libx264", pixelformat="yuv420p")
+    renderer = mujoco.Renderer(mj_model, height=H, width=W)
+    frame_last_time = -np.inf
+    print(f"\nRecording → {video_path}  ({W}×{H} @ {FPS}fps)")
+
     print_instructions()
 
     with mujoco.viewer.launch_passive(
         mj_model, mj_data,
         key_callback=lambda kc: key_callback(player, kc),
     ) as viewer:
+        viewer.cam.distance=6.0
         viewer.sync()
-        while viewer.is_running():
-            player.step()
-            viewer.user_scn.ngeom = 0
-            player.render(viewer.user_scn)
-            if player.camera_follow:
-                viewer.cam.lookat[:] = mj_data.qpos[:3]
-            viewer.sync()
-            time.sleep(0.001)
+        try:
+            while viewer.is_running():
+                player.step()
+                viewer.user_scn.ngeom = 0
+                player.render(viewer.user_scn)
+                if player.camera_follow:
+                    viewer.cam.lookat[:] = mj_data.qpos[:3]
+                viewer.sync()
+
+                if time.time() - frame_last_time > 1.0 / FPS:
+                    renderer.update_scene(mj_data, camera=viewer.cam)
+                    player.render(renderer.scene, clear=False)
+                    writer.append_data(renderer.render())
+                    frame_last_time = time.time()
+
+                time.sleep(0.001)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            writer.close()
+            print(f"Video saved: {video_path}")
 
 
 if __name__ == "__main__":
