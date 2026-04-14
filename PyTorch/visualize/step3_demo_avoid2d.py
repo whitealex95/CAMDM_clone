@@ -775,7 +775,7 @@ def main():
 
     # ── Video recording (always on) ────────────────────────────────────────
     os.makedirs("videos", exist_ok=True)
-    video_path = "videos/demo_avoid2d.mp4"
+    video_path = f"videos/demo_avoid2d_{time.strftime('%m%d_%H%M')}.mp4"
     W, H = 640, 320
     FPS  = player.fps
     writer   = imageio.get_writer(video_path, fps=FPS, codec="libx264", pixelformat="yuv420p")
