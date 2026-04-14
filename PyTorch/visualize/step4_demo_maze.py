@@ -38,11 +38,14 @@ import argparse
 import time
 from collections import deque
 
+import heapq
+
 import numpy as np
 import mujoco
 import mujoco.viewer
 import torch
 import imageio.v2 as imageio
+from scipy.interpolate import splprep, splev
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -54,8 +57,10 @@ from diffusion.create_diffusion import create_gaussian_diffusion
 from visualize.motion_loader import MotionDataset
 from visualize.utils.geometry import (
     draw_trajectory,
+    draw_trajectory_lines,
     draw_sensor_readings,
     draw_obstacle_box,
+    draw_label,
 )
 from visualize.utils.transition_manager import create_transition_manager
 from visualize.utils.trajectory import blend_trajectory, extend_future_traj_heusristic
@@ -102,124 +107,286 @@ def _yaw_to_quat(yaw: float) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Maze layout
+# Maze layout  –  two rooms + narrow corridor
 # ---------------------------------------------------------------------------
+
+def _astar_path(
+    open_rects: list,
+    start: np.ndarray,
+    goal: np.ndarray,
+    resolution: float = 0.1,
+    robot_radius: float = 0.15,
+) -> np.ndarray:
+    """
+    8-directional A* path planner in the local frame.
+
+    Cells inside ``open_rects`` (eroded by ``robot_radius``) are passable;
+    everything else is a wall.
+
+    Returns an (N, 2) array of path points in local frame.
+    Falls back to a direct straight line if no path is found.
+    """
+    margin = 0.5
+    x_lo = min(r[0] for r in open_rects) - margin
+    x_hi = max(r[1] for r in open_rects) + margin
+    y_lo = min(r[2] for r in open_rects) - margin
+    y_hi = max(r[3] for r in open_rects) + margin
+
+    res = float(resolution)
+    nx  = int(np.ceil((x_hi - x_lo) / res)) + 1
+    ny  = int(np.ceil((y_hi - y_lo) / res)) + 1
+
+    # Build passable-cell mask (vectorised)
+    gx, gy = np.meshgrid(
+        x_lo + np.arange(nx) * res,
+        y_lo + np.arange(ny) * res,
+        indexing='ij',
+    )
+    passable = np.zeros((nx, ny), dtype=bool)
+    r = robot_radius
+    for (rxlo, rxhi, rylo, ryhi) in open_rects:
+        passable |= (gx >= rxlo + r) & (gx <= rxhi - r) & \
+                    (gy >= rylo + r) & (gy <= ryhi - r)
+
+    def to_idx(p):
+        ix = int(round((float(p[0]) - x_lo) / res))
+        iy = int(round((float(p[1]) - y_lo) / res))
+        return np.clip(ix, 0, nx - 1), np.clip(iy, 0, ny - 1)
+
+    def to_xy(ix, iy):
+        return np.array([x_lo + ix * res, y_lo + iy * res])
+
+    si, gi = to_idx(start), to_idx(goal)
+
+    dirs  = [(1,0),(0,1),(-1,0),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
+    costs = [res]*4 + [res * 1.41421]*4
+
+    g_cost = {si: 0.0}
+    parent: dict = {}
+    tie   = 0
+    heap  = [(np.hypot(si[0]-gi[0], si[1]-gi[1]) * res, tie, si)]
+
+    while heap:
+        _, _, cur = heapq.heappop(heap)
+        if cur == gi:
+            path = []
+            while cur in parent:
+                path.append(to_xy(*cur))
+                cur = parent[cur]
+            path.append(to_xy(*si))
+            return np.array(path[::-1])
+        for (dx, dy), c in zip(dirs, costs):
+            nb = (cur[0] + dx, cur[1] + dy)
+            if not (0 <= nb[0] < nx and 0 <= nb[1] < ny):
+                continue
+            if not passable[nb]:
+                continue
+            ng = g_cost[cur] + c
+            if nb not in g_cost or ng < g_cost[nb]:
+                g_cost[nb] = ng
+                parent[nb] = cur
+                tie += 1
+                f = ng + np.hypot(nb[0]-gi[0], nb[1]-gi[1]) * res
+                heapq.heappush(heap, (f, tie, nb))
+
+    return np.array([start, goal])   # fallback
+
+
+def _spline_waypoints(
+    astar_pts: np.ndarray,
+    spacing: float,
+    n_ctrl: int = 30,
+    s_smooth: float = 0.3,
+) -> np.ndarray:
+    """
+    Smooth an A* path with a parametric cubic spline and resample at ``spacing``.
+
+    1. Coarsen to ``n_ctrl`` control points (uniform re-sampling).
+    2. Fit ``splprep`` spline with smoothing ``s_smooth * n_ctrl``.
+    3. Evaluate at uniform arc-length steps of ``spacing`` m.
+    """
+    # Coarsen
+    idx  = np.round(np.linspace(0, len(astar_pts) - 1, n_ctrl)).astype(int)
+    ctrl = astar_pts[idx]
+
+    # Remove consecutive duplicates
+    keep = np.concatenate([[True], np.any(np.diff(ctrl, axis=0) != 0, axis=1)])
+    ctrl = ctrl[keep]
+    if len(ctrl) < 4:
+        return ctrl
+
+    try:
+        tck, _ = splprep([ctrl[:, 0], ctrl[:, 1]],
+                         s=s_smooth * len(ctrl), k=3)
+    except Exception:
+        return ctrl
+
+    # Estimate total arc length via dense evaluation, then resample
+    u_dense = np.linspace(0, 1, max(500, int(len(astar_pts) * 2)))
+    xy_dense = np.column_stack(splev(u_dense, tck))
+    arc = np.concatenate([[0.0],
+                           np.cumsum(np.linalg.norm(np.diff(xy_dense, axis=0), axis=1))])
+    n_pts = max(2, int(arc[-1] / spacing))
+    u_uniform = np.interp(np.linspace(0, arc[-1], n_pts), arc, u_dense)
+    return np.column_stack(splev(u_uniform, tck))
+
 
 class MazeLayout:
     """
-    L-shaped corridor maze centred on the robot's initial position.
+    Two large rooms connected by a single narrow corridor (top area).
 
-    Local frame:
-        x = forward  (aligned with ``initial_yaw`` in world)
-        y = left      (CCW perpendicular)
+    Local frame  (x = initial heading forward, y = left):
 
-    Corridor A: x ∈ [0, la],     y ∈ [-hw, hw]  → robot walks in +x
-    At the end the robot turns left (into +y) and enters:
-    Corridor B: x ∈ [la-hw, la+hw], y ∈ [0, lb]  → robot walks in +y
+        ┌──────────────┐  ┌──┐  ┌──────────────┐
+        │              │  │  │  │              │
+        │  Left room   │  │co│  │  Right room  │
+        │    (Goal)    │  │rr│  │   (Start)    │
+        │              │  │  │  │              │
+        └──────────────┘  └──┘  └──────────────┘
+          x ∈ [x_l, x_l+rw]  corridor  x ∈ [0, rw]
+
+    Walls are flood-filled with a tight box grid so every sensor sphere
+    that lands outside a room or the corridor reads ≥ 1 (fully red).
 
     Parameters
     ----------
-    origin      : (2,) world XY of the maze start (robot's initial XY).
-    initial_yaw : Robot's initial heading in radians (CCW from world +X).
-    hw          : Corridor half-width (metres, default 0.5 → 1.0 m total).
-    wt          : Wall half-thickness (metres, default 0.15 → 0.3 m total).
-    la          : Length of Corridor A in metres.
-    lb          : Length of Corridor B in metres.
-    spacing     : Waypoint spacing in metres.
+    origin        : (2,) world XY that maps to local (0, 0).
+                    Pass ``init_xy - R @ start_local`` so the robot's initial
+                    world position coincides with the first waypoint.
+    initial_yaw   : Robot heading in radians (CCW from world +X).
+    room_w        : Room width in the x direction (metres).
+    room_h        : Room height in the y direction (metres).
+    corridor_len  : Length of the corridor in the x direction (metres).
+    corridor_hw   : Half-width of the corridor in the y direction (metres).
+    corridor_y    : Y-centre of the corridor (offset from room centre, metres).
+    grid_spacing  : Box grid pitch for flood-fill walls (metres).
+    box_half      : Half-extent of each wall box (metres).  Should be
+                    ≥ grid_spacing/2 so boxes tile flush with no gaps.
+    wp_spacing    : Waypoint spacing (metres).
     """
+
+    # These define where on the path the robot starts and ends (local frame).
+    # start_local is (room_w * START_FRAC, 0); goal_local is in the left room.
+    START_FRAC = 0.75   # fraction of room_w → start near the right side of right room
+    GOAL_FRAC  = 0.25   # fraction of room_w → goal near the right side of left room
 
     def __init__(
         self,
         origin: np.ndarray,
         initial_yaw: float,
-        hw: float = 0.7,
-        wt: float = 0.15,
-        la: float = 5.0,
-        lb: float = 5.0,
-        spacing: float = 0.05,
+        room_w: float = 4.0,
+        room_h: float = 4.0,
+        corridor_len: float = 1.5,
+        corridor_hw: float = 0.45,
+        corridor_y: float = 1.0,
+        grid_spacing: float = 0.5,
+        box_half: float = 0.26,
+        wp_spacing: float = 0.05,
     ):
         self.origin      = np.asarray(origin[:2], dtype=np.float64)
         self.initial_yaw = float(initial_yaw)
-        self.hw = hw
-        self.wt = wt
-        self.la = la
-        self.lb = lb
 
         c, s = np.cos(initial_yaw), np.sin(initial_yaw)
         self._R = np.array([[c, -s], [s, c]], dtype=np.float64)
 
-        self.walls     = self._build_walls()
-        self.waypoints = self._build_waypoints(spacing)
+        self.room_w       = float(room_w)
+        self.room_h       = float(room_h)
+        self.corridor_len = float(corridor_len)
+        self.corridor_hw  = float(corridor_hw)
+        self.corridor_y   = float(corridor_y)
+
+        # Local-frame positions of the three open areas:
+        #   Right room :  x ∈ [0, rw],                      y ∈ [-rh/2, rh/2]
+        #   Corridor   :  x ∈ [rw, rw+cl],                  y ∈ [cy-chw, cy+chw]
+        #   Left room  :  x ∈ [rw+cl, 2*rw+cl],             y ∈ [-rh/2, rh/2]
+        rw, rh, cl  = room_w, room_h, corridor_len
+        chw, cy     = corridor_hw, corridor_y
+        rhw         = rh / 2.0
+        x_left_lo   = rw + cl
+
+        self._open_rects = [           # (xlo, xhi, ylo, yhi) in local frame
+            (0.0,       rw,           -rhw,         rhw),          # right room
+            (rw,        rw + cl,       cy - chw,    cy + chw),     # corridor
+            (x_left_lo, x_left_lo+rw, -rhw,         rhw),          # left room
+        ]
+
+        self.walls     = self._flood_fill(grid_spacing, box_half)
+        self.waypoints = self._build_waypoints(rw, cl, wp_spacing)
         self.goal_xy   = self.waypoints[-1].copy()
 
-        print(f"Maze:  {len(self.walls)} walls, {len(self.waypoints)} waypoints")
-        print(f"  Start: {self.origin},  Yaw: {np.degrees(initial_yaw):.1f}°")
-        print(f"  Goal:  {self.goal_xy}")
+        print(f"Maze:  {len(self.walls)} wall boxes, {len(self.waypoints)} waypoints")
+        print(f"  Origin: {self.origin},  Yaw: {np.degrees(initial_yaw):.1f}°")
+        print(f"  Goal:   {self.goal_xy}")
 
     # ------------------------------------------------------------------
 
     def _w(self, local_xy: np.ndarray) -> np.ndarray:
-        """Local → world transform (vectorised)."""
+        """Local → world (vectorised)."""
         a = np.asarray(local_xy, dtype=np.float64)
         if a.ndim == 1:
             return self._R @ a + self.origin
         return (self._R @ a.T).T + self.origin
 
-    def _build_walls(self) -> list:
-        hw, wt, la, lb = self.hw, self.wt, self.la, self.lb
-        y0 = self.initial_yaw
+    def _flood_fill(self, gs: float, h: float) -> list:
+        """
+        Place axis-aligned box obstacles on a regular grid, omitting any box
+        whose footprint overlaps one of the three open rectangles.
 
-        # Each entry: (cx_local, cy_local, hx_local, hy_local)
-        walls_local = [
-            # ── Corridor A ───────────────────────────────────────────────
-            # South wall  (inner edge y = -hw, runs along full A + east side)
-            ((la + hw) / 2,
-             -(hw + wt),
-             (la + hw) / 2 + wt,
-             wt),
-            # North wall of A  (inner edge y = +hw, only until the turn at x = la-hw)
-            ((la - hw) / 2 - wt / 2,
-             hw + wt,
-             (la - hw) / 2 + wt / 2,
-             wt),
-            # ── Corridor B ───────────────────────────────────────────────
-            # West wall of B  (inner edge x = la-hw, y ∈ [hw, lb])
-            (la - hw - wt,
-             (hw + lb) / 2 + wt / 2,
-             wt,
-             (lb - hw) / 2 + wt / 2),
-            # East wall of B  (inner edge x = la+hw, also closes east end of A)
-            (la + hw + wt,
-             (lb - hw) / 2 - wt / 2,
-             wt,
-             (lb + hw) / 2 + wt),
-            # Top wall of B  (inner edge y = lb)
-            (la,
-             lb + wt,
-             hw + wt,
-             wt),
-            # ── Caps ─────────────────────────────────────────────────────
-            # Start cap  (closes corridor A at x ≈ 0)
-            (-wt,
-             0.0,
-             wt,
-             hw + wt),
+        The grid extends ``sensor_buffer`` beyond the open area so the robot's
+        sensor is fully occluded in every direction outside the rooms.
+        """
+        sensor_buffer = 2.5  # slightly larger than max sensor range (2.0 m)
+
+        xs_lo = min(r[0] for r in self._open_rects) - sensor_buffer
+        xs_hi = max(r[1] for r in self._open_rects) + sensor_buffer
+        ys_lo = min(r[2] for r in self._open_rects) - sensor_buffer
+        ys_hi = max(r[3] for r in self._open_rects) + sensor_buffer
+
+        xs = np.arange(xs_lo, xs_hi + gs * 0.5, gs)
+        ys = np.arange(ys_lo, ys_hi + gs * 0.5, gs)
+        gx, gy = np.meshgrid(xs, ys)
+        pts = np.stack([gx.ravel(), gy.ravel()], axis=1)  # (N, 2) local
+
+        # Mark points whose box [cx-h, cx+h]×[cy-h, cy+h] overlaps any open rect
+        in_open = np.zeros(len(pts), dtype=bool)
+        for (xlo, xhi, ylo, yhi) in self._open_rects:
+            in_open |= (
+                (pts[:, 0] + h > xlo) & (pts[:, 0] - h < xhi) &
+                (pts[:, 1] + h > ylo) & (pts[:, 1] - h < yhi)
+            )
+
+        wall_pts_local = pts[~in_open]
+        half = np.array([h, h], dtype=np.float64)
+        return [
+            BoxObstacle(self._w(p), half, self.initial_yaw)
+            for p in wall_pts_local
         ]
 
-        obstacles = []
-        for cx_l, cy_l, hx_l, hy_l in walls_local:
-            cw = self._w(np.array([cx_l, cy_l]))
-            obstacles.append(BoxObstacle(cw, np.array([hx_l, hy_l]), y0))
-        return obstacles
+    def _build_waypoints(
+        self, rw, cl, spacing
+    ) -> np.ndarray:
+        """
+        Plan a path in local frame using A* through the open rectangles,
+        then smooth with a parametric cubic spline.
 
-    def _build_waypoints(self, spacing: float) -> np.ndarray:
-        la, lb = self.la, self.lb
-        n_a = max(2, int(la / spacing) + 1)
-        n_b = max(2, int(lb / spacing) + 1)
+        Path shape (arch):
+          Start (right room, y=0) → arc up through corridor (y≈cy) → Goal (left room, y=0)
+        """
+        sx = rw * self.START_FRAC           # start x in right room
+        gx = rw + cl + rw * self.GOAL_FRAC  # goal x in left room
 
-        wp_a = np.column_stack([np.linspace(0, la, n_a), np.zeros(n_a)])
-        wp_b = np.column_stack([np.full(n_b, la), np.linspace(0, lb, n_b)])
-        local = np.vstack([wp_a, wp_b[1:]])   # skip duplicate junction point
+        start_local = np.array([sx,  0.0])
+        goal_local  = np.array([gx,  0.0])
+
+        astar_pts = _astar_path(
+            self._open_rects,
+            start_local,
+            goal_local,
+            resolution=0.1,
+            robot_radius=0.0,   # path is a reference only; model handles avoidance
+        )
+        self.astar_pts_world = self._w(astar_pts)   # store for visualization
+        local = _spline_waypoints(astar_pts, spacing)
         return self._w(local)
 
 
@@ -689,13 +856,40 @@ class DemoPlayerMaze:
             for obs in self.obstacles:
                 if isinstance(obs, BoxObstacle):
                     draw_obstacle_box(scene, obs.center, obs.half_extents, obs.yaw,
-                                      height=1.8, color=[0.55, 0.55, 0.55, 0.7])
+                                      height=0.8, color=[0.55, 0.55, 0.55, 0.7])
+
+        # Yellow line – full A* planned path (start → corridor → goal)
+        if self.show_trajectory and hasattr(self.maze, 'astar_pts_world'):
+            apts = self.maze.astar_pts_world
+            apts3 = np.hstack([apts, np.full((len(apts), 1), 0.04)])
+            draw_trajectory_lines(scene, apts3, color=[1.0, 0.85, 0.0, 0.9])
 
         if self.show_sensor:
             draw_sensor_readings(
                 scene, self.mj_data.qpos[:3], self.readings, self.sphere_centers,
                 z_height=0.08, dot_radius=0.04, draw_lines=self.draw_lines,
             )
+
+        # Sensor ON/OFF indicator: colored sphere + label above robot's head
+        if scene.ngeom < scene.maxgeom - 1:
+            robot_pos = self.mj_data.qpos[:3].copy()
+            indicator_pos = robot_pos + np.array([0.0, 0.0, 1.6])
+            if self.zero_sensor:
+                ind_color = np.array([1.0, 0.15, 0.15, 0.95], dtype=np.float32)
+                label_text = "SENSOR: OFF"
+            else:
+                ind_color = np.array([0.15, 1.0, 0.15, 0.95], dtype=np.float32)
+                label_text = "SENSOR: ON"
+            mujoco.mjv_initGeom(
+                scene.geoms[scene.ngeom],
+                type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                size=np.array([0.12, 0.12, 0.12], dtype=np.float64),
+                pos=indicator_pos,
+                mat=np.eye(3).flatten(),
+                rgba=ind_color,
+            )
+            scene.ngeom += 1
+            draw_label(scene, indicator_pos + np.array([0.0, 0.0, 0.25]), label_text)
 
     # ------------------------------------------------------------------
     # Toggles
@@ -784,12 +978,16 @@ def get_args():
     p.add_argument("--checkpoint",    default="save/camdm_g1_env/best.pt")
     p.add_argument("--motion",        type=int,   default=0,
                    help="Motion clip index from dataset (for initial pose & style)")
-    p.add_argument("--corridor-hw",   type=float, default=0.5,
-                   help="Corridor half-width in metres (default 0.5 → 1.0 m wide)")
-    p.add_argument("--corridor-a",    type=float, default=5.0,
-                   help="Length of corridor A (forward arm) in metres")
-    p.add_argument("--corridor-b",    type=float, default=5.0,
-                   help="Length of corridor B (left-turn arm) in metres")
+    p.add_argument("--room-w",        type=float, default=4.0,
+                   help="Room width in the forward (x) direction, metres")
+    p.add_argument("--room-h",        type=float, default=4.0,
+                   help="Room height in the lateral (y) direction, metres")
+    p.add_argument("--corridor-len",  type=float, default=1.5,
+                   help="Corridor length (x direction) in metres")
+    p.add_argument("--corridor-hw",   type=float, default=0.45,
+                   help="Corridor half-width (y direction) in metres (default 0.45 → 0.9 m)")
+    p.add_argument("--corridor-y",    type=float, default=1.0,
+                   help="Y-offset of corridor centre from room centre, metres")
     p.add_argument("--speed",         type=float, default=0.7,
                    help="Path-following speed in m/s: controls how fast the red-arrow waypoints advance. "
                         "Increase (e.g. 1.0–1.5) to pull the robot faster along the corridor.")
@@ -889,18 +1087,27 @@ def main():
         device=device, sampler=args.sampler,
     )
 
-    # ── Build maze relative to robot's initial position & heading ──────────
-    motion_idx  = args.motion % len(dataset)
-    init_qpos   = dataset[motion_idx].get_qpos(0)
-    init_xy     = init_qpos[:2].copy()
-    init_yaw    = quat_wxyz_to_yaw(init_qpos[3:7])
+    # ── Build maze so that robot's initial position = first waypoint ──────────
+    motion_idx = args.motion % len(dataset)
+    init_qpos  = dataset[motion_idx].get_qpos(0)
+    init_xy    = init_qpos[:2].copy()
+    init_yaw   = quat_wxyz_to_yaw(init_qpos[3:7])
+
+    # start_local: where the first waypoint sits in the maze's local frame
+    # = right-side centre of the right room (room_w * START_FRAC, 0)
+    c_y, s_y = np.cos(init_yaw), np.sin(init_yaw)
+    R_mat    = np.array([[c_y, -s_y], [s_y, c_y]])
+    start_local = np.array([args.room_w * MazeLayout.START_FRAC, 0.0])
+    maze_origin = init_xy - R_mat @ start_local   # local (0,0) in world
 
     maze = MazeLayout(
-        origin=init_xy,
+        origin=maze_origin,
         initial_yaw=init_yaw,
-        hw=args.corridor_hw,
-        la=args.corridor_a,
-        lb=args.corridor_b,
+        room_w=args.room_w,
+        room_h=args.room_h,
+        corridor_len=args.corridor_len,
+        corridor_hw=args.corridor_hw,
+        corridor_y=args.corridor_y,
     )
     path = PathController(
         waypoints=maze.waypoints,
