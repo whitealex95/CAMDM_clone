@@ -64,7 +64,6 @@ from visualize.utils.geometry import (
 )
 from visualize.utils.transition_manager import create_transition_manager
 from visualize.utils.trajectory import blend_trajectory, extend_future_traj_heusristic
-from visualize.utils.sdf_guidance import make_obstacle_cond_fn
 from utils.environment_sensor import (
     EnvironmentSensor,
     BoxObstacle,
@@ -515,8 +514,6 @@ class SensorMotionGenerator:
         style_idx: int,
         obstacles: list,
         zero_sensor: bool = False,
-        guidance_scale: float = 0.0,
-        guidance_margin: float = 0.3,
     ) -> np.ndarray:
         """
         Args
@@ -568,34 +565,19 @@ class SensorMotionGenerator:
             y={},
         )
 
-        # SDF guidance: build cond_fn if guidance_scale > 0
-        cond_fn = None
-        if guidance_scale > 0.0 and obstacles:
-            cond_fn = make_obstacle_cond_fn(
-                obstacles, curr_xy, device=self.device,
-                margin=guidance_margin, scale=guidance_scale,
-            )
-
-        shape    = (1, 31, self.per_rot_feat, self.future_frames)
-        use_grad = cond_fn is not None
-        # When cond_fn is active we need enable_grad (p_sample_with_grad rebuilds
-        # the graph inside its own th.enable_grad block).  When guidance is off,
-        # use no_grad for speed.
-        grad_ctx = torch.enable_grad() if use_grad else torch.no_grad()
-        with grad_ctx:
+        shape = (1, 31, self.per_rot_feat, self.future_frames)
+        with torch.no_grad():
             if self.sampler == 'ddim':
                 out = self.diffusion.ddim_sample_loop(
                     self.model, shape, clip_denoised=False,
                     model_kwargs=model_kwargs, progress=False, eta=0.0,
                     device=self.device,
-                    cond_fn=cond_fn, cond_fn_with_grad=use_grad,
                 )
             else:
                 out = self.diffusion.p_sample_loop(
                     self.model, shape, clip_denoised=False,
                     model_kwargs=model_kwargs, progress=False,
                     device=self.device,
-                    cond_fn=cond_fn, cond_fn_with_grad=use_grad,
                 )
 
         out = out.squeeze(0).permute(2, 0, 1).cpu().numpy()
@@ -629,8 +611,6 @@ class DemoPlayerMaze:
         blend: bool = True,            # False = skip blending, use raw waypoint
         traj_bias_pos: float = 0.4,   # position blend exponent (higher = more waypoint-biased)
         traj_bias_rot: float = 2.2,   # rotation blend exponent
-        guidance_scale: float = 0.0,  # SDF guidance strength (0 = off)
-        guidance_margin: float = 0.3, # minimum clearance in metres for guidance
         cfg_count: int = 2,
         applyframes: int = 15,
         inertialize: bool = True,
@@ -693,9 +673,7 @@ class DemoPlayerMaze:
         # Blend parameters
         self.blend         = bool(blend)
         self.traj_bias_pos = float(traj_bias_pos)
-        self.traj_bias_rot    = float(traj_bias_rot)
-        self.guidance_scale   = float(guidance_scale)
-        self.guidance_margin  = float(guidance_margin)
+        self.traj_bias_rot = float(traj_bias_rot)
 
         # Trajectory state (filled by _update_traj)
         self.future_traj_waypoint = None   # raw waypoint path  (red)
@@ -782,8 +760,6 @@ class DemoPlayerMaze:
             self.style_idx,
             self.obstacles,
             zero_sensor=self.zero_sensor,
-            guidance_scale=self.guidance_scale,
-            guidance_margin=self.guidance_margin,
         )
 
     def update_pose(self):
@@ -1041,8 +1017,6 @@ def run_comparison(args, mj_model, dataset, generator, maze: MazeLayout):
             blend=not args.no_blend,
             traj_bias_pos=args.traj_bias_pos,
             traj_bias_rot=args.traj_bias_rot,
-            guidance_scale=args.guidance_scale,
-            guidance_margin=args.guidance_margin,
             cfg_count=args.cfg_count,
             applyframes=args.applyframes,
             inertialize=(args.inertialize == "on"),
@@ -1180,15 +1154,37 @@ def _save_comparison_figure(
     fig, ax = plt.subplots(figsize=(13, 7))
 
     # ── Maze geometry ────────────────────────────────────────────────────
-    # Draw each open rectangle as a light patch (rotated if initial_yaw ≠ 0)
+    # Draw open rectangles as light fill (free space)
     for (xlo, xhi, ylo, yhi) in maze._open_rects:
         corners_local = np.array([
             [xlo, ylo], [xhi, ylo], [xhi, yhi], [xlo, yhi],
         ])
         corners_world = maze._w(corners_local)
         poly = MplPolygon(corners_world, closed=True,
-                          facecolor='#e8e8e8', edgecolor='#444444',
-                          linewidth=1.8, zorder=1)
+                          facecolor='#e8e8e8', edgecolor='none',
+                          linewidth=0, zorder=1)
+        ax.add_patch(poly)
+
+    # Draw actual BoxObstacle walls (matches simulation exactly)
+    for obs in maze.walls:
+        cx, cy_obs = obs.center[0], obs.center[1]
+        hx, hy = obs.half_extents[0], obs.half_extents[1]
+        yaw = obs.yaw
+        import math
+        corners_world = np.array([
+            [cx - hx, cy_obs - hy],
+            [cx + hx, cy_obs - hy],
+            [cx + hx, cy_obs + hy],
+            [cx - hx, cy_obs + hy],
+        ])
+        if abs(yaw) > 1e-4:
+            c_, s_ = math.cos(yaw), math.sin(yaw)
+            R_ = np.array([[c_, -s_], [s_, c_]])
+            corners_world = ((R_ @ (corners_world - [cx, cy_obs]).T).T
+                             + [cx, cy_obs])
+        poly = MplPolygon(corners_world, closed=True,
+                          facecolor='#aaaaaa', edgecolor='#333333',
+                          linewidth=0.5, zorder=2)
         ax.add_patch(poly)
 
     # ── A* reference path ────────────────────────────────────────────────
@@ -1196,7 +1192,7 @@ def _save_comparison_figure(
         apts = maze.astar_pts_world
         ax.plot(apts[:, 0], apts[:, 1], '--',
                 color='#ccaa00', linewidth=1.5, alpha=0.75,
-                label='A* reference path', zorder=2)
+                label='A* reference path', zorder=3)
 
     # ── Trajectories ─────────────────────────────────────────────────────
     ax.plot(qpos_on[:, 0], qpos_on[:, 1],
@@ -1268,12 +1264,6 @@ def get_args():
     p.add_argument("--future-frames", type=int,   default=45)
     p.add_argument("--no-blend",        action="store_true",
                    help="Disable trajectory blending; feed raw waypoint path directly to the model")
-    p.add_argument("--guidance-scale",  type=float, default=0.0,
-                   help="SDF obstacle-avoidance guidance strength (0 = off). "
-                        "Adds ∇_x(−E) to each denoising step where E is the "
-                        "hinge-loss penetration energy. Try 1–10.")
-    p.add_argument("--guidance-margin", type=float, default=0.3,
-                   help="Minimum clearance in metres used by SDF guidance (default 0.3)")
     p.add_argument("--traj-bias-pos",  type=float, default=0.4,
                    help="Position blend exponent: higher = trajectory pulled more toward waypoints")
     p.add_argument("--traj-bias-rot",  type=float, default=2.2,
@@ -1410,8 +1400,6 @@ def main():
         blend=not args.no_blend,
         traj_bias_pos=args.traj_bias_pos,
         traj_bias_rot=args.traj_bias_rot,
-        guidance_scale=args.guidance_scale,
-        guidance_margin=args.guidance_margin,
         cfg_count=args.cfg_count,
         applyframes=args.applyframes,
         inertialize=(args.inertialize == "on"),
