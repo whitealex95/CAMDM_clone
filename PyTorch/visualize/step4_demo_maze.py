@@ -969,6 +969,251 @@ def key_callback(player: DemoPlayerMaze, keycode: int):
 
 
 # ---------------------------------------------------------------------------
+# Headless comparison utilities
+# ---------------------------------------------------------------------------
+
+def _collect_pass(player: DemoPlayerMaze, max_steps: int = 8000) -> np.ndarray:
+    """
+    Run one full maze pass without real-time throttling.
+
+    Returns
+    -------
+    qpos : (T, 36) array – one row per simulation step (including initial frame).
+    """
+    player.reset()
+    records = [player.mj_data.qpos.copy()]
+    for _ in range(max_steps):
+        qpos = player.mj_data.qpos
+        player.readings, player.sphere_centers = player.sensor.compute(
+            qpos[:3], quat_wxyz_to_yaw(qpos[3:7]), player.obstacles
+        )
+        player.update_pose()
+        records.append(player.mj_data.qpos.copy())
+        if player.path.is_done:
+            break
+    return np.array(records)
+
+
+def run_comparison(args, mj_model, dataset, generator, maze: MazeLayout):
+    """
+    Run sensor-ON and sensor-OFF passes headlessly, then save a side-by-side
+    comparison video:  left = SENSOR ON (green),  right = SENSOR OFF (red).
+    """
+    fps        = 30
+    motion_idx = args.motion % len(dataset)
+
+    def _make_player(mj_data, zero_sensor: bool) -> DemoPlayerMaze:
+        path = PathController(
+            waypoints=maze.waypoints,
+            speed=args.speed,
+            fps=fps,
+            future_frames=args.future_frames,
+        )
+        p = DemoPlayerMaze(
+            mj_model, mj_data, dataset, generator, maze, path,
+            motion_idx=motion_idx,
+            past_frames=args.past_frames,
+            future_frames=args.future_frames,
+            blend=not args.no_blend,
+            traj_bias_pos=args.traj_bias_pos,
+            traj_bias_rot=args.traj_bias_rot,
+            cfg_count=args.cfg_count,
+            applyframes=args.applyframes,
+            inertialize=(args.inertialize == "on"),
+            inertialization_mode=args.inertialization_mode,
+            blendtime_rotation=args.blendtime_rotation,
+            blendtime_position=args.blendtime_position,
+            spring_halflife_position=args.spring_halflife_position,
+            spring_halflife_rotation=args.spring_halflife_rotation,
+        )
+        p.zero_sensor = zero_sensor
+        return p
+
+    # ── Pass 1: sensor ON ─────────────────────────────────────────────────
+    print("\n[Compare] Pass 1 – SENSOR ON …")
+    mj_data_on = mujoco.MjData(mj_model)
+    player_on  = _make_player(mj_data_on, zero_sensor=False)
+    qpos_on    = _collect_pass(player_on)
+    print(f"          {len(qpos_on)} frames recorded")
+
+    # ── Pass 2: sensor OFF ────────────────────────────────────────────────
+    print("[Compare] Pass 2 – SENSOR OFF …")
+    mj_data_off = mujoco.MjData(mj_model)
+    player_off  = _make_player(mj_data_off, zero_sensor=True)
+    qpos_off    = _collect_pass(player_off)
+    print(f"          {len(qpos_off)} frames recorded")
+
+    os.makedirs("videos", exist_ok=True)
+    tag = time.strftime('%m%d_%H%M')
+
+    # ── 2D map figure ────────────────────────────────────────────────────
+    fig_path = f"videos/demo_maze_compare_{tag}.png"
+    _save_comparison_figure(qpos_on, qpos_off, maze, fig_path)
+
+    # ── Side-by-side MP4 ─────────────────────────────────────────────────
+    video_path = f"videos/demo_maze_compare_{tag}.mp4"
+    _save_comparison_video(qpos_on, qpos_off, mj_model, maze, fps, video_path)
+
+
+def _save_comparison_video(
+    qpos_on: np.ndarray,
+    qpos_off: np.ndarray,
+    mj_model,
+    maze: MazeLayout,
+    fps: int,
+    output_path: str,
+    W: int = 640,
+    H: int = 720,
+):
+    """
+    Render a side-by-side MP4:  left = SENSOR ON (green),  right = SENSOR OFF (red).
+    Both panels share a fixed overhead camera centred on the maze.
+    """
+    # Fixed overhead camera
+    cam = mujoco.MjvCamera()
+    mujoco.mjv_defaultCamera(cam)
+    center_local = np.array([maze.room_w + maze.corridor_len * 0.5,
+                              maze.corridor_y * 0.4])
+    center_world = maze._w(center_local)
+    cam.lookat[:] = [center_world[0], center_world[1], 0.4]
+    cam.distance  = 14.0
+    cam.elevation = -65.0
+    cam.azimuth   = float(np.degrees(maze.initial_yaw) - 90.0)
+
+    mj_data_on  = mujoco.MjData(mj_model)
+    mj_data_off = mujoco.MjData(mj_model)
+    ren_on  = mujoco.Renderer(mj_model, height=H, width=W)
+    ren_off = mujoco.Renderer(mj_model, height=H, width=W)
+
+    def _draw_overlay(scene, past_xy: np.ndarray, traj_color: list, label: str):
+        for obs in maze.walls:
+            draw_obstacle_box(scene, obs.center, obs.half_extents, obs.yaw,
+                              height=0.8, color=[0.55, 0.55, 0.55, 0.7])
+        if hasattr(maze, 'astar_pts_world'):
+            apts = maze.astar_pts_world
+            apts3 = np.hstack([apts, np.full((len(apts), 1), 0.04)])
+            draw_trajectory_lines(scene, apts3, color=[1.0, 0.85, 0.0, 0.7])
+        if len(past_xy) >= 2:
+            past3 = np.ascontiguousarray(
+                np.hstack([past_xy, np.full((len(past_xy), 1), 0.05)]),
+                dtype=np.float64,
+            )
+            draw_trajectory_lines(scene, past3, color=traj_color)
+        draw_label(scene, np.array([center_world[0], center_world[1], 2.8]), label)
+
+    writer = imageio.get_writer(output_path, fps=fps, codec="libx264", pixelformat="yuv420p")
+    n = max(len(qpos_on), len(qpos_off))
+    print(f"[Compare] Rendering {n} frames for MP4 …")
+
+    for t in range(n):
+        t_on  = min(t, len(qpos_on)  - 1)
+        t_off = min(t, len(qpos_off) - 1)
+
+        mj_data_on.qpos[:] = qpos_on[t_on]
+        mujoco.mj_forward(mj_model, mj_data_on)
+        ren_on.update_scene(mj_data_on, camera=cam)
+        _draw_overlay(ren_on.scene, qpos_on[:t_on + 1, :2],
+                      [0.1, 1.0, 0.1, 0.95], "SENSOR: ON")
+        frame_on = ren_on.render().copy()
+
+        mj_data_off.qpos[:] = qpos_off[t_off]
+        mujoco.mj_forward(mj_model, mj_data_off)
+        ren_off.update_scene(mj_data_off, camera=cam)
+        _draw_overlay(ren_off.scene, qpos_off[:t_off + 1, :2],
+                      [1.0, 0.15, 0.15, 0.95], "SENSOR: OFF")
+        frame_off = ren_off.render().copy()
+
+        writer.append_data(np.hstack([frame_on, frame_off]))
+
+    writer.close()
+    print(f"[Compare] MP4 saved  → {output_path}")
+
+
+def _save_comparison_figure(
+    qpos_on: np.ndarray,
+    qpos_off: np.ndarray,
+    maze: MazeLayout,
+    output_path: str,
+):
+    """
+    Save a 2-D top-down map comparing sensor-ON vs sensor-OFF trajectories.
+
+    Layout
+    ------
+    Open rooms / corridor  : light gray fill, dark border
+    A* reference path      : dashed gold line
+    Sensor-ON trajectory   : solid green line  (with start/end arrows)
+    Sensor-OFF trajectory  : solid red line    (with start/end arrows)
+    Start marker           : blue circle
+    Goal marker            : orange star
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.patches import Polygon as MplPolygon
+
+    fig, ax = plt.subplots(figsize=(13, 7))
+
+    # ── Maze geometry ────────────────────────────────────────────────────
+    # Draw each open rectangle as a light patch (rotated if initial_yaw ≠ 0)
+    for (xlo, xhi, ylo, yhi) in maze._open_rects:
+        corners_local = np.array([
+            [xlo, ylo], [xhi, ylo], [xhi, yhi], [xlo, yhi],
+        ])
+        corners_world = maze._w(corners_local)
+        poly = MplPolygon(corners_world, closed=True,
+                          facecolor='#e8e8e8', edgecolor='#444444',
+                          linewidth=1.8, zorder=1)
+        ax.add_patch(poly)
+
+    # ── A* reference path ────────────────────────────────────────────────
+    if hasattr(maze, 'astar_pts_world'):
+        apts = maze.astar_pts_world
+        ax.plot(apts[:, 0], apts[:, 1], '--',
+                color='#ccaa00', linewidth=1.5, alpha=0.75,
+                label='A* reference path', zorder=2)
+
+    # ── Trajectories ─────────────────────────────────────────────────────
+    ax.plot(qpos_on[:, 0], qpos_on[:, 1],
+            color='#00bb44', linewidth=2.5, label='Sensor ON', zorder=3)
+    ax.plot(qpos_off[:, 0], qpos_off[:, 1],
+            color='#dd2222', linewidth=2.5, label='Sensor OFF', alpha=0.85, zorder=3)
+
+    # Arrow at the end of each trajectory to show direction of travel
+    for xy, color in [(qpos_on, '#00bb44'), (qpos_off, '#dd2222')]:
+        if len(xy) >= 2:
+            dx = xy[-1, 0] - xy[-2, 0]
+            dy = xy[-1, 1] - xy[-2, 1]
+            ax.annotate('', xy=xy[-1, :2], xytext=xy[-2, :2],
+                        arrowprops=dict(arrowstyle='->', color=color, lw=2.0),
+                        zorder=4)
+
+    # ── Start / Goal markers ─────────────────────────────────────────────
+    start = maze.waypoints[0]
+    goal  = maze.waypoints[-1]
+    ax.plot(*start, 'o', color='royalblue',  markersize=12, zorder=5, label='Start')
+    ax.plot(*goal,  '*', color='darkorange', markersize=16, zorder=5, label='Goal')
+
+    # ── Frame length annotation ───────────────────────────────────────────
+    ax.text(0.02, 0.97,
+            f"Sensor ON:  {len(qpos_on)} frames\nSensor OFF: {len(qpos_off)} frames",
+            transform=ax.transAxes, va='top', fontsize=10,
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
+
+    # ── Styling ───────────────────────────────────────────────────────────
+    ax.set_aspect('equal')
+    ax.legend(loc='upper right', fontsize=10)
+    ax.set_title('Maze Navigation – Sensor ON vs OFF', fontsize=14, fontweight='bold')
+    ax.set_xlabel('X (m)', fontsize=11)
+    ax.set_ylabel('Y (m)', fontsize=11)
+    ax.grid(True, alpha=0.25, linestyle=':')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"[Compare] Figure saved → {output_path}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1010,6 +1255,9 @@ def get_args():
     p.add_argument("--blendtime-position",   type=float, default=0.2)
     p.add_argument("--spring-halflife-position", type=float, default=0.12)
     p.add_argument("--spring-halflife-rotation",  type=float, default=0.12)
+    p.add_argument("--compare", action="store_true",
+                   help="Run sensor-ON then sensor-OFF headlessly and save a side-by-side "
+                        "comparison video (no interactive window)")
     return p.parse_args()
 
 
@@ -1109,6 +1357,12 @@ def main():
         corridor_hw=args.corridor_hw,
         corridor_y=args.corridor_y,
     )
+
+    # ── Comparison mode: run both passes headlessly and exit ──────────────
+    if args.compare:
+        run_comparison(args, mj_model, dataset, generator, maze)
+        return
+
     path = PathController(
         waypoints=maze.waypoints,
         speed=args.speed,
