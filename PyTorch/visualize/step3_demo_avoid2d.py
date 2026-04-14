@@ -69,7 +69,7 @@ from visualize.utils.trajectory import (
 )
 from utils.environment_sensor import (
     EnvironmentSensor,
-    ObstacleGenerator,
+    make_generator,
     CircleObstacle,
     BoxObstacle,
     quat_wxyz_to_yaw,
@@ -277,7 +277,7 @@ class DemoPlayerEnv:
         self.motion_generator = generator
 
         self.sensor    = generator.sensor
-        self.generator_obs = ObstacleGenerator(mode=obstacle_mode)
+        self.generator_obs = make_generator(obstacle_mode)
         self.obstacles = []
         self._last_obs_window = -1
 
@@ -641,8 +641,8 @@ def get_args():
     p.add_argument("--dataset",    default="lafan1_g1")
     p.add_argument("--checkpoint", default="save/camdm_g1_env_lafan1_g1_env/best.pt",
                    help="Path to MotionDiffusionEnv checkpoint")
-    p.add_argument("--mode",  default="sparse", choices=["sparse", "dense", "compact"],
-                   help="Obstacle density mode (default: sparse)")
+    p.add_argument("--mode",  default="sparse|dense|compact|none",
+                   help="Obstacle density mode. Use '|' to cycle modes, e.g. 'sparse|dense|compact|none'")
     p.add_argument("--obstacle-interval", type=int, default=30)
     p.add_argument("--resolution", type=int,   default=9)
     p.add_argument("--max-range",  type=float, default=2.0)
@@ -767,7 +767,7 @@ def main():
         inertial_quat_start=args.inertial_quat_start,
         inertial_quat_end=args.inertial_quat_end,
         obstacle_interval=args.obstacle_interval,
-        obstacle_mode=args.mode,
+        obstacle_mode=[m.strip() for m in args.mode.split("|") if m.strip()],
     )
 
     if args.motion > 0:
