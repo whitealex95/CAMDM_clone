@@ -733,7 +733,7 @@ def main():
 
     print_instruction()
     with mujoco.viewer.launch_passive(mj_model, mj_data, key_callback=lambda keycode: key_callback(player, keycode)) as viewer:
-        W, H = 640, 320
+        W, H = 1280, 720
         OUT = f"videos/demo_{time.strftime('%m%d_%H%M')}.mp4"
         FPS = 30
         writer = imageio.get_writer(OUT, fps=FPS, codec="libx264", pixelformat="yuv420p")

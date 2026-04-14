@@ -776,7 +776,7 @@ def main():
     # ── Video recording (always on) ────────────────────────────────────────
     os.makedirs("videos", exist_ok=True)
     video_path = f"videos/demo_avoid2d_{time.strftime('%m%d_%H%M')}.mp4"
-    W, H = 640, 320
+    W, H = 1280, 720
     FPS  = player.fps
     writer   = imageio.get_writer(video_path, fps=FPS, codec="libx264", pixelformat="yuv420p")
     renderer = mujoco.Renderer(mj_model, height=H, width=W)
