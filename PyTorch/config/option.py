@@ -33,6 +33,7 @@ def add_train_args(parser):
     parser.add_argument('--ema', default=False, type=bool, help='Use Exponential Moving Average (EMA) for model parameters.')
     parser.add_argument('--workers', default=8, type=int, help='Number of workers for data loading.')
     parser.add_argument('--no_rotation_aug', action='store_true', help='Disable global rotation augmentation on training samples.')
+    parser.add_argument('--legacy_rotation_aug', action='store_true', help='Use pre-5fad8d2 rotation aug (traj_pos not rotated).')
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging.')
     parser.add_argument('--wandb_project', type=str, help='W&B project name.')
     parser.add_argument('--wandb_entity', type=str, help='W&B entity/team name.')
@@ -78,6 +79,7 @@ def config_parse(args):
     config.trainer.use_loss_vel = True if loss_terms[2] == '1' else False
     config.trainer.use_loss_contact = True if loss_terms[3] == '1' else False
     config.trainer.rotation_aug = not args.no_rotation_aug
+    config.trainer.legacy_rotation_aug = args.legacy_rotation_aug
     config.trainer.load_num = None
     config.trainer.save_freq = int(config.trainer.epoch // 10)
     config.trainer.use_wandb = bool(args.wandb or getattr(config.trainer, 'use_wandb', False))

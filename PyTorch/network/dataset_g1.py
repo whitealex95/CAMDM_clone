@@ -27,7 +27,8 @@ class HumanoidMotionDataset(Dataset):
     def __init__(self, pkl_path, rot_req, offset_frame,
                  past_frame, future_frame, dtype=np.float32, limited_num=None,
                  min_start_velocity: float = None,
-                 rotation_aug: bool = True):
+                 rotation_aug: bool = True,
+                 legacy_rotation_aug: bool = False):
         """
         Args:
             min_start_velocity: If set, skip the initial T-pose / low-motion
@@ -39,11 +40,15 @@ class HumanoidMotionDataset(Dataset):
             rotation_aug: If True (default), randomly rotate each sample around
                 the Z axis during __getitem__.  Applies consistently to root
                 rotation, root position, trajectory XY, and trajectory rotation.
+            legacy_rotation_aug: If True, use pre-5fad8d2 behaviour where
+                traj_pos (world-frame XY) was NOT rotated. Ignored when
+                rotation_aug=False.
         """
         self.pkl_path = pkl_path
         self.rot_req = rot_req.lower()
         self.dtype    = dtype
         self.rotation_aug = rotation_aug
+        self.legacy_rotation_aug = legacy_rotation_aug
 
         window_size = past_frame + future_frame
         self.past_frame = past_frame
@@ -196,9 +201,10 @@ class HumanoidMotionDataset(Dataset):
             root_pos = rot_vec.apply(root_pos)
 
             # traj_pos is world-frame XY so it must rotate with everything else
-            cos_t, sin_t = np.cos(theta[0]), np.sin(theta[0])
-            R2 = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=traj_pos.dtype)
-            traj_pos = (R2 @ traj_pos.T).T
+            if not self.legacy_rotation_aug:
+                cos_t, sin_t = np.cos(theta[0]), np.sin(theta[0])
+                R2 = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=traj_pos.dtype)
+                traj_pos = (R2 @ traj_pos.T).T
 
         # -----------------------------
         # TORCH CONVERSION

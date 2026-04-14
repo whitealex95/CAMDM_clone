@@ -28,7 +28,8 @@ def train(config, resume, logger, tb_writer):
                                   config.arch.offset_frame, config.arch.past_frame,
                                   config.arch.future_frame, dtype=np_dtype, limited_num=config.trainer.load_num,
                                   min_start_velocity=config.trainer.min_start_velocity,
-                                  rotation_aug=config.trainer.rotation_aug)
+                                  rotation_aug=config.trainer.rotation_aug,
+                                  legacy_rotation_aug=config.trainer.legacy_rotation_aug)
     train_dataloader = DataLoader(train_data, batch_size=config.trainer.batch_size, shuffle=True, num_workers=config.trainer.workers, drop_last=False, pin_memory=True)
     logger.info('\nTraining Dataset including %d clip, with %d frame per clip;' % (len(train_data), config.arch.clip_len))
     

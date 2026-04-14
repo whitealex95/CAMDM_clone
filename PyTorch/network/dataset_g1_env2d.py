@@ -48,7 +48,8 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
     def __init__(self, pkl_path, rot_req, offset_frame,
                  past_frame, future_frame, dtype=np.float32, limited_num=None,
                  min_start_velocity: float = None,
-                 rotation_aug: bool = True):
+                 rotation_aug: bool = True,
+                 legacy_rotation_aug: bool = False):
 
         # ---- base class init (loads rotations, traj, styles, etc.) ----
         super().__init__(
@@ -56,6 +57,7 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
             past_frame, future_frame, dtype=dtype, limited_num=limited_num,
             min_start_velocity=min_start_velocity,
             rotation_aug=rotation_aug,
+            legacy_rotation_aug=legacy_rotation_aug,
         )
 
         # ---- load sensor metadata and readings ----
@@ -161,9 +163,10 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
             root_pos = rot_vec.apply(root_pos)
 
             # traj_pos is world-frame XY so it must rotate with everything else
-            cos_t, sin_t = np.cos(theta), np.sin(theta)
-            R2 = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=traj_pos.dtype)
-            traj_pos = (R2 @ traj_pos.T).T
+            if not self.legacy_rotation_aug:
+                cos_t, sin_t = np.cos(theta), np.sin(theta)
+                R2 = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=traj_pos.dtype)
+                traj_pos = (R2 @ traj_pos.T).T
 
             # ---- Rotate sensor reading to match new heading ----
             # Each ring z has count_z = round(2π*z) spheres uniformly distributed
