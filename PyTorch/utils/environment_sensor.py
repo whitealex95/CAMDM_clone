@@ -652,6 +652,7 @@ def compute_clip_sensor_readings(
     generator: Union[ObstacleGenerator, CyclingObstacleGenerator],
     obstacle_interval: int = 30,
     lookahead_frames: int = 30,
+    detour_fn=None,
 ) -> Tuple[np.ndarray, List]:
     """
     Compute sensor readings for an entire motion clip with time-varying obstacles.
@@ -667,6 +668,10 @@ def compute_clip_sensor_readings(
         generator:         ObstacleGenerator instance.
         obstacle_interval: Frames between obstacle regeneration.
         lookahead_frames:  Future frames included in collision check.
+        detour_fn:         Optional callable ``(path_xy: ndarray) -> List[Obstacle2D]``.
+                           When provided, its output is appended to the random obstacles
+                           for each window.  Pass a lambda wrapping
+                           ``compute_detour_obstacles`` to add detour obstacles.
 
     Returns:
         readings:          (T, feature_dim) float32 continuous occupancy readings.
@@ -685,6 +690,9 @@ def compute_clip_sensor_readings(
         lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
 
         obstacles = generator.generate_for_window(window_xy, lookahead_xy)
+        if detour_fn is not None:
+            div_xy = all_qpos[w_start:la_end, :2]
+            obstacles = obstacles + list(detour_fn(div_xy))
         window_obstacles.append((w_start, w_end, obstacles))
 
         for t in range(w_start, w_end):

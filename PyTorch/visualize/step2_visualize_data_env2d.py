@@ -115,13 +115,21 @@ class SensorMotionPlayer:
 
         # sensor
         self.sensor = EnvironmentSensor(max_range=max_range, resolution=resolution)
-        self.generator = make_generator(obstacle_mode, robot_safe_radius=robot_safe_radius)
+
+        # Decompose new-style mode names into (detour_flags, random_modes)
+        if isinstance(obstacle_mode, str):
+            obstacle_mode = [obstacle_mode]
+        self._detour_flags = [m != "none" for m in obstacle_mode]
+        random_modes = [_MODE_TO_RANDOM[m] for m in obstacle_mode]
+        self.generator = make_generator(random_modes, robot_safe_radius=robot_safe_radius)
+
         self.obstacles = []
         self.readings = np.zeros(self.sensor.feature_dim, dtype=np.float32)
         self.sphere_centers = np.zeros((self.sensor.feature_dim, 2), dtype=np.float64)
 
         self.obstacle_interval = obstacle_interval
         self._last_obstacle_window = -1   # window index that was last generated
+        self._has_detour = False           # True when detour obstacles exist in current window
 
         # display flags
         self.show_trajectory = show_trajectory
@@ -234,7 +242,10 @@ class SensorMotionPlayer:
         # Deterministic seed: (motion_idx * 1000 + win_idx)
         self.generator.seed(self.current_motion_idx * 1000 + win_idx)
         self.obstacles = self.generator.generate_for_window(window_xy, lookahead_xy)
-        self.obstacles.extend(self._detour_obstacles(div_xy))
+        use_detour = self._detour_flags[win_idx % len(self._detour_flags)]
+        div_obs = self._detour_obstacles(div_xy) if use_detour else []
+        self._has_detour = len(div_obs) > 0
+        self.obstacles.extend(div_obs)
         self._last_obstacle_window = win_idx
 
     def force_new_obstacles(self):
@@ -251,10 +262,12 @@ class SensorMotionPlayer:
         lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
         div_xy = all_qpos[w_start:div_end, :2]
         self.obstacles = self.generator.generate_for_window(window_xy, lookahead_xy)
-        div_obs = self._detour_obstacles(div_xy)
+        use_detour = self._detour_flags[win_idx % len(self._detour_flags)]
+        div_obs = self._detour_obstacles(div_xy) if use_detour else []
+        self._has_detour = len(div_obs) > 0
         self.obstacles.extend(div_obs)
         print(f"Regenerated {len(self.obstacles)} obstacles "
-              f"({len(div_obs)} from trajectory divergence)")
+              f"({len(div_obs)} from trajectory detour)")
 
     # ------------------------------------------------------------------
     # Divergence obstacle placement
@@ -311,17 +324,24 @@ class SensorMotionPlayer:
         )
 
     def _compute_command_trajectory(self, future_traj, future_orient):
-        """Linear position interpolation (start → end); orientation taken from dataset."""
+        """
+        Command trajectory:
+          - No detour this window → same as dataset target (future_traj as-is).
+          - Detour detected       → linear interpolation start→end (forces robot
+                                    to navigate past the detour obstacle).
+        Orientation is always taken from the dataset.
+        """
         if future_traj is None or len(future_traj) < 2:
             return None, None
 
+        if not self._has_detour:
+            return future_traj, future_orient
+
         N = len(future_traj)
         t = np.linspace(0.0, 1.0, N)
-
         start_pos    = future_traj[0]
         end_pos      = future_traj[-1]
         command_traj = start_pos[None] + t[:, None] * (end_pos - start_pos)[None]  # (N, 3)
-
         return command_traj, future_orient
 
     # ------------------------------------------------------------------
@@ -504,9 +524,16 @@ def create_env_dataset(
 
     output_motions = []
     for m_idx, mode_str in enumerate(modes):
-        generator = make_generator(mode_str, robot_safe_radius=robot_safe_radius,
-                                   seed=seed)
-        print(f"\n[{m_idx+1}/{len(modes)}] mode='{mode_str}' …")
+        use_detour  = mode_str != "none"
+        random_mode = _MODE_TO_RANDOM[mode_str]
+        generator   = make_generator(random_mode, robot_safe_radius=robot_safe_radius,
+                                     seed=seed)
+        detour_fn = (
+            (lambda xy: compute_detour_obstacles(xy, robot_safe_radius=robot_safe_radius)[0])
+            if use_detour else None
+        )
+        print(f"\n[{m_idx+1}/{len(modes)}] mode='{mode_str}'  "
+              f"(random={random_mode}, detour={'yes' if use_detour else 'no'}) …")
         for clip_idx, motion in enumerate(tqdm(source_motions)):
             local_rot = motion["local_joint_rotations"]   # (T, 30, 4)
             root_pos  = motion["global_root_positions"]   # (T, 3)
@@ -525,6 +552,7 @@ def create_env_dataset(
                 generator,
                 obstacle_interval=obstacle_interval,
                 lookahead_frames=lookahead_frames,
+                detour_fn=detour_fn,
             )
             new_motion = dict(motion)
             new_motion["sensor_readings"] = readings.astype(np.float32)
@@ -576,15 +604,16 @@ def get_args():
     p.add_argument("--robot-safe-radius", type=float, default=0.25,
                    help="Minimum clear gap around robot path in metres (default: 0.5)")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--mode", default="sparse|dense|compact|none",
-                   help="Obstacle density mode(s), separated by '|'. "
-                        "Choices: sparse, dense, compact, none. "
-                        "'none' places no obstacles (all sensor readings = 0). "
-                        "'compact' flood-fills the sensor area with flush square boxes, "
-                        "leaving only the trajectory corridor clear. "
+    p.add_argument("--mode", default="detour_only|detour_sparse|detour_dense|detour_packed|none",
+                   help="Obstacle mode(s), separated by '|'. "
+                        "Choices: detour_only, detour_sparse, detour_dense, detour_packed, none. "
+                        "Modes prefixed with 'detour_' add trajectory-detour obstacles; "
+                        "the suffix selects additional random obstacles "
+                        "(detour_only=none, detour_sparse, detour_dense, detour_packed). "
+                        "'none' places no obstacles at all. "
                         "Visualiser: cycles modes across obstacle windows. "
                         "Dataset creation: each clip is duplicated once per mode. "
-                        "Default: 'sparse|dense|compact|none'")
+                        "Default: 'detour_only|detour_sparse|detour_dense|detour_packed|none'")
 
     p.add_argument("--min-start-velocity", type=float, default=0.008,
                    help="Skip initial T-pose frames: first frame whose 5-frame "
@@ -641,7 +670,17 @@ def print_instructions():
 # Main
 # ---------------------------------------------------------------------------
 
-_VALID_MODES = {"sparse", "dense", "compact", "none"}
+# User-facing mode names
+_VALID_MODES = {"detour_only", "detour_sparse", "detour_dense", "detour_packed", "none"}
+
+# Maps each user-facing mode to the underlying ObstacleGenerator (random) mode
+_MODE_TO_RANDOM = {
+    "detour_only":   "none",
+    "detour_sparse": "sparse",
+    "detour_dense":  "dense",
+    "detour_packed": "compact",
+    "none":          "none",
+}
 
 
 def _parse_modes(raw: str) -> List[str]:
