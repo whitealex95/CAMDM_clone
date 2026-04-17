@@ -70,6 +70,7 @@ from utils.environment_sensor import (
     compute_clip_sensor_readings,
     CircleObstacle,
     BoxObstacle,
+    Obstacle2D,
     quat_wxyz_to_yaw,
 )
 
@@ -102,14 +103,16 @@ class SensorMotionPlayer:
         past_frames: int = 10,
         future_frames: int = 45,
         min_start_velocity: float = None,
+        robot_safe_radius: float = 0.25,
     ):
         self.model = model
         self.data = data
         self.dataset = dataset
+        self.robot_safe_radius = robot_safe_radius
 
         # sensor
         self.sensor = EnvironmentSensor(max_range=max_range, resolution=resolution)
-        self.generator = make_generator(obstacle_mode)
+        self.generator = make_generator(obstacle_mode, robot_safe_radius=robot_safe_radius)
         self.obstacles = []
         self.readings = np.zeros(self.sensor.feature_dim, dtype=np.float32)
         self.sphere_centers = np.zeros((self.sensor.feature_dim, 2), dtype=np.float64)
@@ -215,14 +218,20 @@ class SensorMotionPlayer:
         w_end = min(w_start + self.obstacle_interval, self.current_motion.num_frames)
         la_end = min(w_end + self.obstacle_interval, self.current_motion.num_frames)
 
+        # Divergence check must cover the full future_traj window (future_frames),
+        # which can extend beyond la_end when current_frame is late in the window.
+        div_end = min(w_end + self.future_frames, self.current_motion.num_frames)
+
         # Collect robot XY for current + lookahead window
         all_qpos = self.current_motion.get_all_qpos()
-        window_xy = all_qpos[w_start:w_end, :2]
+        window_xy  = all_qpos[w_start:w_end, :2]
         lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
+        div_xy = all_qpos[w_start:div_end, :2]   # window + future_frames lookahead
 
         # Deterministic seed: (motion_idx * 1000 + win_idx)
         self.generator.seed(self.current_motion_idx * 1000 + win_idx)
         self.obstacles = self.generator.generate_for_window(window_xy, lookahead_xy)
+        self.obstacles.extend(self._divergence_obstacles(div_xy))
         self._last_obstacle_window = win_idx
 
     def force_new_obstacles(self):
@@ -233,11 +242,83 @@ class SensorMotionPlayer:
         w_start = win_idx * self.obstacle_interval
         w_end = min(w_start + self.obstacle_interval, self.current_motion.num_frames)
         la_end = min(w_end + self.obstacle_interval, self.current_motion.num_frames)
+        div_end = min(w_end + self.future_frames, self.current_motion.num_frames)
         all_qpos = self.current_motion.get_all_qpos()
         window_xy = all_qpos[w_start:w_end, :2]
         lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
+        div_xy = all_qpos[w_start:div_end, :2]
         self.obstacles = self.generator.generate_for_window(window_xy, lookahead_xy)
-        print(f"Regenerated {len(self.obstacles)} obstacles")
+        div_obs = self._divergence_obstacles(div_xy)
+        self.obstacles.extend(div_obs)
+        print(f"Regenerated {len(self.obstacles)} obstacles "
+              f"({len(div_obs)} from trajectory divergence)")
+
+    def _divergence_obstacles(self, path_xy: np.ndarray) -> List[Obstacle2D]:
+        """
+        Place a circle obstacle in the gap between the linear (command/green)
+        and actual (red) trajectories when they diverge significantly.
+
+        Uses window + lookahead (up to 60 frames) so the robot has enough spatial
+        separation to leave a clear gap between the two trajectories.
+
+        The obstacle:
+          - Center is on the green (straight-line) trajectory
+          - Radius = spatial clearance from the nearest red waypoint * 0.90
+          - Guaranteed NOT to overlap with the red trajectory
+        """
+        N = len(path_xy)
+        if N < 4:
+            return []
+
+        t = np.linspace(0.0, 1.0, N)
+        green_xy = path_xy[0] + t[:, None] * (path_xy[-1] - path_xy[0])
+
+        # Pointwise divergence (same-index comparison): skip if path is near-straight
+        pointwise = np.linalg.norm(green_xy - path_xy, axis=1)
+        if float(pointwise.max()) < 0.10:
+            return []
+
+        # Step 1: find best center using arrow points (every 5th) — sparser sampling
+        #   gives larger clearance values so we get meaningful center candidates.
+        arrow_indices = np.arange(0, N, 5)
+        red_arrow_xy = path_xy[arrow_indices]          # (M, 2)
+        diffs_arrow = green_xy[:, None, :] - red_arrow_xy[None, :, :]  # (N, M, 2)
+        dist_arrow = np.linalg.norm(diffs_arrow, axis=2).min(axis=1)   # (N,)
+
+        # Exclude first/last 25 % — endpoints are shared with red, clearance ≈ 0
+        margin = max(2, N // 4)
+        dist_arrow[:margin] = 0.0
+        dist_arrow[N - margin:] = 0.0
+
+        if float(dist_arrow.max()) < 0.05:
+            return []
+
+        best_idx = int(dist_arrow.argmax())
+        center = green_xy[best_idx].copy()
+
+        # Step 2: minimum distance from center to the red PATH as a polyline
+        #   (segment-based, not point-based) so no LINE SEGMENT clips the obstacle.
+        P1 = path_xy[:-1]                                    # (N-1, 2)
+        P2 = path_xy[1:]                                     # (N-1, 2)
+        seg_d = P2 - P1                                      # (N-1, 2)
+        t = np.sum((center - P1) * seg_d, axis=1) / (
+            np.sum(seg_d * seg_d, axis=1) + 1e-12)
+        t = np.clip(t, 0.0, 1.0)
+        closest = P1 + t[:, None] * seg_d                   # (N-1, 2)
+        seg_clearance = float(np.linalg.norm(center - closest, axis=1).min())
+
+        # Subtract robot body radius so the obstacle surface stays clear of the robot
+        effective_clearance = seg_clearance - self.robot_safe_radius
+        radius = effective_clearance * 0.90
+
+        if radius < 0.05:
+            return []
+
+        print(f"  [divergence] PLACED r={radius:.2f}m  "
+              f"seg_clearance={seg_clearance:.3f}m  "
+              f"effective={effective_clearance:.3f}m (body={self.robot_safe_radius}m)  "
+              f"idx={best_idx}/{N}")
+        return [CircleObstacle(center, radius)]
 
     def update_pose(self):
         qpos = self.current_motion.get_qpos(self.current_frame)
@@ -550,7 +631,7 @@ def get_args():
                    help="Sensor max range in metres = Size/2 (paper: Size=4 → 2.0m)")
     p.add_argument("--obstacle-interval", type=int, default=30,
                    help="Frames between obstacle regeneration (default: 30 = 1 s)")
-    p.add_argument("--robot-safe-radius", type=float, default=0.5,
+    p.add_argument("--robot-safe-radius", type=float, default=0.25,
                    help="Minimum clear gap around robot path in metres (default: 0.5)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--mode", default="sparse|dense|compact|none",
@@ -704,6 +785,7 @@ def main():
         past_frames=args.past_frames,
         future_frames=args.future_frames,
         min_start_velocity=args.min_start_velocity if args.min_start_velocity > 0 else None,
+        robot_safe_radius=args.robot_safe_radius,
     )
 
     if args.motion > 0:
