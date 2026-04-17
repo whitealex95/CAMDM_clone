@@ -58,7 +58,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from visualize.motion_loader import MotionDataset
-from visualize.utils.divergence import compute_divergence_obstacles
+from visualize.utils.detour import compute_detour_obstacles
 from visualize.utils.geometry import (
     draw_trajectory,
     draw_sensor_readings,
@@ -234,7 +234,7 @@ class SensorMotionPlayer:
         # Deterministic seed: (motion_idx * 1000 + win_idx)
         self.generator.seed(self.current_motion_idx * 1000 + win_idx)
         self.obstacles = self.generator.generate_for_window(window_xy, lookahead_xy)
-        self.obstacles.extend(self._divergence_obstacles(div_xy))
+        self.obstacles.extend(self._detour_obstacles(div_xy))
         self._last_obstacle_window = win_idx
 
     def force_new_obstacles(self):
@@ -251,7 +251,7 @@ class SensorMotionPlayer:
         lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
         div_xy = all_qpos[w_start:div_end, :2]
         self.obstacles = self.generator.generate_for_window(window_xy, lookahead_xy)
-        div_obs = self._divergence_obstacles(div_xy)
+        div_obs = self._detour_obstacles(div_xy)
         self.obstacles.extend(div_obs)
         print(f"Regenerated {len(self.obstacles)} obstacles "
               f"({len(div_obs)} from trajectory divergence)")
@@ -260,9 +260,9 @@ class SensorMotionPlayer:
     # Divergence obstacle placement
     # ------------------------------------------------------------------
 
-    def _divergence_obstacles(self, path_xy: np.ndarray) -> List[Obstacle2D]:
-        """Delegate to the shared compute_divergence_obstacles utility."""
-        obstacles, _ = compute_divergence_obstacles(
+    def _detour_obstacles(self, path_xy: np.ndarray) -> List[Obstacle2D]:
+        """Delegate to the shared compute_detour_obstacles utility."""
+        obstacles, _ = compute_detour_obstacles(
             path_xy, robot_safe_radius=self.robot_safe_radius
         )
         for k, obs in enumerate(obstacles):

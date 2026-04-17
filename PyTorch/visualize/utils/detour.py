@@ -1,23 +1,23 @@
 """
-Divergence obstacle placement utilities
-========================================
-Shared logic for detecting trajectory divergence and placing circular
-obstacles in the gap between the linear command (green) and actual (red)
-root trajectories.
+Detour obstacle placement utilities
+=====================================
+When the actual root trajectory (red) takes a detour from the linear
+command trajectory (green), circular obstacles are placed in the gap so
+the policy must navigate around them.
 
 Two circles are placed per window:
-  Circle 1 – off-green-line center
+  Circle 1 – off-path center
       Seed: green point farthest from red arrow points.
       Center moved away from red to maximise radius while the circle
-      still overlaps the green line.
+      still overlaps the green (command) line.
 
-  Circle 2 – on-green-line center
+  Circle 2 – on-path center
       Center fixed on the green line at the point with maximum
       clearance from red.
 
 Overlap between the two circles is not checked.
 All obstacles are discarded when every circle is smaller than
-robot_safe_radius (trajectory too close to green to be useful).
+robot_safe_radius (detour too shallow to be useful).
 """
 
 import numpy as np
@@ -49,20 +49,20 @@ def point_to_seg_dist(c: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Obstacle placement
+# Circle finders
 # ---------------------------------------------------------------------------
 
-def optimize_center(seed: np.ndarray,
-                    green_start: np.ndarray, green_end: np.ndarray,
-                    P1: np.ndarray, seg_d: np.ndarray, seg_d_sq: np.ndarray,
-                    robot_safe_radius: float,
-                    n_steps: int = 60, max_dist: float = 2.5):
+def find_offpath_circle(seed: np.ndarray,
+                        green_start: np.ndarray, green_end: np.ndarray,
+                        P1: np.ndarray, seg_d: np.ndarray, seg_d_sq: np.ndarray,
+                        robot_safe_radius: float,
+                        n_steps: int = 60, max_dist: float = 2.5):
     """
-    Circle 1 – off-green-line center.
+    Circle 1 – off-path center.
 
     Starts at *seed* (a green-line point) and steps away from the nearest
     red segment to find the center that maximises obstacle radius while the
-    circle still overlaps the green line.
+    circle still overlaps the green (command) line.
 
     Returns (center, radius) or (None, 0.0) when no valid position is found.
     """
@@ -93,11 +93,11 @@ def optimize_center(seed: np.ndarray,
     return best_c, best_r
 
 
-def green_line_center(green_xy: np.ndarray,
-                      P1: np.ndarray, seg_d: np.ndarray, seg_d_sq: np.ndarray,
-                      robot_safe_radius: float, margin: int):
+def find_onpath_circle(green_xy: np.ndarray,
+                       P1: np.ndarray, seg_d: np.ndarray, seg_d_sq: np.ndarray,
+                       robot_safe_radius: float, margin: int):
     """
-    Circle 2 – on-green-line center.
+    Circle 2 – on-path center.
 
     Scans every non-margin green-line point and returns the one that yields
     the largest safe radius (clearance from red minus robot_safe_radius).
@@ -117,16 +117,20 @@ def green_line_center(green_xy: np.ndarray,
     return best_c, best_r
 
 
-def compute_divergence_obstacles(path_xy: np.ndarray, robot_safe_radius: float = 0.25):
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def compute_detour_obstacles(path_xy: np.ndarray, robot_safe_radius: float = 0.25):
     """
-    Place up to two divergence obstacles for one trajectory window.
+    Place up to two detour obstacles for one trajectory window.
 
     Parameters
     ----------
     path_xy : (N, 2) float array
-        Root XY positions for the window (red trajectory).
+        Root XY positions for the window (red / actual trajectory).
     robot_safe_radius : float
-        Body clearance; subtracted from raw segment distance when
+        Body clearance subtracted from raw segment distance when
         computing obstacle radius.
 
     Returns
@@ -157,7 +161,8 @@ def compute_divergence_obstacles(path_xy: np.ndarray, robot_safe_radius: float =
     obstacles    = []
     seed_indices = []   # None entry = no single seed point (circle 2)
 
-    # --- Circle 1: off-green-line ---
+    # --- Circle 1: off-path ---
+    # da[i] = distance from green_xy[i] to the nearest red arrow point
     da = np.linalg.norm(
         green_xy[:, None, :] - red_arrow_xy[None, :, :], axis=2
     ).min(axis=1)
@@ -167,7 +172,7 @@ def compute_divergence_obstacles(path_xy: np.ndarray, robot_safe_radius: float =
     if float(da.max()) >= 0.05:
         seed_idx       = int(da.argmax())
         seed           = green_xy[seed_idx].copy()
-        center, radius = optimize_center(
+        center, radius = find_offpath_circle(
             seed, green_start, green_end,
             P1, seg_d, seg_d_sq, robot_safe_radius,
         )
@@ -175,8 +180,8 @@ def compute_divergence_obstacles(path_xy: np.ndarray, robot_safe_radius: float =
             obstacles.append(CircleObstacle(center, radius))
             seed_indices.append(seed_idx)
 
-    # --- Circle 2: on-green-line ---
-    center, radius = green_line_center(
+    # --- Circle 2: on-path ---
+    center, radius = find_onpath_circle(
         green_xy, P1, seg_d, seg_d_sq, robot_safe_radius, margin
     )
     if center is not None and radius >= 0.05:

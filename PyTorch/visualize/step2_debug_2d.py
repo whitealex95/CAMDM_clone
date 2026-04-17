@@ -37,9 +37,9 @@ import matplotlib.pyplot as plt
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from visualize.motion_loader import MotionDataset
-from visualize.utils.divergence import (
+from visualize.utils.detour import (
     ARROW_STEP,
-    compute_divergence_obstacles,
+    compute_detour_obstacles,
 )
 
 
@@ -189,7 +189,7 @@ def main():
         div_end = min(w_end   + args.future_frames,     T)
         div_xy  = all_qpos[w_start:div_end, :2]
 
-        obs_list, info = compute_divergence_obstacles(
+        obs_list, info = compute_detour_obstacles(
             div_xy, robot_safe_radius=args.robot_safe_radius
         )
 
