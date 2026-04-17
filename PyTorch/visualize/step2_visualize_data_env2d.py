@@ -22,6 +22,7 @@ Controls (visualisation mode)
   UP   / DOWN : Previous / Next motion clip
   R           : Reset to first frame
   T           : Toggle trajectory visualisation
+  C           : Toggle command trajectory (green linear)
   E           : Toggle environment-sensor overlay
   L           : Toggle ray lines (dots only ↔ lines+dots)
   O           : Toggle obstacle display
@@ -47,9 +48,11 @@ import time
 import pickle
 
 import numpy as np
+from scipy.spatial.transform import Rotation, Slerp
 from typing import List, Union
 import mujoco
 import mujoco.viewer
+import imageio.v2 as imageio
 from tqdm import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -116,6 +119,7 @@ class SensorMotionPlayer:
 
         # display flags
         self.show_trajectory = show_trajectory
+        self.show_command_traj = True
         self.show_sensor = show_sensor
         self.show_obstacles = show_obstacles
         self.draw_sensor_lines = True
@@ -271,13 +275,39 @@ class SensorMotionPlayer:
             self.current_frame, self.past_frames, self.future_frames, kernel_idx=0
         )
         self.past_traj, self.future_traj, self.past_orient, self.future_orient = result
+        self.command_traj, self.command_orient = self._compute_command_trajectory(
+            self.future_traj, self.future_orient
+        )
+
+    def _compute_command_trajectory(self, future_traj, future_orient):
+        """Linear interpolation from t=0 position to the last point of target trajectory."""
+        if future_traj is None or len(future_traj) < 2:
+            return None, None
+
+        N = len(future_traj)
+        t = np.linspace(0.0, 1.0, N)
+
+        start_pos = future_traj[0]   # (3,)
+        end_pos   = future_traj[-1]  # (3,)
+        command_traj = start_pos[None] + t[:, None] * (end_pos - start_pos)[None]  # (N, 3)
+
+        # SLERP between start and end orientation (WXYZ → XYZW for scipy)
+        def wxyz_to_xyzw(q): return np.array([q[1], q[2], q[3], q[0]])
+        r_start = Rotation.from_quat(wxyz_to_xyzw(future_orient[0]))
+        r_end   = Rotation.from_quat(wxyz_to_xyzw(future_orient[-1]))
+        slerp   = Slerp([0.0, 1.0], Rotation.concatenate([r_start, r_end]))
+        xyzw    = slerp(t).as_quat()                    # (N, 4) xyzw
+        command_orient = np.roll(xyzw, 1, axis=1)       # (N, 4) wxyz
+
+        return command_traj, command_orient
 
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
 
-    def render(self, scene):
-        scene.ngeom = 0
+    def render(self, scene, clear: bool = True):
+        if clear:
+            scene.ngeom = 0
 
         # trajectory
         if self.show_trajectory and hasattr(self, "past_traj"):
@@ -286,7 +316,11 @@ class SensorMotionPlayer:
                                 color=[0.2, 0.5, 1.0, 1.0])
             if self.future_traj is not None and len(self.future_traj) > 0:
                 draw_trajectory(scene, self.future_traj, self.future_orient,
-                                color=[1.0, 0.2, 0.2, 1.0])
+                                color=[1.0, 0.2, 0.2, 1.0])   # red: target trajectory
+            if self.show_command_traj and \
+               self.command_traj is not None and len(self.command_traj) > 0:
+                draw_trajectory(scene, self.command_traj, self.command_orient,
+                                color=[0.1, 0.9, 0.2, 1.0])   # green: command trajectory
 
         # obstacles
         if self.show_obstacles:
@@ -312,6 +346,10 @@ class SensorMotionPlayer:
     def toggle_trajectory(self):
         self.show_trajectory = not self.show_trajectory
         print(f"Trajectory: {'ON' if self.show_trajectory else 'OFF'}")
+
+    def toggle_command_trajectory(self):
+        self.show_command_traj = not self.show_command_traj
+        print(f"Command trajectory: {'ON' if self.show_command_traj else 'OFF'}")
 
     def toggle_sensor(self):
         self.show_sensor = not self.show_sensor
@@ -363,6 +401,8 @@ def key_callback(player: SensorMotionPlayer, keycode: int):
         player.reset()
     elif keycode in (ord('t'), ord('T')):
         player.toggle_trajectory()
+    elif keycode in (ord('c'), ord('C')):
+        player.toggle_command_trajectory()
     elif keycode in (ord('e'), ord('E')):
         player.toggle_sensor()
     elif keycode in (ord('l'), ord('L')):
@@ -547,6 +587,10 @@ def get_args():
     p.add_argument("--output", default=None,
                    help="Output pkl path (default: data/pkls/<dataset>_env2d_<modes>.pkl)")
     p.add_argument("--lookahead-frames", type=int, default=30)
+    p.add_argument("--no-video", action="store_true",
+                   help="Disable MP4 recording (visualisation mode only)")
+    p.add_argument("--video-width",  type=int, default=1280)
+    p.add_argument("--video-height", type=int, default=720)
     return p.parse_args()
 
 
@@ -559,6 +603,7 @@ def print_instructions():
     print("  UP/DOWN     : Prev / Next motion clip")
     print("  R           : Reset to first frame")
     print("  T           : Toggle trajectory")
+    print("  C           : Toggle command trajectory (green linear interp)")
     print("  E           : Toggle sensor overlay")
     print("  L           : Toggle ray lines (dots only ↔ lines+dots)")
     print("  O           : Toggle obstacle display")
@@ -664,6 +709,19 @@ def main():
     if args.motion > 0:
         player.load_motion(args.motion)
 
+    # ── Video recording setup ──────────────────────────────────────────────
+    writer   = None
+    renderer = None
+    frame_last_time = -np.inf
+    if not args.no_video:
+        os.makedirs("videos", exist_ok=True)
+        video_path = f"videos/step2_{time.strftime('%m%d_%H%M')}.mp4"
+        W, H = args.video_width, args.video_height
+        writer   = imageio.get_writer(video_path, fps=player.fps,
+                                      codec="libx264", pixelformat="yuv420p")
+        renderer = mujoco.Renderer(model, height=H, width=W)
+        print(f"Recording → {video_path}  ({W}×{H} @ {player.fps}fps)")
+
     print_instructions()
 
     with mujoco.viewer.launch_passive(
@@ -671,13 +729,27 @@ def main():
         key_callback=lambda kc: key_callback(player, kc),
     ) as viewer:
         viewer.sync()
-        while viewer.is_running():
-            player.step()
-            viewer.user_scn.ngeom = 0
-            player.render(viewer.user_scn)
-            viewer.cam.lookat[:] = mj_data.qpos[:3]
-            viewer.sync()
-            time.sleep(0.001)
+        try:
+            while viewer.is_running():
+                player.step()
+                viewer.user_scn.ngeom = 0
+                player.render(viewer.user_scn)
+                viewer.cam.lookat[:] = mj_data.qpos[:3]
+                viewer.sync()
+
+                if writer is not None and time.time() - frame_last_time > 1.0 / player.fps:
+                    renderer.update_scene(mj_data, camera=viewer.cam)
+                    player.render(renderer.scene, clear=False)
+                    writer.append_data(renderer.render())
+                    frame_last_time = time.time()
+
+                time.sleep(0.001)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if writer is not None:
+                writer.close()
+                print(f"Video saved: {video_path}")
 
 
 if __name__ == "__main__":
