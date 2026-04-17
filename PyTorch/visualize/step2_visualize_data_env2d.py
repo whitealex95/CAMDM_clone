@@ -48,7 +48,7 @@ import time
 import pickle
 
 import numpy as np
-from scipy.spatial.transform import Rotation, Slerp
+
 from typing import List, Union
 import mujoco
 import mujoco.viewer
@@ -311,26 +311,18 @@ class SensorMotionPlayer:
         )
 
     def _compute_command_trajectory(self, future_traj, future_orient):
-        """Linear interpolation from t=0 position to the last point of target trajectory."""
+        """Linear position interpolation (start → end); orientation taken from dataset."""
         if future_traj is None or len(future_traj) < 2:
             return None, None
 
         N = len(future_traj)
         t = np.linspace(0.0, 1.0, N)
 
-        start_pos = future_traj[0]   # (3,)
-        end_pos   = future_traj[-1]  # (3,)
+        start_pos    = future_traj[0]
+        end_pos      = future_traj[-1]
         command_traj = start_pos[None] + t[:, None] * (end_pos - start_pos)[None]  # (N, 3)
 
-        # SLERP between start and end orientation (WXYZ → XYZW for scipy)
-        def wxyz_to_xyzw(q): return np.array([q[1], q[2], q[3], q[0]])
-        r_start = Rotation.from_quat(wxyz_to_xyzw(future_orient[0]))
-        r_end   = Rotation.from_quat(wxyz_to_xyzw(future_orient[-1]))
-        slerp   = Slerp([0.0, 1.0], Rotation.concatenate([r_start, r_end]))
-        xyzw    = slerp(t).as_quat()                    # (N, 4) xyzw
-        command_orient = np.roll(xyzw, 1, axis=1)       # (N, 4) wxyz
-
-        return command_traj, command_orient
+        return command_traj, future_orient
 
     # ------------------------------------------------------------------
     # Rendering
