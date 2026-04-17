@@ -104,11 +104,13 @@ class SensorMotionPlayer:
         future_frames: int = 45,
         min_start_velocity: float = None,
         robot_safe_radius: float = 0.25,
+        max_div_obstacles: int = 3,
     ):
         self.model = model
         self.data = data
         self.dataset = dataset
         self.robot_safe_radius = robot_safe_radius
+        self.max_div_obstacles = max_div_obstacles
 
         # sensor
         self.sensor = EnvironmentSensor(max_range=max_range, resolution=resolution)
@@ -253,72 +255,170 @@ class SensorMotionPlayer:
         print(f"Regenerated {len(self.obstacles)} obstacles "
               f"({len(div_obs)} from trajectory divergence)")
 
+    # ------------------------------------------------------------------
+    # Divergence obstacle helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _polyline_seg_dist(center: np.ndarray,
+                           P1: np.ndarray,
+                           seg_d: np.ndarray, seg_d_sq: np.ndarray) -> float:
+        """Min distance from *center* to a pre-computed polyline (segment-based)."""
+        t = np.sum((center - P1) * seg_d, axis=1) / (seg_d_sq + 1e-12)
+        t = np.clip(t, 0.0, 1.0)
+        closest = P1 + t[:, None] * seg_d
+        return float(np.linalg.norm(center - closest, axis=1).min())
+
+    @staticmethod
+    def _point_to_seg_dist(c: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+        """Distance from point *c* to line segment *a*–*b*."""
+        ab = b - a
+        t  = np.dot(c - a, ab) / (np.dot(ab, ab) + 1e-12)
+        return float(np.linalg.norm(c - (a + np.clip(t, 0.0, 1.0) * ab)))
+
+    def _optimise_center(
+        self,
+        seed: np.ndarray,
+        green_start: np.ndarray,
+        green_end: np.ndarray,
+        P1: np.ndarray,
+        seg_d: np.ndarray, seg_d_sq: np.ndarray,
+        existing: List[Obstacle2D],
+        n_steps: int = 60,
+        max_dist: float = 2.5,
+    ):
+        """
+        Move *seed* (a point on the green line) away from the nearest red
+        segment point to find the center that maximises obstacle radius while
+        still overlapping the green line.
+
+        Returns (center, radius) or (None, 0) if no valid placement found.
+        """
+        # Direction: away from the nearest point on the red polyline
+        t = np.sum((seed - P1) * seg_d, axis=1) / (seg_d_sq + 1e-12)
+        t = np.clip(t, 0.0, 1.0)
+        closest_red = P1 + t[:, None] * seg_d               # (N-1, 2)
+        nearest_red = closest_red[np.linalg.norm(seed - closest_red, axis=1).argmin()]
+        away = seed - nearest_red
+        norm = np.linalg.norm(away)
+        if norm < 1e-6:
+            return None, 0.0
+        away /= norm
+
+        best_r, best_c = 0.0, None
+
+        for d in np.linspace(0.0, max_dist, n_steps):
+            c = seed + away * d
+
+            seg_clr = self._polyline_seg_dist(c, P1, seg_d, seg_d_sq)
+            eff     = seg_clr - self.robot_safe_radius
+            if eff <= 0:
+                continue
+            r = eff * 0.90
+            if r < 0.05:
+                continue
+
+            # Must still overlap the green LINE SEGMENT
+            dist_g = self._point_to_seg_dist(c, green_start, green_end)
+            if dist_g > r:
+                continue
+
+            # Must not overlap any already-placed divergence obstacle
+            if any(np.linalg.norm(c - o.center) < r + o.radius
+                   for o in existing if isinstance(o, CircleObstacle)):
+                continue
+
+            if r > best_r:
+                best_r = r
+                best_c = c.copy()
+
+        return best_c, best_r
+
     def _divergence_obstacles(self, path_xy: np.ndarray) -> List[Obstacle2D]:
         """
-        Place a circle obstacle in the gap between the linear (command/green)
-        and actual (red) trajectories when they diverge significantly.
+        Place up to *max_div_obstacles* circles in the gap between the linear
+        (green/command) and actual (red) trajectories.
 
-        Uses window + lookahead (up to 60 frames) so the robot has enough spatial
-        separation to leave a clear gap between the two trajectories.
+        Center optimisation
+        -------------------
+        Each circle's center is NOT restricted to the green line.  Starting
+        from the green point with maximum arrow-clearance from red, the center
+        is moved in the direction *away from the nearest red segment point*
+        until the circle no longer overlaps the green line.  This maximises
+        the achievable radius.
 
-        The obstacle:
-          - Center is on the green (straight-line) trajectory
-          - Radius = spatial clearance from the nearest red waypoint * 0.90
-          - Guaranteed NOT to overlap with the red trajectory
+        Multiple circles
+        ----------------
+        After placing each circle, green points it already "covers" are masked
+        out.  The next circle seeds from the best remaining uncovered green
+        point, enabling independent obstacles across the full gap.
         """
         N = len(path_xy)
         if N < 4:
             return []
 
-        t = np.linspace(0.0, 1.0, N)
-        green_xy = path_xy[0] + t[:, None] * (path_xy[-1] - path_xy[0])
+        t_param = np.linspace(0.0, 1.0, N)
+        green_start = path_xy[0].copy()
+        green_end   = path_xy[-1].copy()
+        green_xy    = green_start + t_param[:, None] * (green_end - green_start)
 
-        # Pointwise divergence (same-index comparison): skip if path is near-straight
+        # Skip near-straight trajectories
         pointwise = np.linalg.norm(green_xy - path_xy, axis=1)
         if float(pointwise.max()) < 0.10:
             return []
 
-        # Step 1: find best center using arrow points (every 5th) — sparser sampling
-        #   gives larger clearance values so we get meaningful center candidates.
-        arrow_indices = np.arange(0, N, 5)
-        red_arrow_xy = path_xy[arrow_indices]          # (M, 2)
-        diffs_arrow = green_xy[:, None, :] - red_arrow_xy[None, :, :]  # (N, M, 2)
-        dist_arrow = np.linalg.norm(diffs_arrow, axis=2).min(axis=1)   # (N,)
+        # Pre-compute polyline segments once (reused in every _optimise_center call)
+        P1      = path_xy[:-1]
+        P2      = path_xy[1:]
+        seg_d   = P2 - P1
+        seg_d_sq = (seg_d * seg_d).sum(axis=1)
 
-        # Exclude first/last 25 % — endpoints are shared with red, clearance ≈ 0
-        margin = max(2, N // 4)
-        dist_arrow[:margin] = 0.0
-        dist_arrow[N - margin:] = 0.0
+        # Arrow sample points used for seed selection (every 5th frame)
+        arrow_idx    = np.arange(0, N, 5)
+        red_arrow_xy = path_xy[arrow_idx]
 
-        if float(dist_arrow.max()) < 0.05:
-            return []
+        margin  = max(2, N // 4)
+        covered = np.zeros(N, dtype=bool)
+        covered[:margin]   = True   # exclude shared endpoints
+        covered[N-margin:] = True
 
-        best_idx = int(dist_arrow.argmax())
-        center = green_xy[best_idx].copy()
+        obstacles: List[Obstacle2D] = []
 
-        # Step 2: minimum distance from center to the red PATH as a polyline
-        #   (segment-based, not point-based) so no LINE SEGMENT clips the obstacle.
-        P1 = path_xy[:-1]                                    # (N-1, 2)
-        P2 = path_xy[1:]                                     # (N-1, 2)
-        seg_d = P2 - P1                                      # (N-1, 2)
-        t = np.sum((center - P1) * seg_d, axis=1) / (
-            np.sum(seg_d * seg_d, axis=1) + 1e-12)
-        t = np.clip(t, 0.0, 1.0)
-        closest = P1 + t[:, None] * seg_d                   # (N-1, 2)
-        seg_clearance = float(np.linalg.norm(center - closest, axis=1).min())
+        for _ in range(self.max_div_obstacles):
+            # Arrow-point clearance for each green point
+            da = np.linalg.norm(
+                green_xy[:, None, :] - red_arrow_xy[None, :, :], axis=2
+            ).min(axis=1)
+            da[covered] = 0.0
 
-        # Subtract robot body radius so the obstacle surface stays clear of the robot
-        effective_clearance = seg_clearance - self.robot_safe_radius
-        radius = effective_clearance * 0.90
+            if float(da.max()) < 0.05:
+                break
 
-        if radius < 0.05:
-            return []
+            seed_idx = int(da.argmax())
+            seed     = green_xy[seed_idx].copy()
 
-        print(f"  [divergence] PLACED r={radius:.2f}m  "
-              f"seg_clearance={seg_clearance:.3f}m  "
-              f"effective={effective_clearance:.3f}m (body={self.robot_safe_radius}m)  "
-              f"idx={best_idx}/{N}")
-        return [CircleObstacle(center, radius)]
+            center, radius = self._optimise_center(
+                seed, green_start, green_end,
+                P1, seg_d, seg_d_sq,
+                existing=obstacles,
+            )
+
+            if center is None or radius < 0.05:
+                covered[seed_idx] = True   # mark exhausted, try elsewhere
+                continue
+
+            obs = CircleObstacle(center, radius)
+            obstacles.append(obs)
+            print(f"  [divergence #{len(obstacles)}] r={radius:.2f}m  "
+                  f"center={center.round(3)}  seed_idx={seed_idx}/{N}")
+
+            # Mask green points covered by this obstacle
+            covered |= np.linalg.norm(green_xy - center, axis=1) < radius
+
+            if covered[margin:N-margin].all():
+                break   # entire middle section is now blocked
+
+        return obstacles
 
     def update_pose(self):
         qpos = self.current_motion.get_qpos(self.current_frame)
