@@ -80,9 +80,11 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
         self._ring_slices = ring_slices
 
         window_size = past_frame + future_frame
-        n_missing = 0
+        n_missing_sensor = 0
+        n_missing_detour = 0
 
         self.sensor_readings_list = []
+        self.command_detour_flags_list = []
         for motion in data_source["motions"][:limited_num]:
             N = motion["local_joint_rotations"].shape[0]
             if N < window_size:
@@ -90,13 +92,23 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
             if "sensor_readings" in motion:
                 readings = np.asarray(motion["sensor_readings"], dtype=dtype)
             else:
-                n_missing += 1
+                n_missing_sensor += 1
                 readings = np.zeros((N, self.env_sensor_dim), dtype=dtype)
             self.sensor_readings_list.append(readings)
 
-        if n_missing:
-            print(f"[HumanoidEnvMotionDataset] WARNING: {n_missing} clips had no "
+            if "command_detour_flags" in motion:
+                flags = np.asarray(motion["command_detour_flags"], dtype=bool)
+            else:
+                n_missing_detour += 1
+                flags = np.zeros(N, dtype=bool)
+            self.command_detour_flags_list.append(flags)
+
+        if n_missing_sensor:
+            print(f"[HumanoidEnvMotionDataset] WARNING: {n_missing_sensor} clips had no "
                   f"sensor_readings field; using all-zero readings for those clips.")
+        if n_missing_detour:
+            print(f"[HumanoidEnvMotionDataset] WARNING: {n_missing_detour} clips had no "
+                  f"command_detour_flags field; treating all frames as non-detour.")
 
         print(f"[HumanoidEnvMotionDataset] env_sensor_dim={self.env_sensor_dim}, "
               f"resolution={sensor_resolution}, max_range={sensor_max_range}m, "
@@ -181,6 +193,18 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
                 if k != 0:
                     rotated[start:end] = np.roll(sensor_current[start:end], k)
             sensor_current = rotated
+
+        # ----------------------------------------------------------
+        # COMMAND TRAJECTORY: replace traj_pos with linear interpolation
+        # when the current frame falls in a detour obstacle window.
+        # The endpoint (traj_pos[-1]) is already in the rotated frame,
+        # so this is applied after rotation augmentation.
+        # ----------------------------------------------------------
+        current_frame = frame_ids[self.reference_frame_idx - 1]
+        if self.command_detour_flags_list[motion_idx][current_frame]:
+            TF = len(traj_pos)
+            t  = np.arange(1, TF + 1, dtype=traj_pos.dtype) / TF   # (TF,) 1/TF … 1
+            traj_pos = t[:, None] * traj_pos[-1][None]              # straight line → endpoint
 
         # ----------------------------------------------------------
         # TORCH CONVERSION (same as base class)

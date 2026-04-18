@@ -471,7 +471,7 @@ def create_env_dataset(
     resolution: int = 9,
     obstacle_interval: int = 30,
     robot_safe_radius: float = 0.5,
-    lookahead_frames: int = 30,
+    lookahead_frames: int = 45,
     seed: int = 0,
     mode: Union[str, List[str]] = 'sparse',
 ):
@@ -546,7 +546,7 @@ def create_env_dataset(
 
             generator.seed(seed + clip_idx)
 
-            readings, _ = compute_clip_sensor_readings(
+            readings, _, detour_flags = compute_clip_sensor_readings(
                 all_qpos,
                 sensor,
                 generator,
@@ -555,8 +555,9 @@ def create_env_dataset(
                 detour_fn=detour_fn,
             )
             new_motion = dict(motion)
-            new_motion["sensor_readings"] = readings.astype(np.float32)
-            new_motion["obstacle_mode"]   = mode_str
+            new_motion["sensor_readings"]      = readings.astype(np.float32)
+            new_motion["command_detour_flags"] = detour_flags          # (T,) bool
+            new_motion["obstacle_mode"]        = mode_str
             output_motions.append(new_motion)
 
     data_dict["motions"] = output_motions
@@ -638,7 +639,7 @@ def get_args():
                         "(overrides --dataset; default: data/pkls/<dataset>.pkl)")
     p.add_argument("--output", default=None,
                    help="Output pkl path (default: data/pkls/<dataset>_env2d_<modes>.pkl)")
-    p.add_argument("--lookahead-frames", type=int, default=30)
+    p.add_argument("--lookahead-frames", type=int, default=45)
     p.add_argument("--no-video", action="store_true",
                    help="Disable MP4 recording (visualisation mode only)")
     p.add_argument("--video-width",  type=int, default=1280)

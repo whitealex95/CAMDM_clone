@@ -679,6 +679,7 @@ def compute_clip_sensor_readings(
     """
     T = all_qpos.shape[0]
     readings = np.zeros((T, sensor.feature_dim), dtype=np.float32)
+    detour_flags = np.zeros(T, dtype=bool)
     window_obstacles = []
 
     starts = list(range(0, T, obstacle_interval))
@@ -692,7 +693,10 @@ def compute_clip_sensor_readings(
         obstacles = generator.generate_for_window(window_xy, lookahead_xy)
         if detour_fn is not None:
             div_xy = all_qpos[w_start:la_end, :2]
-            obstacles = obstacles + list(detour_fn(div_xy))
+            det_obs = list(detour_fn(div_xy))
+            if det_obs:
+                detour_flags[w_start:w_end] = True
+            obstacles = obstacles + det_obs
         window_obstacles.append((w_start, w_end, obstacles))
 
         for t in range(w_start, w_end):
@@ -701,4 +705,4 @@ def compute_clip_sensor_readings(
             occ, _ = sensor.compute(pos, yaw, obstacles)
             readings[t] = occ
 
-    return readings, window_obstacles
+    return readings, window_obstacles, detour_flags
