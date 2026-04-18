@@ -150,14 +150,8 @@ if __name__ == "__main__":
     else:
         raise AssertionError("Configuration file must be specified (-c config.json).")
 
-    if "debug" in args.name:
-        config.arch.offset_frame = config.arch.clip_len
-        config.trainer.workers = 4
-        config.trainer.load_num = None
-        config.trainer.batch_size = 256
-
     if not args.cluster:
-        if os.path.exists(config.save) and "debug" not in args.name and args.resume is None:
+        if os.path.exists(config.save) and args.resume is None:
             allow = input(f"Model dir ({config.save}) exists. Overwrite? (Y/N): ").lower()
             if allow == "n":
                 exit()
