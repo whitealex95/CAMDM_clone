@@ -225,19 +225,18 @@ class SensorMotionPlayer:
         if win_idx is None:
             win_idx = self._current_window_idx()
 
-        w_start = win_idx * self.obstacle_interval
-        w_end = min(w_start + self.obstacle_interval, self.current_motion.num_frames)
-        la_end = min(w_end + self.obstacle_interval, self.current_motion.num_frames)
-
-        # Divergence check must cover the full future_traj window (future_frames),
-        # which can extend beyond la_end when current_frame is late in the window.
-        div_end = min(w_end + self.future_frames, self.current_motion.num_frames)
+        w_start  = win_idx * self.obstacle_interval
+        w_end    = min(w_start + self.obstacle_interval, self.current_motion.num_frames)
+        # Lookahead covers the full future trajectory window so random obstacles
+        # cannot block the path even at the end of the future horizon.
+        la_end   = min(w_end + self.future_frames, self.current_motion.num_frames)
+        div_end  = la_end  # detour check uses the same range
 
         # Collect robot XY for current + lookahead window
         all_qpos = self.current_motion.get_all_qpos()
-        window_xy  = all_qpos[w_start:w_end, :2]
+        window_xy    = all_qpos[w_start:w_end, :2]
         lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
-        div_xy = all_qpos[w_start:div_end, :2]   # window + future_frames lookahead
+        div_xy       = all_qpos[w_start:div_end, :2]   # window + future_frames
 
         # Deterministic seed: (motion_idx * 1000 + win_idx)
         self.generator.seed(self.current_motion_idx * 1000 + win_idx)
@@ -253,14 +252,14 @@ class SensorMotionPlayer:
         # Use a random seed to get a different placement
         self.generator.seed(int(time.time() * 1000) % 1_000_000)
         win_idx = self._current_window_idx()
-        w_start = win_idx * self.obstacle_interval
-        w_end = min(w_start + self.obstacle_interval, self.current_motion.num_frames)
-        la_end = min(w_end + self.obstacle_interval, self.current_motion.num_frames)
-        div_end = min(w_end + self.future_frames, self.current_motion.num_frames)
+        w_start  = win_idx * self.obstacle_interval
+        w_end    = min(w_start + self.obstacle_interval, self.current_motion.num_frames)
+        la_end   = min(w_end + self.future_frames, self.current_motion.num_frames)
+        div_end  = la_end
         all_qpos = self.current_motion.get_all_qpos()
-        window_xy = all_qpos[w_start:w_end, :2]
+        window_xy    = all_qpos[w_start:w_end, :2]
         lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
-        div_xy = all_qpos[w_start:div_end, :2]
+        div_xy       = all_qpos[w_start:div_end, :2]
         self.obstacles = self.generator.generate_for_window(window_xy, lookahead_xy)
         use_detour = self._detour_flags[win_idx % len(self._detour_flags)]
         div_obs = self._detour_obstacles(div_xy) if use_detour else []
