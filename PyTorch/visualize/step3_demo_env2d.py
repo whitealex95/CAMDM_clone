@@ -304,6 +304,7 @@ class DemoPlayerEnv:
 
         self.obstacles = []
         self._last_obs_window = -1
+        self._has_detour = False
 
         self.show_trajectory = show_trajectory
         self.show_sensor     = True
@@ -321,6 +322,8 @@ class DemoPlayerEnv:
         self.generated_qpos         = None
         self.generated_future_traj  = None
         self.generated_future_orient = None
+        self.command_traj   = None
+        self.command_orient = None
 
         self.traj_bias_pos = float(traj_bias_pos)
         self.traj_bias_rot = float(traj_bias_rot)
@@ -423,6 +426,7 @@ class DemoPlayerEnv:
         self.obstacles = self.generator_obs.generate_for_window(win_xy, la_xy)
         # Detour obstacles: use dataset target trajectory (same as step2)
         use_detour = self._detour_flags[w % len(self._detour_flags)]
+        self._has_detour = use_detour
         if use_detour:
             self.obstacles.extend(self._detour_obstacles_from_dataset(w))
         self._last_obs_window = w
@@ -434,6 +438,7 @@ class DemoPlayerEnv:
         self.obstacles = self.generator_obs.generate_for_window(win_xy, la_xy)
         w = self._window_idx()
         use_detour = self._detour_flags[w % len(self._detour_flags)]
+        self._has_detour = use_detour
         det_obs = self._detour_obstacles_from_dataset(w) if use_detour else []
         self.obstacles.extend(det_obs)
         print(f"Regenerated {len(self.obstacles)} obstacles  "
@@ -544,6 +549,19 @@ class DemoPlayerEnv:
         )
         return pt[:, :2], ft[:, :2], po, fo
 
+    def _compute_command_trajectory(self):
+        """Yellow trajectory: linear interp to endpoint when detour, else same as target."""
+        if self.future_traj_dataset is None:
+            return None, None
+        if not self._has_detour:
+            return self.future_traj_dataset.copy(), self.future_orient_dataset.copy()
+        curr_xy  = self.data.qpos[:2].copy()
+        endpoint = self.future_traj_dataset[-1]
+        TF = len(self.future_traj_dataset)
+        t  = np.arange(1, TF + 1, dtype=np.float32) / TF
+        command_pos = curr_xy + t[:, None] * (endpoint - curr_xy)
+        return command_pos, self.future_orient_dataset.copy()
+
     def _update_future_trajectory(self):
         _, ft_d, _, fo_d = self._load_traj_from_dataset()
         ref_q  = self.current_motion_data.get_qpos(self.current_frame)
@@ -552,6 +570,7 @@ class DemoPlayerEnv:
         self.future_traj_dataset, self.future_orient_dataset = match_future_horizon(
             aligned_t, aligned_o, self.future_frames
         )
+        self.command_traj, self.command_orient = self._compute_command_trajectory()
 
         if self.generated_qpos is not None:
             gft  = self.generated_qpos[:, :3]
@@ -562,12 +581,12 @@ class DemoPlayerEnv:
             ext_t, ext_o = extend_future_traj_heusristic(pred_xy, pred_ori, self.future_frames)
             self.future_traj, self.future_orient = blend_trajectory(
                 ext_t, ext_o,
-                self.future_traj_dataset, self.future_orient_dataset,
+                self.command_traj, self.command_orient,
                 blend=self.traj_bias_pos, blend_rot=self.traj_bias_rot,
             )
         else:
-            self.future_traj   = self.future_traj_dataset
-            self.future_orient = self.future_orient_dataset
+            self.future_traj   = self.command_traj
+            self.future_orient = self.command_orient
 
     # ------------------------------------------------------------------
     # Rendering
@@ -580,11 +599,14 @@ class DemoPlayerEnv:
         if self.show_trajectory and hasattr(self, 'past_traj'):
             draw_trajectory(scene, self.past_traj, self.past_orient,
                             color=[0.2, 0.5, 1.0, 1.0])
-            if hasattr(self, 'future_traj_dataset'):
+            if hasattr(self, 'future_traj_dataset') and self.future_traj_dataset is not None:
                 draw_trajectory(scene, self.future_traj_dataset,
-                                self.future_orient_dataset, color=[1.0, 0.2, 0.2, 1.0])
+                                self.future_orient_dataset, color=[1.0, 0.2, 0.2, 1.0])   # red: target
+            if self.command_traj is not None:
+                draw_trajectory(scene, self.command_traj, self.command_orient,
+                                color=[1.0, 0.9, 0.0, 1.0])                               # yellow: command
             draw_trajectory(scene, self.future_traj, self.future_orient,
-                            color=[0.2, 1.0, 0.2, 1.0])
+                            color=[0.2, 1.0, 0.2, 1.0])                                   # green: blended
             if self.generated_future_traj is not None:
                 draw_trajectory(scene, self.generated_future_traj,
                                 self.generated_future_orient, color=[0.2, 0.2, 0.2, 0.5])
