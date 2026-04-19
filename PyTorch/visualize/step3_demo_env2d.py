@@ -283,6 +283,7 @@ class DemoPlayerEnv:
         inertial_quat_start=3, inertial_quat_end=7,
         obstacle_interval=30, obstacle_mode='sparse',
         robot_safe_radius=0.25,
+        command_orient_mode='target',
     ):
         self.model   = mj_model
         self.data    = mj_data
@@ -291,6 +292,7 @@ class DemoPlayerEnv:
 
         self.sensor = generator.sensor
         self.robot_safe_radius = float(robot_safe_radius)
+        self.command_orient_mode = str(command_orient_mode)  # target | interp | forward
 
         # Decompose new-style mode names into detour flags + random modes
         if isinstance(obstacle_mode, str):
@@ -557,7 +559,13 @@ class DemoPlayerEnv:
         return pt[:, :2], ft[:, :2], po, fo
 
     def _compute_command_trajectory(self):
-        """Yellow trajectory: linear interp to endpoint when detour, else same as target."""
+        """Yellow trajectory: linear interp to endpoint when detour, else same as target.
+
+        Orientation modes (command_orient_mode):
+          target  : copy future_orient_dataset (default)
+          interp  : slerp from current robot orientation to endpoint orientation
+          forward : align each frame's yaw to the direction of movement
+        """
         if self.future_traj_dataset is None:
             return None, None
         if not self._has_detour:
@@ -567,7 +575,31 @@ class DemoPlayerEnv:
         TF = len(self.future_traj_dataset)
         t  = np.arange(1, TF + 1, dtype=np.float32) / TF
         command_pos = curr_xy + t[:, None] * (endpoint - curr_xy)
-        return command_pos, self.future_orient_dataset.copy()
+
+        if self.command_orient_mode == "target":
+            command_orient = self.future_orient_dataset.copy()
+
+        elif self.command_orient_mode == "interp":
+            from scipy.spatial.transform import Rotation as ScipyR, Slerp
+            curr_wxyz = self.data.qpos[3:7].astype(np.float32)
+            end_wxyz  = self.future_orient_dataset[-1]
+            r0 = ScipyR.from_quat(curr_wxyz[[1, 2, 3, 0]])
+            r1 = ScipyR.from_quat(end_wxyz[[1, 2, 3, 0]])
+            slerp = Slerp([0.0, 1.0], ScipyR.concatenate([r0, r1]))
+            xyzw  = slerp(t).as_quat()                          # (TF, 4) xyzw
+            command_orient = xyzw[:, [3, 0, 1, 2]].astype(np.float32)  # → wxyz
+
+        elif self.command_orient_mode == "forward":
+            # Direction of movement: straight line → constant yaw from curr to endpoint
+            dx, dy = float(endpoint[0] - curr_xy[0]), float(endpoint[1] - curr_xy[1])
+            yaw    = np.arctan2(dy, dx)
+            quat   = np.array([np.cos(yaw / 2), 0., 0., np.sin(yaw / 2)], np.float32)
+            command_orient = np.tile(quat, (TF, 1))
+
+        else:
+            raise ValueError(f"Unknown command_orient_mode: {self.command_orient_mode!r}")
+
+        return command_pos, command_orient
 
     def _update_future_trajectory(self):
         _, ft_d, _, fo_d = self._load_traj_from_dataset()
@@ -719,6 +751,12 @@ def get_args():
                         "Legacy: sparse|dense|compact|none (no detour).")
     p.add_argument("--obstacle-interval", type=int, default=30)
     p.add_argument("--robot-safe-radius", type=float, default=0.25)
+    p.add_argument("--command-orient-mode", default="target",
+                   choices=["target", "interp", "forward"],
+                   help="Yellow trajectory orientation: "
+                        "target=copy dataset orient, "
+                        "interp=slerp curr→endpoint, "
+                        "forward=align to movement direction")
     p.add_argument("--resolution", type=int,   default=9)
     p.add_argument("--max-range",  type=float, default=2.0)
     p.add_argument("--traj-bias-pos",  type=float, default=0.4)
@@ -844,6 +882,7 @@ def main():
         obstacle_interval=args.obstacle_interval,
         obstacle_mode=[m.strip() for m in args.mode.split("|") if m.strip()],
         robot_safe_radius=args.robot_safe_radius,
+        command_orient_mode=args.command_orient_mode,
     )
 
     if args.motion > 0:
