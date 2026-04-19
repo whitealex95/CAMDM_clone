@@ -630,7 +630,7 @@ def run_comparison(args, mj_model, generator, obstacle, init_qpos, style_idx, wa
     _save_comparison_figure(qpos_on, qpos_off, obstacle, waypoints,
                             f"videos/straight_compare_{tag}.png")
     _save_comparison_video(qpos_on, qpos_off, mj_model, obstacle, waypoints,
-                           fps, f"videos/straight_compare_{tag}.mp4")
+                           generator.sensor, fps, f"videos/straight_compare_{tag}.mp4")
 
 
 def _save_comparison_figure(qpos_on, qpos_off, obstacle, waypoints, output_path):
@@ -675,7 +675,7 @@ def _save_comparison_figure(qpos_on, qpos_off, obstacle, waypoints, output_path)
 
 
 def _save_comparison_video(qpos_on, qpos_off, mj_model, obstacle, waypoints,
-                           fps, output_path, W=640, H=720):
+                           sensor, fps, output_path, W=640, H=720):
     cam = mujoco.MjvCamera()
     mujoco.mjv_defaultCamera(cam)
     mid_x = (waypoints[0, 0] + waypoints[-1, 0]) / 2
@@ -690,13 +690,20 @@ def _save_comparison_video(qpos_on, qpos_off, mj_model, obstacle, waypoints,
     ren_on  = mujoco.Renderer(mj_model, height=H, width=W)
     ren_off = mujoco.Renderer(mj_model, height=H, width=W)
 
-    def _draw_overlay(scene, past_xy, traj_color, label):
+    def _draw_overlay(scene, past_xy, traj_color, label, qpos, zero_sensor):
         draw_obstacle_circle(scene, obstacle.center, obstacle.radius, height=1.2)
         wps3 = np.hstack([waypoints, np.full((len(waypoints), 1), 0.02)])
         draw_trajectory_lines(scene, wps3, color=[1.0, 0.85, 0.0, 0.6])
         if len(past_xy) >= 2:
             past3 = np.hstack([past_xy, np.full((len(past_xy), 1), 0.05)])
             draw_trajectory_lines(scene, past3.astype(np.float64), color=traj_color)
+        # Sensor dots: actual readings when ON, zeros when OFF
+        yaw = quat_wxyz_to_yaw(qpos[3:7])
+        readings, sphere_centers = sensor.compute(qpos[:3], yaw, [obstacle])
+        if zero_sensor:
+            readings = np.zeros_like(readings)
+        draw_sensor_readings(scene, qpos[:3], readings, sphere_centers,
+                             z_height=0.08, dot_radius=0.04, draw_lines=False)
         center_pos = np.array([mid_x, mid_y, 2.5])
         draw_label(scene, center_pos, label)
 
@@ -711,14 +718,16 @@ def _save_comparison_video(qpos_on, qpos_off, mj_model, obstacle, waypoints,
         mujoco.mj_forward(mj_model, mj_data_on)
         ren_on.update_scene(mj_data_on, camera=cam)
         _draw_overlay(ren_on.scene, qpos_on[:t_on + 1, :2],
-                      [0.1, 1.0, 0.1, 0.95], "SENSOR: ON")
+                      [0.1, 1.0, 0.1, 0.95], "SENSOR: ON",
+                      qpos=qpos_on[t_on], zero_sensor=False)
         frame_on = ren_on.render().copy()
 
         mj_data_off.qpos[:] = qpos_off[t_off]
         mujoco.mj_forward(mj_model, mj_data_off)
         ren_off.update_scene(mj_data_off, camera=cam)
         _draw_overlay(ren_off.scene, qpos_off[:t_off + 1, :2],
-                      [1.0, 0.15, 0.15, 0.95], "SENSOR: OFF")
+                      [1.0, 0.15, 0.15, 0.95], "SENSOR: OFF",
+                      qpos=qpos_off[t_off], zero_sensor=True)
         frame_off = ren_off.render().copy()
 
         writer.append_data(np.hstack([frame_on, frame_off]))
