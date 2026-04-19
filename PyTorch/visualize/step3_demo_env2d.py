@@ -403,15 +403,22 @@ class DemoPlayerEnv:
         return self.current_frame // self.obstacle_interval
 
     def _detour_obstacles_from_dataset(self, win_idx: int):
-        """Compute detour obstacles from dataset target trajectory (same as step2)."""
-        w_start = win_idx * self.obstacle_interval
-        w_end   = min(w_start + self.obstacle_interval, self.current_motion_data.num_frames)
-        div_end = min(w_end + self.future_frames, self.current_motion_data.num_frames)
-        all_qpos = self.current_motion_data.get_all_qpos()
-        div_xy   = all_qpos[w_start:div_end, :2]
+        """Compute detour obstacles using actual robot trajectory + aligned future path.
+
+        step2 uses raw dataset world-XY which matches because the robot always follows
+        the dataset exactly.  In step3 the model can drift, so we build div_xy from:
+          - qpos_history  : actual past robot positions (world XY)
+          - future_traj_dataset : dataset trajectory aligned to the current robot pose
+        This ensures obstacles are placed near where the robot actually is.
+        """
+        past_xy   = np.array(self.qpos_history)[:, :2]
+        future_xy = (self.future_traj_dataset[:, :2]
+                     if getattr(self, 'future_traj_dataset', None) is not None
+                     else np.empty((0, 2), dtype=np.float32))
+        div_xy = np.concatenate([past_xy, future_xy], axis=0)
         obs, _   = compute_detour_obstacles(div_xy, robot_safe_radius=self.robot_safe_radius)
         for k, o in enumerate(obs):
-            tag = "off-green" if k == 0 else "on-green"
+            tag = "off-line" if k == 0 else "on-line"
             print(f"  [detour #{k+1} {tag}] r={o.radius:.2f}m  center={o.center.round(3)}")
         return obs
 
