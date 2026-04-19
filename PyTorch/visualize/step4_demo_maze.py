@@ -1052,7 +1052,7 @@ def run_comparison(args, mj_model, dataset, generator, maze: MazeLayout):
 
     # ── Side-by-side MP4 ─────────────────────────────────────────────────
     video_path = f"videos/demo_maze_compare_{tag}.mp4"
-    _save_comparison_video(qpos_on, qpos_off, mj_model, maze, fps, video_path)
+    _save_comparison_video(qpos_on, qpos_off, mj_model, maze, generator.sensor, fps, video_path)
 
 
 def _save_comparison_video(
@@ -1060,6 +1060,7 @@ def _save_comparison_video(
     qpos_off: np.ndarray,
     mj_model,
     maze: MazeLayout,
+    sensor,
     fps: int,
     output_path: str,
     W: int = 640,
@@ -1085,7 +1086,8 @@ def _save_comparison_video(
     ren_on  = mujoco.Renderer(mj_model, height=H, width=W)
     ren_off = mujoco.Renderer(mj_model, height=H, width=W)
 
-    def _draw_overlay(scene, past_xy: np.ndarray, traj_color: list, label: str):
+    def _draw_overlay(scene, past_xy: np.ndarray, traj_color: list, label: str,
+                      qpos: np.ndarray, zero_sensor: bool):
         for obs in maze.walls:
             draw_obstacle_box(scene, obs.center, obs.half_extents, obs.yaw,
                               height=0.8, color=[0.55, 0.55, 0.55, 0.7])
@@ -1099,6 +1101,13 @@ def _save_comparison_video(
                 dtype=np.float64,
             )
             draw_trajectory_lines(scene, past3, color=traj_color)
+        # Sensor dots: actual readings when ON, zeros when OFF
+        yaw = quat_wxyz_to_yaw(qpos[3:7])
+        readings, sphere_centers = sensor.compute(qpos[:3], yaw, maze.walls)
+        if zero_sensor:
+            readings = np.zeros_like(readings)
+        draw_sensor_readings(scene, qpos[:3], readings, sphere_centers,
+                             z_height=0.08, dot_radius=0.04, draw_lines=False)
         draw_label(scene, np.array([center_world[0], center_world[1], 2.8]), label)
 
     writer = imageio.get_writer(output_path, fps=fps, codec="libx264", pixelformat="yuv420p")
@@ -1113,14 +1122,16 @@ def _save_comparison_video(
         mujoco.mj_forward(mj_model, mj_data_on)
         ren_on.update_scene(mj_data_on, camera=cam)
         _draw_overlay(ren_on.scene, qpos_on[:t_on + 1, :2],
-                      [0.1, 1.0, 0.1, 0.95], "SENSOR: ON")
+                      [0.1, 1.0, 0.1, 0.95], "SENSOR: ON",
+                      qpos=qpos_on[t_on], zero_sensor=False)
         frame_on = ren_on.render().copy()
 
         mj_data_off.qpos[:] = qpos_off[t_off]
         mujoco.mj_forward(mj_model, mj_data_off)
         ren_off.update_scene(mj_data_off, camera=cam)
         _draw_overlay(ren_off.scene, qpos_off[:t_off + 1, :2],
-                      [1.0, 0.15, 0.15, 0.95], "SENSOR: OFF")
+                      [1.0, 0.15, 0.15, 0.95], "SENSOR: OFF",
+                      qpos=qpos_off[t_off], zero_sensor=True)
         frame_off = ren_off.render().copy()
 
         writer.append_data(np.hstack([frame_on, frame_off]))
@@ -1270,7 +1281,7 @@ def get_args():
                    help="Rotation blend exponent")
     p.add_argument("--sampler",       default="ddpm", choices=["ddpm", "ddim"])
     p.add_argument("--cfg-count",     type=int,   default=2)
-    p.add_argument("--applyframes",   type=int,   default=15)
+    p.add_argument("--applyframes",   type=int,   default=30)
     p.add_argument("--inertialize",   default="on", choices=["on", "off"])
     p.add_argument("--inertialization-mode", default="camdm", choices=["camdm", "spring"])
     p.add_argument("--blendtime-rotation",   type=float, default=0.2)
