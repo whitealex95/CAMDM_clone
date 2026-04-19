@@ -22,7 +22,7 @@ Controls (visualisation mode)
   UP   / DOWN : Previous / Next motion clip
   R           : Reset to first frame
   T           : Toggle trajectory visualisation
-  C           : Toggle command trajectory (green linear)
+  C           : Toggle command trajectory (yellow linear)
   E           : Toggle environment-sensor overlay
   L           : Toggle ray lines (dots only ↔ lines+dots)
   O           : Toggle obstacle display
@@ -362,7 +362,7 @@ class SensorMotionPlayer:
             if self.show_command_traj and \
                self.command_traj is not None and len(self.command_traj) > 0:
                 draw_trajectory(scene, self.command_traj, self.command_orient,
-                                color=[0.1, 0.9, 0.2, 1.0])   # green: command trajectory
+                                color=[1.0, 0.9, 0.0, 1.0])   # yellow: command trajectory
 
         # obstacles
         if self.show_obstacles:
@@ -655,7 +655,7 @@ def print_instructions():
     print("  UP/DOWN     : Prev / Next motion clip")
     print("  R           : Reset to first frame")
     print("  T           : Toggle trajectory")
-    print("  C           : Toggle command trajectory (green linear interp)")
+    print("  C           : Toggle command trajectory (yellow linear interp)")
     print("  E           : Toggle sensor overlay")
     print("  L           : Toggle ray lines (dots only ↔ lines+dots)")
     print("  O           : Toggle obstacle display")
