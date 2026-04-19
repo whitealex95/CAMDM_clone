@@ -74,6 +74,18 @@ from utils.environment_sensor import (
     BoxObstacle,
     quat_wxyz_to_yaw,
 )
+from visualize.utils.detour import compute_detour_obstacles
+
+# Maps new-style mode names to underlying ObstacleGenerator modes
+_MODE_TO_RANDOM = {
+    "detour_only":   "none",
+    "detour_sparse": "sparse",
+    "detour_dense":  "dense",
+    "detour_packed": "compact",
+    "none":          "none",
+    # legacy names (backward compat)
+    "sparse": "sparse", "dense": "dense", "compact": "compact",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -270,14 +282,26 @@ class DemoPlayerEnv:
         spring_halflife_position=0.12, spring_halflife_rotation=0.12,
         inertial_quat_start=3, inertial_quat_end=7,
         obstacle_interval=30, obstacle_mode='sparse',
+        robot_safe_radius=0.25,
     ):
         self.model   = mj_model
         self.data    = mj_data
         self.dataset = dataset
         self.motion_generator = generator
 
-        self.sensor    = generator.sensor
-        self.generator_obs = make_generator(obstacle_mode)
+        self.sensor = generator.sensor
+        self.robot_safe_radius = float(robot_safe_radius)
+
+        # Decompose new-style mode names into detour flags + random modes
+        if isinstance(obstacle_mode, str):
+            obstacle_mode = [obstacle_mode]
+        self._detour_flags = [m != "none" and not m.startswith("none") and
+                               (m.startswith("detour_") or m == "detour_only")
+                               for m in obstacle_mode]
+        random_modes = [_MODE_TO_RANDOM.get(m, m) for m in obstacle_mode]
+        self.generator_obs = make_generator(random_modes)
+        self.obstacle_mode = obstacle_mode
+
         self.obstacles = []
         self._last_obs_window = -1
 
@@ -375,18 +399,32 @@ class DemoPlayerEnv:
     def _window_idx(self) -> int:
         return self.current_frame // self.obstacle_interval
 
+    def _detour_obstacles_from_dataset(self, win_idx: int):
+        """Compute detour obstacles from dataset target trajectory (same as step2)."""
+        w_start = win_idx * self.obstacle_interval
+        w_end   = min(w_start + self.obstacle_interval, self.current_motion_data.num_frames)
+        div_end = min(w_end + self.future_frames, self.current_motion_data.num_frames)
+        all_qpos = self.current_motion_data.get_all_qpos()
+        div_xy   = all_qpos[w_start:div_end, :2]
+        obs, _   = compute_detour_obstacles(div_xy, robot_safe_radius=self.robot_safe_radius)
+        for k, o in enumerate(obs):
+            tag = "off-green" if k == 0 else "on-green"
+            print(f"  [detour #{k+1} {tag}] r={o.radius:.2f}m  center={o.center.round(3)}")
+        return obs
+
     def _maybe_regenerate(self):
         w = self._window_idx()
         if w == self._last_obs_window:
             return
-        # Use actual robot positions (qpos_history) as safe zone,
-        # with future_traj waypoints as lookahead — avoids placing
-        # obstacles where the robot actually is, not where GT says it is.
+        # Random obstacles: use actual robot positions as safe zone (step3 advantage)
         win_xy = np.array(self.qpos_history)[:, :2]
         la_xy  = self.future_traj[:, :2] if hasattr(self, 'future_traj') and self.future_traj is not None else None
-
         self.generator_obs.seed(self.current_motion_idx * 1000 + w)
         self.obstacles = self.generator_obs.generate_for_window(win_xy, la_xy)
+        # Detour obstacles: use dataset target trajectory (same as step2)
+        use_detour = self._detour_flags[w % len(self._detour_flags)]
+        if use_detour:
+            self.obstacles.extend(self._detour_obstacles_from_dataset(w))
         self._last_obs_window = w
 
     def force_new_obstacles(self):
@@ -394,7 +432,12 @@ class DemoPlayerEnv:
         win_xy = np.array(self.qpos_history)[:, :2]
         la_xy  = self.future_traj[:, :2] if hasattr(self, 'future_traj') and self.future_traj is not None else None
         self.obstacles = self.generator_obs.generate_for_window(win_xy, la_xy)
-        print(f"Regenerated {len(self.obstacles)} obstacles  (mode={self.obstacle_mode})")
+        w = self._window_idx()
+        use_detour = self._detour_flags[w % len(self._detour_flags)]
+        det_obs = self._detour_obstacles_from_dataset(w) if use_detour else []
+        self.obstacles.extend(det_obs)
+        print(f"Regenerated {len(self.obstacles)} obstacles  "
+              f"({len(det_obs)} detour, mode={self.obstacle_mode})")
 
     # ------------------------------------------------------------------
     # Pose update (mirrors step3_demo.py)
@@ -641,9 +684,12 @@ def get_args():
     p.add_argument("--dataset",    default="lafan1_g1")
     p.add_argument("--checkpoint", default="save/camdm_g1_env_lafan1_g1_env/best.pt",
                    help="Path to MotionDiffusionEnv checkpoint")
-    p.add_argument("--mode",  default="sparse|dense|compact|none",
-                   help="Obstacle density mode. Use '|' to cycle modes, e.g. 'sparse|dense|compact|none'")
+    p.add_argument("--mode",  default="detour_only|detour_sparse|detour_dense|detour_packed|none",
+                   help="Obstacle mode(s), '|'-separated. "
+                        "New: detour_only|detour_sparse|detour_dense|detour_packed|none. "
+                        "Legacy: sparse|dense|compact|none (no detour).")
     p.add_argument("--obstacle-interval", type=int, default=30)
+    p.add_argument("--robot-safe-radius", type=float, default=0.25)
     p.add_argument("--resolution", type=int,   default=9)
     p.add_argument("--max-range",  type=float, default=2.0)
     p.add_argument("--traj-bias-pos",  type=float, default=0.4)
@@ -768,6 +814,7 @@ def main():
         inertial_quat_end=args.inertial_quat_end,
         obstacle_interval=args.obstacle_interval,
         obstacle_mode=[m.strip() for m in args.mode.split("|") if m.strip()],
+        robot_safe_radius=args.robot_safe_radius,
     )
 
     if args.motion > 0:
