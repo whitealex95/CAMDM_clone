@@ -143,7 +143,7 @@ class UserController:
         self,
         future_frames: int = 45,
         fps: float = 30.0,
-        move_speed: float = 0.5,    # m/s  (translation)
+        move_speed: float = 2.0,    # m/s  (translation)
         turn_speed: float = 1.2,    # rad/s (rotation, ~70°/s)
     ):
         self.future_frames = int(future_frames)
@@ -559,7 +559,7 @@ def get_args():
     p.add_argument("--dataset",       default=None,
                    help="Optional pkl for initial pose & style (e.g. lafan1_g1_motion30)")
     p.add_argument("--motion",        type=int,   default=0)
-    p.add_argument("--move-speed",    type=float, default=0.5,  help="Translation speed (m/s)")
+    p.add_argument("--move-speed",    type=float, default=2.0,  help="Translation speed (m/s)")
     p.add_argument("--turn-speed",    type=float, default=1.2,  help="Rotation speed (rad/s)")
     p.add_argument("--traj-bias-pos", type=float, default=0.1,
                    help="Blend toward model prediction (low=follow user closely)")
