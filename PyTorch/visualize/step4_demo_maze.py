@@ -570,7 +570,7 @@ class SensorMotionGenerator:
             past_motion=torch.zeros_like(past_t),
             traj_trans=traj_tr_t,
             traj_pose=traj_po_t,
-            sensor=sensor_t,
+            sensor=torch.zeros_like(sensor_t),
             style_idx=style_t,
             y={},
         )
@@ -1311,7 +1311,7 @@ def get_args():
     p.add_argument("--traj-bias-rot",  type=float, default=2.2,
                    help="Rotation blend exponent")
     p.add_argument("--sampler",       default="ddpm", choices=["ddpm", "ddim"])
-    p.add_argument("--cfg-scale",     type=float, default=0.5)
+    p.add_argument("--cfg-scale",     type=float, default=1.0)
     p.add_argument("--cfg-count",     type=int,   default=2)
     p.add_argument("--applyframes",   type=int,   default=30)
     p.add_argument("--inertialize",   default="on", choices=["on", "off"])

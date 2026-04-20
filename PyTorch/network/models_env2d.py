@@ -70,7 +70,7 @@ class MotionDiffusionEnv(MotionDiffusion):
                  env_sensor_dim: int = 226,
                  latent_dim=256, ff_size=1024, num_layers=8, num_heads=4,
                  dropout=0.2, ablation=None, activation="gelu", legacy=False,
-                 arch='trans_enc', cond_mask_prob=0, device=None):
+                 arch='trans_enc', cond_mask_prob=0, sensor_cond_mask_prob=0, device=None):
 
         super().__init__(
             input_feats, nstyles, njoints, nfeats, rot_req, clip_len,
@@ -80,7 +80,8 @@ class MotionDiffusionEnv(MotionDiffusion):
             cond_mask_prob=cond_mask_prob, device=device,
         )
 
-        self.env_sensor_dim = env_sensor_dim
+        self.env_sensor_dim        = env_sensor_dim
+        self.sensor_cond_mask_prob = float(sensor_cond_mask_prob)
         # NSM-style environment encoder: 2-layer MLP with ELU
         self.sensor_encoder = EnvSensorEncoder(env_sensor_dim, self.latent_dim)
 
@@ -140,8 +141,13 @@ class MotionDiffusionEnv(MotionDiffusion):
         traj_trans  = y['traj_trans']
         sensor      = y.get('sensor', None)
 
-        # CFG masking on past_motion only (matching base class behaviour)
+        # CFG masking on past_motion
         keep = torch.rand(bs, device=past_motion.device) < (1.0 - self.cond_mask_prob)
         past_motion = past_motion * keep.view(bs, 1, 1, 1)
+
+        # CFG masking on sensor
+        if sensor is not None and self.sensor_cond_mask_prob > 0:
+            keep_s = torch.rand(bs, device=sensor.device) < (1.0 - self.sensor_cond_mask_prob)
+            sensor = sensor * keep_s.view(bs, 1)
 
         return self.forward(x, timesteps, past_motion, traj_pose, traj_trans, style_idx, sensor)

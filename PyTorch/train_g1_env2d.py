@@ -86,6 +86,7 @@ def train(config, resume, logger, tb_writer):
         num_heads=config.arch.num_heads,
         arch=config.arch.decoder,
         cond_mask_prob=config.trainer.cond_mask_prob,
+        sensor_cond_mask_prob=getattr(config.trainer, 'sensor_cond_mask_prob', 0.0),
         device=config.device,
     ).to(config.device)
 

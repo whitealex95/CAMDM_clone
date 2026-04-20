@@ -764,7 +764,7 @@ def get_args():
     p.add_argument("--past-frames",    type=int,   default=10)
     p.add_argument("--future-frames",  type=int,   default=45)
     p.add_argument("--sampler",        default="ddpm", choices=["ddpm", "ddim"])
-    p.add_argument("--cfg-scale",      type=float, default=0.5)
+    p.add_argument("--cfg-scale",      type=float, default=1.0)
     p.add_argument("--cfg-count",      type=int,   default=2)
     p.add_argument("--applyframes",    type=int,   default=15)
     p.add_argument("--inertialize",    default="on",    choices=["on", "off"])

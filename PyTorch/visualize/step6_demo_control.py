@@ -297,7 +297,7 @@ class SensorMotionGenerator:
         uncond_kwargs = dict(
             past_motion=torch.zeros_like(past_t),
             traj_trans=traj_tr_t, traj_pose=traj_po_t,
-            sensor=sensor_t, style_idx=style_t, y={},
+            sensor=torch.zeros_like(sensor_t), style_idx=style_t, y={},
         )
 
         scale = self.cfg_scale if cfg_scale is None else float(cfg_scale)
@@ -597,7 +597,7 @@ def get_args():
     p.add_argument("--traj-bias-pos", type=float, default=0.1,
                    help="Blend toward model prediction (low=follow user closely)")
     p.add_argument("--traj-bias-rot", type=float, default=0.5)
-    p.add_argument("--cfg-scale",     type=float, default=0.5)
+    p.add_argument("--cfg-scale",     type=float, default=1.0)
     p.add_argument("--cfg-count",     type=int,   default=2)
     p.add_argument("--resolution",    type=int,   default=9)
     p.add_argument("--max-range",     type=float, default=2.0)
