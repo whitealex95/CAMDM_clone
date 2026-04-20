@@ -309,9 +309,9 @@ class SensorMotionGenerator:
 
             class _CFGWrap(torch.nn.Module):
                 def forward(self_, x, timesteps, **kw):  # noqa: N805
-                    return cond_m(x, timesteps, **kw) + \
-                           s * (cond_m(x, timesteps, **kw) -
-                                cond_m(x, timesteps, **uncond_kw))
+                    cond_out   = cond_m(x, timesteps, **kw)
+                    uncond_out = cond_m(x, timesteps, **uncond_kw)
+                    return uncond_out + s * (cond_out - uncond_out)
 
             sampling_model  = _CFGWrap()
             sampling_kwargs = model_kwargs
