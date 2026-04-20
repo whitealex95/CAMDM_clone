@@ -496,12 +496,13 @@ class SensorMotionGenerator:
     """Autoregressive motion generator with optional sensor conditioning."""
 
     def __init__(self, model, diffusion, config, sensor: EnvironmentSensor,
-                 device='cuda', sampler='ddpm'):
+                 device='cuda', sampler='ddpm', cfg_scale=1.0):
         self.model     = _ModelWrapper(model)
         self.diffusion = diffusion
         self.sensor    = sensor
         self.device    = device
         self.sampler   = sampler.lower()
+        self.cfg_scale = float(cfg_scale)
         self.future_frames  = config.arch.future_frame
         self.rot_req        = config.arch.rot_req
         self.per_rot_feat   = 6
@@ -514,6 +515,7 @@ class SensorMotionGenerator:
         style_idx: int,
         obstacles: list,
         zero_sensor: bool = False,
+        cfg_scale: float = None,
     ) -> np.ndarray:
         """
         Args
@@ -564,19 +566,43 @@ class SensorMotionGenerator:
             style_idx=style_t,
             y={},
         )
+        uncond_kwargs = dict(
+            past_motion=torch.zeros_like(past_t),
+            traj_trans=traj_tr_t,
+            traj_pose=traj_po_t,
+            sensor=sensor_t,
+            style_idx=style_t,
+            y={},
+        )
+
+        scale = self.cfg_scale if cfg_scale is None else float(cfg_scale)
+        if scale == 1.0:
+            sampling_model  = self.model
+            sampling_kwargs = model_kwargs
+        else:
+            cond_m, uncond_kw, s = self.model, uncond_kwargs, scale
+
+            class _CFGWrap(torch.nn.Module):
+                def forward(self_, x, timesteps, **kw):  # noqa: N805
+                    return cond_m(x, timesteps, **kw) + \
+                           s * (cond_m(x, timesteps, **kw) -
+                                cond_m(x, timesteps, **uncond_kw))
+
+            sampling_model  = _CFGWrap()
+            sampling_kwargs = model_kwargs
 
         shape = (1, 31, self.per_rot_feat, self.future_frames)
         with torch.no_grad():
             if self.sampler == 'ddim':
                 out = self.diffusion.ddim_sample_loop(
-                    self.model, shape, clip_denoised=False,
-                    model_kwargs=model_kwargs, progress=False, eta=0.0,
+                    sampling_model, shape, clip_denoised=False,
+                    model_kwargs=sampling_kwargs, progress=False, eta=0.0,
                     device=self.device,
                 )
             else:
                 out = self.diffusion.p_sample_loop(
-                    self.model, shape, clip_denoised=False,
-                    model_kwargs=model_kwargs, progress=False,
+                    sampling_model, shape, clip_denoised=False,
+                    model_kwargs=sampling_kwargs, progress=False,
                     device=self.device,
                 )
 
@@ -753,14 +779,19 @@ class DemoPlayerMaze:
 
     def _generate(self) -> np.ndarray:
         past_qpos = np.array(self.qpos_history)
-        return self.generator.generate_motion(
+        eff_scale = self.generator.cfg_scale if self.cfg_count > 0 else 1.0
+        gen = self.generator.generate_motion(
             past_qpos,
             self.future_traj,
             self.future_orient,
             self.style_idx,
             self.obstacles,
             zero_sensor=self.zero_sensor,
+            cfg_scale=eff_scale,
         )
+        if self.cfg_count > 0:
+            self.cfg_count -= 1
+        return gen
 
     def update_pose(self):
         if self.inertialize:
@@ -1280,6 +1311,7 @@ def get_args():
     p.add_argument("--traj-bias-rot",  type=float, default=2.2,
                    help="Rotation blend exponent")
     p.add_argument("--sampler",       default="ddpm", choices=["ddpm", "ddim"])
+    p.add_argument("--cfg-scale",     type=float, default=0.5)
     p.add_argument("--cfg-count",     type=int,   default=2)
     p.add_argument("--applyframes",   type=int,   default=30)
     p.add_argument("--inertialize",   default="on", choices=["on", "off"])
@@ -1365,7 +1397,7 @@ def main():
     sensor    = EnvironmentSensor(max_range=args.max_range, resolution=args.resolution)
     generator = SensorMotionGenerator(
         diffusion_model, diffusion, config, sensor,
-        device=device, sampler=args.sampler,
+        device=device, sampler=args.sampler, cfg_scale=args.cfg_scale,
     )
 
     # ── Build maze so that robot's initial position = first waypoint ──────────
