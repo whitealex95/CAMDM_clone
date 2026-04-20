@@ -23,7 +23,7 @@
         "lr": 0.0001,
         "batch_size": 512,
         "cond_mask_prob": 0.15,
-        "sensor_cond_mask_prob": 0.15,
+        "sensor_cond_mask_prob": 0.0,
         "loss_terms": "1010",
         "use_geometric_losses": false,
         "loss_geo_pos_weight": 1.0,
