@@ -296,7 +296,11 @@ class StraightLinePlayer:
         spring_halflife_rotation: float = 0.12,
         inertial_quat_start: int = 3,
         inertial_quat_end: int = 7,
+        freeze_traj: bool = False,
     ):
+        self.freeze_traj = bool(freeze_traj)
+        self._frozen_traj   = None
+        self._frozen_orient = None
         self.mj_model  = mj_model
         self.mj_data   = mj_data
         self.generator = generator
@@ -403,10 +407,18 @@ class StraightLinePlayer:
             self.future_orient = wp_o
 
     def _generate(self) -> np.ndarray:
+        if self.freeze_traj:
+            if self._frozen_traj is None:
+                self._frozen_traj   = self.future_traj.copy()
+                self._frozen_orient = self.future_orient.copy()
+            traj_t, traj_o = self._frozen_traj, self._frozen_orient
+        else:
+            traj_t, traj_o = self.future_traj, self.future_orient
+
         eff_scale = self.generator.cfg_scale if self.cfg_count > 0 else 1.0
         gen = self.generator.generate_motion(
             np.array(self.qpos_history),
-            self.future_traj, self.future_orient,
+            traj_t, traj_o,
             self.style_idx, self.obstacles,
             zero_sensor=self.zero_sensor,
             cfg_scale=eff_scale,
@@ -795,6 +807,8 @@ def get_args():
     p.add_argument("--traj-bias-rot", type=float, default=2.2)
     p.add_argument("--sampler",       default="ddpm", choices=["ddpm", "ddim"])
     p.add_argument("--cfg-scale",     type=float, default=1.0)
+    p.add_argument("--freeze-traj",   action="store_true",
+                   help="Debug: reuse first trajectory for every generation")
     p.add_argument("--cfg-count",     type=int,   default=2)
     p.add_argument("--applyframes",   type=int,   default=15)
     p.add_argument("--inertialize",   default="on", choices=["on", "off"])
@@ -942,6 +956,7 @@ def main():
         blendtime_position=args.blendtime_position,
         spring_halflife_position=args.spring_halflife_position,
         spring_halflife_rotation=args.spring_halflife_rotation,
+        freeze_traj=args.freeze_traj,
     )
 
     os.makedirs("videos", exist_ok=True)
