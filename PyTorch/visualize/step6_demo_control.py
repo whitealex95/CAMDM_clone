@@ -170,17 +170,17 @@ class UserController:
         lx, ly = 0.0, 0.0
         if 'w' in keys: ly += 1.0
         if 's' in keys: ly -= 1.0
-        if 'a' in keys: lx -= 1.0
-        if 'd' in keys: lx += 1.0
+        if 'a' in keys: lx += 1.0   # +left
+        if 'd' in keys: lx -= 1.0   # -left = right
 
         norm = np.hypot(lx, ly)
         if norm > 1e-6:
             lx /= norm; ly /= norm
 
-        # Rotate local → world
+        # Rotate local → world  (yaw=0 → facing +X, +yaw → CCW)
         c, s = np.cos(self.target_yaw), np.sin(self.target_yaw)
-        fwd  = np.array([c,  s])   # forward dir in world (+X when yaw=0)
-        left = np.array([-s, c])   # left    dir in world
+        fwd  = np.array([ c,  s])   # forward dir in world
+        left = np.array([-s,  c])   # left    dir in world
 
         self.target_pos += (ly * fwd + lx * left) * self.move_speed * dt
 
@@ -203,8 +203,8 @@ class UserController:
         lx, ly = 0.0, 0.0
         if 'w' in keys: ly += 1.0
         if 's' in keys: ly -= 1.0
-        if 'a' in keys: lx -= 1.0
-        if 'd' in keys: lx += 1.0
+        if 'a' in keys: lx += 1.0
+        if 'd' in keys: lx -= 1.0
         norm = np.hypot(lx, ly)
         if norm > 1e-6:
             lx /= norm; ly /= norm
