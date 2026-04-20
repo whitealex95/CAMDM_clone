@@ -472,7 +472,7 @@ class ControlPlayer:
             self.future_orient = cmd_quat
 
     def _generate(self) -> np.ndarray:
-        eff_scale = self.generator.cfg_scale if self.cfg_count > 0 else 1.0
+        eff_scale = self.generator.cfg_scale if self.cfg_count != 0 else 1.0
         gen = self.generator.generate_motion(
             np.array(self.qpos_history),
             self.future_traj, self.future_orient,
@@ -598,7 +598,7 @@ def get_args():
                    help="Blend toward model prediction (low=follow user closely)")
     p.add_argument("--traj-bias-rot", type=float, default=0.5)
     p.add_argument("--cfg-scale",     type=float, default=1.0)
-    p.add_argument("--cfg-count",     type=int,   default=2)
+    p.add_argument("--cfg-count",     type=int,   default=-1)
     p.add_argument("--resolution",    type=int,   default=9)
     p.add_argument("--max-range",     type=float, default=2.0)
     p.add_argument("--past-frames",   type=int,   default=10)

@@ -414,8 +414,7 @@ class StraightLinePlayer:
             traj_t, traj_o = self._frozen_traj, self._frozen_orient
         else:
             traj_t, traj_o = self.future_traj, self.future_orient
-
-        eff_scale = self.generator.cfg_scale if self.cfg_count > 0 else 1.0
+        eff_scale = self.generator.cfg_scale if self.cfg_count != 0 else 1.0
         gen = self.generator.generate_motion(
             np.array(self.qpos_history),
             traj_t, traj_o,
@@ -809,7 +808,7 @@ def get_args():
     p.add_argument("--cfg-scale",     type=float, default=1.0)
     p.add_argument("--freeze-traj",   action="store_true",
                    help="Debug: reuse first trajectory for every generation")
-    p.add_argument("--cfg-count",     type=int,   default=2)
+    p.add_argument("--cfg-count",     type=int,   default=-1)
     p.add_argument("--applyframes",   type=int,   default=15)
     p.add_argument("--inertialize",   default="on", choices=["on", "off"])
     p.add_argument("--inertialization-mode", default="camdm", choices=["camdm", "spring"])

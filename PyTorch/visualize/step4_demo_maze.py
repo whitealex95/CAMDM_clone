@@ -779,7 +779,7 @@ class DemoPlayerMaze:
 
     def _generate(self) -> np.ndarray:
         past_qpos = np.array(self.qpos_history)
-        eff_scale = self.generator.cfg_scale if self.cfg_count > 0 else 1.0
+        eff_scale = self.generator.cfg_scale if self.cfg_count != 0 else 1.0
         gen = self.generator.generate_motion(
             past_qpos,
             self.future_traj,
@@ -1312,7 +1312,7 @@ def get_args():
                    help="Rotation blend exponent")
     p.add_argument("--sampler",       default="ddpm", choices=["ddpm", "ddim"])
     p.add_argument("--cfg-scale",     type=float, default=1.0)
-    p.add_argument("--cfg-count",     type=int,   default=2)
+    p.add_argument("--cfg-count",     type=int,   default=-1)
     p.add_argument("--applyframes",   type=int,   default=30)
     p.add_argument("--inertialize",   default="on", choices=["on", "off"])
     p.add_argument("--inertialization-mode", default="camdm", choices=["camdm", "spring"])
