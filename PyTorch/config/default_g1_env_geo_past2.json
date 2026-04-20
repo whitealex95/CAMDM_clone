@@ -1,0 +1,34 @@
+{
+    "arch": {
+        "rot_req": "6d",
+        "decoder": "trans_enc",
+        "latent_dim": 256,
+        "ff_size": 1024,
+        "num_heads": 4,
+        "num_layers": 4,
+        "offset_frame": 1,
+        "past_frame": 2,
+        "future_frame": 45,
+        "local_cond": "traj_sensor",
+        "global_cond": "style",
+        "env_sensor_dim": 226
+    },
+    "diff": {
+        "noise_schedule": "cosine",
+        "diffusion_steps": 4,
+        "sigma_small": true
+    },
+    "trainer": {
+        "epoch": 10000,
+        "lr": 0.0001,
+        "batch_size": 512,
+        "cond_mask_prob": 0.15,
+        "sensor_cond_mask_prob": 0.0,
+        "loss_terms": "1010",
+        "use_geometric_losses": true,
+        "loss_geo_pos_weight": 1.0,
+        "loss_geo_foot_weight": 1.0,
+        "loss_geo_vel_weight": 1.0,
+        "min_start_velocity": 0.008
+    }
+}
