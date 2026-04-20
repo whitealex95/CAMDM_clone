@@ -30,6 +30,7 @@ def add_train_args(parser):
     parser.add_argument('--batch_size', type=int, help='Batch size for training.')
     parser.add_argument('--loss_terms', type=str, help='Loss terms to use in training. Format: [mse_rotation, positional_loss, velocity_loss, foot_contact]. Use 0 for No, 1 for Yes, e.g., "1111".')
     parser.add_argument('--cond_mask_prob', type=float, help='Probability of masking conditioning.')
+    parser.add_argument('--sensor_cond_mask_prob', type=float, help='Probability of masking sensor conditioning.')
     parser.add_argument('--ema', default=False, type=bool, help='Use Exponential Moving Average (EMA) for model parameters.')
     parser.add_argument('--workers', default=8, type=int, help='Number of workers for data loading.')
     parser.add_argument('--no_rotation_aug', action='store_true', help='Disable global rotation augmentation on training samples.')
@@ -70,6 +71,7 @@ def config_parse(args):
     config.trainer.weight_decay = args.weight_decay
     config.trainer.lr_anneal_steps = args.lr_anneal_steps
     config.trainer.cond_mask_prob = args.cond_mask_prob if args.cond_mask_prob is not None else config.trainer.cond_mask_prob
+    config.trainer.sensor_cond_mask_prob = args.sensor_cond_mask_prob if args.sensor_cond_mask_prob is not None else getattr(config.trainer, 'sensor_cond_mask_prob', 0.0)
     config.trainer.batch_size = int(args.batch_size) if args.batch_size is not None else config.trainer.batch_size
     config.trainer.ema = True #if args.ema else config.trainer.ema
     config.trainer.workers = int(args.workers) 
