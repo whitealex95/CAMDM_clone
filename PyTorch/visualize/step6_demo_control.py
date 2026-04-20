@@ -420,6 +420,11 @@ class ControlPlayer:
         self.past_traj   = qh[-self.past_frames:, :3]
         self.past_orient = qh[-self.past_frames:, 3:7]
 
+        # Sync controller to actual robot state so trajectory starts from current position
+        actual_pos = self.mj_data.qpos[:2].copy()
+        actual_yaw = quat_wxyz_to_yaw(self.mj_data.qpos[3:7])
+        self.controller.reset(actual_pos, float(actual_yaw))
+
         # Advance controller state by one dt, then build future
         self.controller.update(self.keys, self.frame_dt)
         cmd_xy, cmd_quat = self.controller.get_future_trajectory(self.keys)
