@@ -384,10 +384,12 @@ class ControlPlayer:
         self.readings       = np.zeros(self.sensor.feature_dim, dtype=np.float32)
         self.sphere_centers = np.zeros((self.sensor.feature_dim, 2), dtype=np.float64)
 
-        self.future_traj   = None
-        self.future_orient = None
-        self.past_traj     = None
-        self.past_orient   = None
+        self.future_traj    = None
+        self.future_orient  = None
+        self.command_traj   = None
+        self.command_orient = None
+        self.past_traj      = None
+        self.past_orient    = None
 
         self.qpos_history = deque(maxlen=past_frames)
         self._init_pose()
@@ -421,6 +423,8 @@ class ControlPlayer:
         # Advance controller state by one dt, then build future
         self.controller.update(self.keys, self.frame_dt)
         cmd_xy, cmd_quat = self.controller.get_future_trajectory(self.keys)
+        self.command_traj   = cmd_xy
+        self.command_orient = cmd_quat
 
         if self.gen_qpos is not None:
             pred_xy  = self.gen_qpos[self.gen_idx:, :2]
@@ -508,11 +512,16 @@ class ControlPlayer:
         if self.show_trajectory and self.past_traj is not None:
             draw_trajectory(scene, self.past_traj, self.past_orient,
                             color=[0.2, 0.5, 1.0, 1.0])   # blue: past
+            if self.command_traj is not None:
+                cmd3 = np.hstack([self.command_traj,
+                                   np.zeros((len(self.command_traj), 1))])
+                draw_trajectory(scene, cmd3, self.command_orient,
+                                color=[1.0, 0.9, 0.0, 1.0])  # yellow: user command
             if self.future_traj is not None:
                 ft3 = np.hstack([self.future_traj,
                                   np.zeros((len(self.future_traj), 1))])
                 draw_trajectory(scene, ft3, self.future_orient,
-                                color=[0.2, 1.0, 0.2, 1.0])  # green: commanded future
+                                color=[0.2, 1.0, 0.2, 1.0])  # green: blended NN input
 
         if self.show_sensor and self.obstacles:
             draw_sensor_readings(
