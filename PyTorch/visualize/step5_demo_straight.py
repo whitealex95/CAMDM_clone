@@ -99,11 +99,13 @@ def model_format_to_qpos(model_out: np.ndarray) -> np.ndarray:
 
 
 def _make_straight_waypoints(
-    start_x: float, goal_x: float, y: float = 0.0, spacing: float = 0.05
+    start_x: float, goal_x: float, start_y: float = 0.0, goal_y: float = 0.0,
+    spacing: float = 0.05
 ) -> np.ndarray:
-    n = max(2, int(abs(goal_x - start_x) / spacing))
+    dist = np.hypot(goal_x - start_x, goal_y - start_y)
+    n = max(2, int(dist / spacing))
     xs = np.linspace(start_x, goal_x, n)
-    ys = np.full(n, y)
+    ys = np.linspace(start_y, goal_y, n)
     return np.stack([xs, ys], axis=1)
 
 
@@ -112,11 +114,13 @@ def _make_straight_waypoints(
 # ---------------------------------------------------------------------------
 
 class PathController:
-    def __init__(self, waypoints: np.ndarray, speed=0.5, fps=30., future_frames=45):
+    def __init__(self, waypoints: np.ndarray, speed=0.5, fps=30., future_frames=45,
+                 fixed_yaw: float = None):
         self.waypoints     = np.asarray(waypoints, dtype=np.float64)
         self.speed         = float(speed)
         self.fps           = float(fps)
         self.future_frames = int(future_frames)
+        self.fixed_yaw     = fixed_yaw  # None = follow path direction
         diffs      = np.diff(self.waypoints, axis=0)
         self._arc  = np.concatenate([[0.], np.cumsum(np.linalg.norm(diffs, axis=1))])
         self.total_length = float(self._arc[-1])
@@ -151,6 +155,8 @@ class PathController:
         return self.waypoints[idx] + t * (self.waypoints[idx + 1] - self.waypoints[idx])
 
     def _interp_yaw(self, arc):
+        if self.fixed_yaw is not None:
+            return self.fixed_yaw
         idx = int(np.clip(np.searchsorted(self._arc, arc) - 1, 0, len(self.waypoints) - 2))
         d   = self.waypoints[idx + 1] - self.waypoints[idx]
         return float(np.arctan2(d[1], d[0]))
@@ -632,8 +638,9 @@ def run_comparison(args, mj_model, generator, obstacle, init_qpos, style_idx, wa
     fps = 30
 
     def _make_player(mj_data, zero_sensor):
+        fixed_yaw = np.deg2rad(args.heading) if args.heading is not None else None
         path = PathController(waypoints, speed=args.speed, fps=fps,
-                              future_frames=args.future_frames)
+                              future_frames=args.future_frames, fixed_yaw=fixed_yaw)
         p = StraightLinePlayer(
             mj_model, mj_data, generator, path, obstacle, init_qpos,
             style_idx=style_idx,
@@ -789,7 +796,11 @@ def get_args():
     p.add_argument("--motion",        type=int,   default=0,
                    help="Motion clip index (used if --dataset provided)")
     p.add_argument("--goal-x",        type=float, default=6.0,
-                   help="Goal X position (robot walks from 0 to this)")
+                   help="Goal X position")
+    p.add_argument("--goal-y",        type=float, default=None,
+                   help="Goal Y position (default: same as start Y)")
+    p.add_argument("--heading",       type=float, default=None,
+                   help="Fixed robot heading in degrees (default: face towards goal; 0=+X)")
     p.add_argument("--obstacle-x",    type=float, default=3.0,
                    help="Cylinder X position")
     p.add_argument("--obstacle-y",    type=float, default=0.0,
@@ -926,11 +937,13 @@ def main():
         center=np.array([args.obstacle_x, args.obstacle_y], dtype=np.float64),
         radius=float(args.obstacle_radius),
     )
+    goal_y = args.goal_y if args.goal_y is not None else float(init_qpos[1])
     waypoints = _make_straight_waypoints(
-        start_x=init_qpos[0], goal_x=args.goal_x, y=init_qpos[1],
+        start_x=init_qpos[0], goal_x=args.goal_x,
+        start_y=init_qpos[1], goal_y=goal_y,
     )
     print(f"Obstacle: ({args.obstacle_x}, {args.obstacle_y})  r={args.obstacle_radius} m")
-    print(f"Path:     ({init_qpos[0]:.1f}, {init_qpos[1]:.1f}) → ({args.goal_x:.1f}, {init_qpos[1]:.1f})")
+    print(f"Path:     ({init_qpos[0]:.1f}, {init_qpos[1]:.1f}) → ({args.goal_x:.1f}, {goal_y:.1f})")
 
     # ── Comparison mode ──────────────────────────────────────────────────
     if args.compare:
@@ -938,8 +951,9 @@ def main():
         return
 
     # ── Interactive mode ─────────────────────────────────────────────────
+    fixed_yaw = np.deg2rad(args.heading) if args.heading is not None else None
     path   = PathController(waypoints, speed=args.speed, fps=30.,
-                            future_frames=args.future_frames)
+                            future_frames=args.future_frames, fixed_yaw=fixed_yaw)
     player = StraightLinePlayer(
         mj_model, mj_data, generator, path, obstacle, init_qpos,
         style_idx=style_idx,
