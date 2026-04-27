@@ -213,6 +213,93 @@ def make_command_xy(actual_xy: np.ndarray,
     return weight * extrap + (1.0 - weight) * actual_xy
 
 
+def make_command_yaws(actual_yaws: np.ndarray,
+                     cmd_aug: str = "linear",
+                     past_xy: np.ndarray = None,
+                     past_yaws: np.ndarray = None,
+                     current_yaw: float = None,
+                     weight: float = 1.0) -> np.ndarray:
+    """
+    Build the command (yellow) yaw sequence over the future horizon,
+    mirroring the modes in :func:`make_command_xy`.
+
+    Parameters
+    ----------
+    actual_yaws : (N,) future yaws (gt) in radians; the linear fallback
+                  and the gt side of the blend.
+    cmd_aug     : ``"linear"`` / ``"extrap_pos"`` / ``"extrap_pos_noyaw"``
+                  / ``"extrap_pos_preserve_len"`` / ``"extrap_hfte"``.
+    past_xy     : (P, 2) past XY (only used by ``extrap_pos_noyaw`` to
+                  recover the past velocity direction).
+    past_yaws   : (P,) past yaws (used by ``extrap_pos`` /
+                  ``extrap_pos_preserve_len`` for the constant rate, and
+                  by ``extrap_hfte`` for the HFTE seed).
+    current_yaw : "now" yaw (used by ``extrap_pos_noyaw`` and
+                  ``extrap_hfte``). Defaults to ``actual_yaws[0]``.
+    weight      : blend ``w * extrap + (1 - w) * actual_yaws`` along the
+                  shortest signed yaw path. ``1.0`` = pure extrap
+                  (default), ``0.0`` = pure gt.
+
+    Returns
+    -------
+    yaws : (N,) yaw values in radians. Wrapping is *not* applied — feed
+           through ``cos(y/2), sin(y/2)`` for quaternion conversion if
+           you need it back in [-π, π].
+
+    Notes
+    -----
+    Whenever the requested mode lacks the inputs it needs (e.g. fewer
+    than two past frames for ``extrap_pos``), the function silently
+    falls back to the linear behaviour: it returns ``actual_yaws`` as is.
+    """
+    actual_yaws = np.asarray(actual_yaws, dtype=np.float64)
+    N = len(actual_yaws)
+
+    if current_yaw is None and N >= 1:
+        current_yaw = float(actual_yaws[0])
+
+    extrap = None
+
+    if cmd_aug in ("extrap_pos", "extrap_pos_preserve_len") \
+            and past_yaws is not None and len(past_yaws) >= 2:
+        past_yaws_u = np.unwrap(np.asarray(past_yaws, dtype=np.float64))
+        rate = (past_yaws_u[-1] - past_yaws_u[0]) / (len(past_yaws_u) - 1)
+        extrap = past_yaws_u[-1] + np.arange(1, N + 1) * rate
+
+    elif cmd_aug == "extrap_pos_noyaw" \
+            and past_xy is not None and current_yaw is not None \
+            and len(past_xy) >= 2:
+        past_xy_arr = np.asarray(past_xy, dtype=np.float64)
+        v = (past_xy_arr[-1] - past_xy_arr[0]) / (len(past_xy_arr) - 1)
+        yaw_target = float(np.arctan2(v[1], v[0]))
+        delta = (yaw_target - current_yaw + np.pi) % (2.0 * np.pi) - np.pi
+        ts = np.linspace(0.0, 1.0, N)
+        extrap = current_yaw + ts * delta
+
+    elif cmd_aug == "extrap_hfte" \
+            and past_yaws is not None and current_yaw is not None \
+            and len(past_yaws) >= 1:
+        past_yaws_arr = np.asarray(past_yaws, dtype=np.float64)
+        seed_yaws = np.unwrap(np.concatenate([past_yaws_arr, [current_yaw]]))
+        seed_2d   = np.stack([seed_yaws, np.zeros_like(seed_yaws)], axis=1)
+        total     = len(seed_2d) + (N - 1)
+        dummy     = np.tile([1.0, 0.0, 0.0, 0.0], (len(seed_2d), 1))
+        ext_2d, _ = extend_future_traj_heusristic(seed_2d, dummy, total)
+        extrap    = ext_2d[-N:, 0]
+
+    if extrap is None:
+        return actual_yaws.copy()    # linear fallback (no augmentation)
+
+    if weight >= 1.0:
+        return extrap
+    if weight <= 0.0:
+        return actual_yaws.copy()
+
+    delta = (extrap - actual_yaws + np.pi) % (2.0 * np.pi) - np.pi
+    delta = np.unwrap(delta)
+    return actual_yaws + weight * delta
+
+
 # ---------------------------------------------------------------------------
 # Scandot-fill obstacle augmentation
 # ---------------------------------------------------------------------------

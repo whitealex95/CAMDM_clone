@@ -58,8 +58,11 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from visualize.motion_loader import MotionDataset
-from visualize.utils.detour import make_command_xy, make_scandot_fill_obstacles
-from visualize.utils.trajectory import extend_future_traj_heusristic
+from visualize.utils.detour import (
+    make_command_xy,
+    make_command_yaws,
+    make_scandot_fill_obstacles,
+)
 from visualize.utils.geometry import (
     draw_trajectory,
     draw_sensor_readings,
@@ -368,14 +371,6 @@ class SensorMotionPlayer:
         out[:, 3] = np.sin(yaws / 2.0)
         return out
 
-    def _extrap_past_yaw_rate(self, N: int) -> np.ndarray:
-        """Constant-rate extrapolation of unwrapped past yaws over N frames,
-        starting one frame after past[-1] (mirrors the position formula)."""
-        past_yaws = np.unwrap(self._quats_to_yaws(self.past_orient))
-        P = len(past_yaws)
-        yaw_rate  = (past_yaws[-1] - past_yaws[0]) / (P - 1)
-        return past_yaws[-1] + np.arange(1, N + 1) * yaw_rate
-
     # ------------------------------------------------------------------
     # Command trajectory dispatch + per-mode implementations
     # ------------------------------------------------------------------
@@ -436,6 +431,21 @@ class SensorMotionPlayer:
         delta   = np.unwrap(delta)
         return blended_traj, self._yaws_to_quats(yaw_gt + w * delta)
 
+    def _make_yellow_yaws(self, mode: str, future_orient: np.ndarray) -> np.ndarray:
+        """Build yellow yaws for the given cmd_aug mode using the standalone
+        ``make_command_yaws`` helper, with the visualiser's past/current data."""
+        actual_yaws = self._quats_to_yaws(future_orient)
+        past_xy     = self.past_traj[:, :2] if self.past_traj is not None else None
+        past_yaws   = self._quats_to_yaws(self.past_orient) \
+                      if self.past_orient is not None else None
+        current_yaw = float(quat_wxyz_to_yaw(future_orient[0])) \
+                      if future_orient is not None and len(future_orient) > 0 else None
+        return make_command_yaws(
+            actual_yaws, mode,
+            past_xy=past_xy, past_yaws=past_yaws,
+            current_yaw=current_yaw,
+        )
+
     def _cmd_aug_extrap_pos(self, future_traj, future_orient):
         """
         Position    : extrapolate past-frame velocity forward.
@@ -456,7 +466,8 @@ class SensorMotionPlayer:
 
         new_traj        = future_traj.copy()
         new_traj[:, :2] = cmd_xy
-        return new_traj, self._yaws_to_quats(self._extrap_past_yaw_rate(N))
+        yaws = self._make_yellow_yaws("extrap_pos", future_orient)
+        return new_traj, self._yaws_to_quats(yaws)
 
     def _cmd_aug_extrap_pos_noyaw(self, future_traj, future_orient):
         """
@@ -480,12 +491,8 @@ class SensorMotionPlayer:
 
         new_traj        = future_traj.copy()
         new_traj[:, :2] = cmd_xy
-
-        yaw_now    = float(quat_wxyz_to_yaw(future_orient[0]))
-        yaw_target = float(np.arctan2(v[1], v[0]))
-        delta      = (yaw_target - yaw_now + np.pi) % (2.0 * np.pi) - np.pi
-        ts         = np.linspace(0.0, 1.0, N)
-        return new_traj, self._yaws_to_quats(yaw_now + ts * delta)
+        yaws = self._make_yellow_yaws("extrap_pos_noyaw", future_orient)
+        return new_traj, self._yaws_to_quats(yaws)
 
     def _cmd_aug_extrap_pos_preserve_len(self, future_traj, future_orient):
         """
@@ -506,14 +513,14 @@ class SensorMotionPlayer:
             return future_traj.copy(), future_orient.copy()
         direction = v / v_norm                                          # (2,)
 
-        N        = len(future_traj)
         seg_lens = np.linalg.norm(np.diff(future_traj[:, :2], axis=0), axis=1)
         arc      = np.concatenate([[0.0], np.cumsum(seg_lens)])         # (N,)
         cmd_xy   = future_traj[0, :2][None] + arc[:, None] * direction[None]
 
         new_traj        = future_traj.copy()
         new_traj[:, :2] = cmd_xy
-        return new_traj, self._yaws_to_quats(self._extrap_past_yaw_rate(N))
+        yaws = self._make_yellow_yaws("extrap_pos_preserve_len", future_orient)
+        return new_traj, self._yaws_to_quats(yaws)
 
     def _cmd_aug_extrap_hfte(self, future_traj, future_orient):
         """
@@ -526,24 +533,11 @@ class SensorMotionPlayer:
             return future_traj, future_orient
 
         past_xy = self.past_traj[:, :2]
-        N       = len(future_traj)
         cmd_xy  = make_command_xy(future_traj[:, :2], "extrap_hfte", past_xy)
 
         new_traj        = future_traj.copy()
         new_traj[:, :2] = cmd_xy
-
-        # Yaw via HFTE on past_yaws + current yaw. Stack with a zero second
-        # column to reuse the 2-D HFTE helper; reflections preserve each
-        # column independently, so the yaw column comes back extrapolated.
-        past_yaws = self._quats_to_yaws(self.past_orient)
-        yaw_now   = float(quat_wxyz_to_yaw(future_orient[0]))
-        seed_yaws = np.unwrap(np.concatenate([past_yaws, [yaw_now]]))    # (P+1,)
-        seed_2d   = np.stack([seed_yaws, np.zeros_like(seed_yaws)], axis=1)
-
-        total = len(seed_2d) + (N - 1)
-        dummy = np.tile([1.0, 0.0, 0.0, 0.0], (len(seed_2d), 1))
-        ext_2d, _ = extend_future_traj_heusristic(seed_2d, dummy, total)
-        yaws = ext_2d[-N:, 0]                                            # (N,)
+        yaws = self._make_yellow_yaws("extrap_hfte", future_orient)
         return new_traj, self._yaws_to_quats(yaws)
 
     # ------------------------------------------------------------------
