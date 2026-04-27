@@ -1,48 +1,40 @@
 """
 HumanoidEnvMotionDataset – G1 dataset with NSM Polar Environment Sensor readings.
 
-Extends the base G1 dataset (dataset_g1.py) by loading pre-computed continuous
-occupancy readings from an augmented pkl file (produced by
-visualize/step2_visualize_data_env2d.py --create-dataset).
+Extends the base G1 dataset (``dataset_g1.py``) by loading the augmented pkl
+produced by ``visualize/step2_visualize_data_env2d.py --create-dataset``.
 
-Key addition
-------------
-* ``sensor_readings_list``: per-clip (T, feature_dim) float32 arrays of
-  continuous occupancy values in [0, 1].
-* ``__getitem__`` slices the future window of sensor readings and applies the
-  same global-rotation-augmentation cyclic shift that is applied to the
-  trajectory / pose data.  The shift is applied per-ring so that the polar
-  grid rotates correctly.
+Each motion in the pkl must carry:
 
-The returned condition dict gains:
-    ``sensor``: (env_sensor_dim,) float32 tensor — current-frame snapshot.
+* ``sensor_readings``      : (T, env_sensor_dim) float32 occupancy values.
+* ``traj_trans_per_frame`` : (T, future_frame, 2) float32 — at detour frames
+                             the yellow command, at non-detour frames the
+                             gt (red) trajectory.
+* ``traj_pose_per_frame``  : (T, future_frame, 4) wxyz quaternion, same
+                             detour/non-detour split as ``traj_trans_per_frame``.
+
+``__getitem__`` returns the future window of motion plus a condition dict
+containing past motion, the per-frame trajectory condition, the current
+frame's sensor snapshot, and the style index. Sensor readings and the
+trajectory are co-rotated by the same global heading augmentation.
 """
 
 import sys
 sys.path.append('./')
 
 import pickle
+
 import numpy as np
 import torch
-
-from scipy.ndimage import gaussian_filter1d
 from scipy.spatial.transform import Rotation as R
-from tqdm import tqdm
 
-import utils.nn_transforms as nn_transforms
 from network.dataset_g1 import HumanoidMotionDataset
 
 
 class HumanoidEnvMotionDataset(HumanoidMotionDataset):
     """
-    G1 humanoid motion dataset augmented with environment-sensor readings.
-
-    The pkl file must have a ``sensor_readings`` field (shape T × feature_dim)
-    in each motion dict.  If the field is missing for a clip, the sensor is
-    assumed to be all-zero (free) for that clip with a warning.
-
-    Args (additions):
-        (none – all parameters forwarded to HumanoidMotionDataset)
+    G1 humanoid motion dataset augmented with environment-sensor readings
+    and a per-frame command trajectory.
     """
 
     def __init__(self, pkl_path, rot_req, offset_frame,
@@ -60,17 +52,13 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
             legacy_rotation_aug=legacy_rotation_aug,
         )
 
-        # ---- load sensor metadata and readings ----
         data_source = pickle.load(open(pkl_path, "rb"))
 
-        # Support new (sensor_resolution / sensor_max_range) and legacy pkls
         self.env_sensor_dim = int(data_source["env_sensor_dim"])
-        sensor_resolution = int(data_source.get("sensor_resolution", 10))
-        sensor_max_range  = float(data_source.get("sensor_max_range", 0.5))
+        sensor_resolution   = int(data_source["sensor_resolution"])
+        sensor_max_range    = float(data_source["sensor_max_range"])
 
-        # Recompute per-ring slices using the same formula as EnvironmentSensor
-        size     = 2.0 * sensor_max_range
-        coverage = 0.5 * size / max(sensor_resolution - 1, 1)
+        # Recompute per-ring slices using the same formula as EnvironmentSensor.
         ring_slices: list = []
         n_pts = 0
         for z in range(sensor_resolution):
@@ -80,78 +68,51 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
         self._ring_slices = ring_slices
 
         window_size = past_frame + future_frame
-        n_missing_sensor = 0
-        n_missing_detour = 0
 
-        self.sensor_readings_list = []
-        self.command_detour_flags_list = []
+        self.sensor_readings_list      = []
+        self.traj_trans_per_frame_list = []
+        self.traj_pose_per_frame_list  = []
         for motion in data_source["motions"][:limited_num]:
             N = motion["local_joint_rotations"].shape[0]
             if N < window_size:
                 continue
-            if "sensor_readings" in motion:
-                readings = np.asarray(motion["sensor_readings"], dtype=dtype)
-            else:
-                n_missing_sensor += 1
-                readings = np.zeros((N, self.env_sensor_dim), dtype=dtype)
-            self.sensor_readings_list.append(readings)
-
-            if "command_detour_flags" in motion:
-                flags = np.asarray(motion["command_detour_flags"], dtype=bool)
-            else:
-                n_missing_detour += 1
-                flags = np.zeros(N, dtype=bool)
-            self.command_detour_flags_list.append(flags)
-
-        if n_missing_sensor:
-            print(f"[HumanoidEnvMotionDataset] WARNING: {n_missing_sensor} clips had no "
-                  f"sensor_readings field; using all-zero readings for those clips.")
-        if n_missing_detour:
-            print(f"[HumanoidEnvMotionDataset] WARNING: {n_missing_detour} clips had no "
-                  f"command_detour_flags field; treating all frames as non-detour.")
+            self.sensor_readings_list.append(
+                np.asarray(motion["sensor_readings"], dtype=dtype)
+            )
+            self.traj_trans_per_frame_list.append(
+                np.asarray(motion["traj_trans_per_frame"], dtype=dtype)
+            )
+            self.traj_pose_per_frame_list.append(
+                np.asarray(motion["traj_pose_per_frame"], dtype=dtype)
+            )
 
         print(f"[HumanoidEnvMotionDataset] env_sensor_dim={self.env_sensor_dim}, "
               f"resolution={sensor_resolution}, max_range={sensor_max_range}m, "
               f"{len(self.sensor_readings_list)} clips loaded.")
 
     # ------------------------------------------------------------------
-    # __getitem__ – identical to base class but adds sensor condition
+    # __getitem__ – base-class output + sensor + per-frame trajectory
     # ------------------------------------------------------------------
 
     def __getitem__(self, idx):
-        import random
-
         item = self.item_frame_indices[idx]
         motion_idx, frame_ids = item[0], item[1:]
 
         rotations = self.rotations_list[motion_idx][frame_ids].copy()  # (TW, 30, 4)
         root_pos  = self.root_pos_list[motion_idx][frame_ids].copy()   # (TW, 3)
-
-        # Normalize XY
         root_pos[:, [0, 1]] -= root_pos[self.reference_frame_idx - 1, [0, 1]]
 
-        # Randomly choose trajectory version
-        traj_rot = self.local_conds["traj_pose"][motion_idx][
-            random.choice(self.traj_aug_indexs1)
-        ][frame_ids]
-        traj_pos = self.local_conds["traj_trans"][motion_idx][
-            random.choice(self.traj_aug_indexs2)
-        ][frame_ids]
+        current_frame = int(frame_ids[self.reference_frame_idx - 1])
 
-        # Extra trajectory smoothing
-        r_aug = np.random.rand()
-        if r_aug < 0.75:
-            k = 5 if r_aug < 0.5 else 10
-            traj_pos = gaussian_filter1d(traj_pos, k, axis=0)
+        # Per-frame command trajectory (yellow at detour frames, gt at
+        # non-detour). Stored in world frame, so centre at the current
+        # frame's world XY before passing it on.
+        traj_pos = self.traj_trans_per_frame_list[motion_idx][current_frame].copy()
+        traj_rot = self.traj_pose_per_frame_list[motion_idx][current_frame].copy()
+        ref_xy   = self.root_pos_list[motion_idx][current_frame, :2].astype(traj_pos.dtype)
+        traj_pos = traj_pos - ref_xy                                     # (TF, 2)
 
-        traj_pos -= traj_pos[self.reference_frame_idx - 1]
-        traj_pos = traj_pos[self.reference_frame_idx:]   # (TF, 2)
-        traj_rot = traj_rot[self.reference_frame_idx:]   # (TF, 4) wxyz
-
-        # ---- Sensor reading at current frame (last past frame) ----
-        sensor_current = self.sensor_readings_list[motion_idx][
-            frame_ids[self.reference_frame_idx - 1]
-        ].copy()  # (env_sensor_dim,)
+        sensor_current = self.sensor_readings_list[motion_idx][current_frame].copy()
 
         # ----------------------------------------------------------
         # GLOBAL ROTATION AUGMENTATION (same as base class)
@@ -174,16 +135,16 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
 
             root_pos = rot_vec.apply(root_pos)
 
-            # traj_pos is world-frame XY so it must rotate with everything else
+            # traj_pos is world-frame XY so it must rotate with everything else.
             if not self.legacy_rotation_aug:
                 cos_t, sin_t = np.cos(theta), np.sin(theta)
                 R2 = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=traj_pos.dtype)
                 traj_pos = (R2 @ traj_pos.T).T
 
-            # ---- Rotate sensor reading to match new heading ----
-            # Each ring z has count_z = round(2π*z) spheres uniformly distributed
-            # over 2π.  A heading rotation of theta shifts ring z's angular index by
-            #   k_z = -round(theta * count_z / (2π))
+            # Rotate the sensor reading to match the new heading.
+            # Each ring z has count_z = round(2π*z) spheres uniformly
+            # distributed over 2π. A heading rotation of theta shifts ring z's
+            # angular index by k_z = -round(theta * count_z / (2π)).
             rotated = sensor_current.copy()
             for (start, end) in self._ring_slices:
                 count = end - start
@@ -193,18 +154,6 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
                 if k != 0:
                     rotated[start:end] = np.roll(sensor_current[start:end], k)
             sensor_current = rotated
-
-        # ----------------------------------------------------------
-        # COMMAND TRAJECTORY: replace traj_pos with linear interpolation
-        # when the current frame falls in a detour obstacle window.
-        # The endpoint (traj_pos[-1]) is already in the rotated frame,
-        # so this is applied after rotation augmentation.
-        # ----------------------------------------------------------
-        current_frame = frame_ids[self.reference_frame_idx - 1]
-        if self.command_detour_flags_list[motion_idx][current_frame]:
-            TF = len(traj_pos)
-            t  = np.arange(1, TF + 1, dtype=traj_pos.dtype) / TF   # (TF,) 1/TF … 1
-            traj_pos = t[:, None] * traj_pos[-1][None]              # straight line → endpoint
 
         # ----------------------------------------------------------
         # TORCH CONVERSION (same as base class)

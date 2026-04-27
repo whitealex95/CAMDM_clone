@@ -743,7 +743,9 @@ def create_env_dataset(
 
             generator.seed(seed + clip_idx)
 
-            readings, _, detour_flags = compute_clip_sensor_readings(
+            (readings, _,
+             traj_trans_per_frame,
+             traj_pose_per_frame) = compute_clip_sensor_readings(
                 all_qpos,
                 sensor,
                 generator,
@@ -758,9 +760,10 @@ def create_env_dataset(
                 future_frames=future_frames,
             )
             new_motion = dict(motion)
-            new_motion["sensor_readings"]      = readings.astype(np.float32)
-            new_motion["command_detour_flags"] = detour_flags          # (T,) bool
-            new_motion["obstacle_mode"]        = mode_str
+            new_motion["sensor_readings"]        = readings.astype(np.float32)
+            new_motion["traj_trans_per_frame"]   = traj_trans_per_frame
+            new_motion["traj_pose_per_frame"]    = traj_pose_per_frame
+            new_motion["obstacle_mode"]          = mode_str
             output_motions.append(new_motion)
 
     data_dict["motions"] = output_motions

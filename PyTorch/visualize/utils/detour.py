@@ -430,8 +430,7 @@ def make_scandot_fill_obstacles(
         obstacle_radius          : the radius used
         max_pointwise            : max |yellow_i − red_i| over the horizon
         has_detour               : bool, True iff at least one obstacle was
-                                   actually produced (use this as the
-                                   per-frame ``command_detour_flags`` flag).
+                                   actually produced.
         fill_method              : echoed back for downstream debugging
     """
     command_xy = np.asarray(command_xy, dtype=np.float64)

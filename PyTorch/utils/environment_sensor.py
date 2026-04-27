@@ -671,7 +671,7 @@ def compute_clip_sensor_readings(
     robot_safe_radius: float = 0.25,
     past_frames: int = 10,
     future_frames: int = 45,
-) -> Tuple[np.ndarray, List, np.ndarray]:
+) -> Tuple[np.ndarray, List, np.ndarray, np.ndarray]:
     """
     Compute sensor readings for an entire motion clip with time-varying
     obstacles.
@@ -692,20 +692,45 @@ def compute_clip_sensor_readings(
                       visualisation. Scandot-fill obstacles are not stored
                       here because they are per-frame and would dominate
                       the pkl size.
-    detour_flags    : (T,) bool, True at frames whose yellow↔red max
-                      pointwise deviation crosses the detour threshold.
+    traj_trans_per_frame : (T, future_frames, 2) float32. For each frame
+                      t, the world XY trajectory the policy should be
+                      conditioned on for the next ``future_frames`` steps.
+                      Detour frames store the yellow command; non-detour
+                      frames store the gt (red) trajectory. Padded with
+                      the last available value at the tail of the motion.
+    traj_pose_per_frame  : (T, future_frames, 4) float32 wxyz quaternion.
+                      Same layout as ``traj_trans_per_frame``.
     """
     # Late import to avoid a circular dependency between
     # `utils.environment_sensor` and `visualize.utils.detour`.
     from visualize.utils.detour import (
         make_command_xy,
+        make_command_yaws,
         make_scandot_fill_obstacles,
     )
 
     T = all_qpos.shape[0]
     readings = np.zeros((T, sensor.feature_dim), dtype=np.float32)
-    detour_flags = np.zeros(T, dtype=bool)
     window_obstacles = []
+
+    traj_trans_per_frame = np.zeros((T, future_frames, 2), dtype=np.float32)
+    traj_pose_per_frame  = np.zeros((T, future_frames, 4), dtype=np.float32)
+    traj_pose_per_frame[..., 0] = 1.0   # default identity wxyz quaternion
+
+    def _pad_to_future(arr: np.ndarray, n: int) -> np.ndarray:
+        """Right-pad ``arr`` with its last row up to length ``n``."""
+        if len(arr) >= n:
+            return arr[:n]
+        if len(arr) == 0:
+            return arr  # caller falls back to defaults
+        pad = np.repeat(arr[-1:], n - len(arr), axis=0)
+        return np.concatenate([arr, pad], axis=0)
+
+    def _yaws_to_wxyz(yaws: np.ndarray) -> np.ndarray:
+        out = np.zeros((len(yaws), 4), dtype=np.float32)
+        out[:, 0] = np.cos(yaws / 2.0)
+        out[:, 3] = np.sin(yaws / 2.0)
+        return out
 
     for w_start in range(0, T, obstacle_interval):
         w_end  = min(w_start + obstacle_interval, T)
@@ -721,8 +746,26 @@ def compute_clip_sensor_readings(
             yaw = quat_wxyz_to_yaw(all_qpos[t, 3:7])
 
             obstacles = list(random_obs)
+
+            # gt (red) trajectory for the future horizon, padded to
+            # ``future_frames`` so per-frame storage has a consistent shape.
+            # Match the legacy ``motion["traj_pose"]`` convention: store a
+            # *yaw-only* world-frame quaternion (the forward heading) rather
+            # than the full root quaternion, so the model sees the same
+            # representation for both detour and non-detour frames.
+            red_xy   = all_qpos[t : t + future_frames, :2]
+            red_yaws = np.array(
+                [quat_wxyz_to_yaw(q) for q in all_qpos[t : t + future_frames, 3:7]],
+                dtype=np.float64,
+            )
+            red_quat        = _yaws_to_wxyz(red_yaws)
+            red_xy_padded   = _pad_to_future(red_xy,   future_frames)
+            red_quat_padded = _pad_to_future(red_quat, future_frames)
+            if len(red_xy_padded) == future_frames:
+                traj_trans_per_frame[t] = red_xy_padded.astype(np.float32)
+                traj_pose_per_frame[t]  = red_quat_padded.astype(np.float32)
+
             if use_detour:
-                red_xy  = all_qpos[t : t + future_frames, :2]
                 past_xy = all_qpos[max(0, t - past_frames):t, :2]
                 if len(red_xy) >= 2:
                     yellow_xy = make_command_xy(
@@ -735,9 +778,36 @@ def compute_clip_sensor_readings(
                         fill_method=fill_method,
                     )
                     obstacles += fill_obs
-                    detour_flags[t] = info["has_detour"]
+
+                    # Override storage with yellow values when augmentation
+                    # actually placed obstacles; otherwise the gt values
+                    # written above remain.
+                    if info["has_detour"]:
+                        past_yaws = np.array(
+                            [quat_wxyz_to_yaw(q)
+                             for q in all_qpos[max(0, t - past_frames):t, 3:7]],
+                            dtype=np.float64,
+                        )
+                        yellow_yaws = make_command_yaws(
+                            red_yaws, cmd_aug,
+                            past_xy=past_xy, past_yaws=past_yaws,
+                            current_yaw=float(yaw),
+                            weight=cmd_aug_weight,
+                        )
+                        yellow_quat = _yaws_to_wxyz(yellow_yaws)
+
+                        yellow_xy_padded   = _pad_to_future(
+                            yellow_xy.astype(np.float32), future_frames
+                        )
+                        yellow_quat_padded = _pad_to_future(
+                            yellow_quat, future_frames
+                        )
+                        if len(yellow_xy_padded) == future_frames:
+                            traj_trans_per_frame[t] = yellow_xy_padded
+                            traj_pose_per_frame[t]  = yellow_quat_padded
 
             occ, _ = sensor.compute(pos, yaw, obstacles)
             readings[t] = occ
 
-    return readings, window_obstacles, detour_flags
+    return (readings, window_obstacles,
+            traj_trans_per_frame, traj_pose_per_frame)
