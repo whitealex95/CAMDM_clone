@@ -1,8 +1,10 @@
 """
-Step 2 – 2-D Trajectory & Obstacle Debug Visualiser
-=====================================================
-Renders a top-down (XY) view of every obstacle-generation window for a given
-motion clip and saves a PNG per window.
+Step 2 – 2-D Trajectory & Scandot-Fill Debug Visualiser
+========================================================
+Renders a top-down (XY) view of the scandot-fill obstacle augmentation for a
+given motion clip. One PNG is saved every ``--obstacle-interval`` frames
+(the obstacle augmentation itself is computed *per frame* with the same
+pipeline used by ``step2_visualize_data_env2d.py``).
 
 Usage
 -----
@@ -13,16 +15,12 @@ Usage
 Legend
 ------
   Light coral line  : full clip root trajectory (background reference)
-  Green line        : command trajectory for the window (--cmd-aug)
-  Green × markers  : arrow sample points (every 5th frame)
-  Green shading     : robot safe-radius tube around green trajectory
-  Red line          : actual root trajectory for the window
-  Red × markers    : red arrow points used for seed selection
-  Red shading       : robot safe-radius tube around red trajectory
-  Grey dots         : excluded margin at start / end of window
-  Orange circle     : obstacle #1  (off-green-line, max-radius)
-  Blue circle       : obstacle #2  (on-green-line center)
-  ★ markers        : seed points used for circle 1
+  Green line        : command trajectory for the future horizon (--cmd-aug)
+  Green tube        : robot safe-radius band around green
+  Red line          : actual root trajectory for the future horizon
+  Red tube          : robot safe-radius band around red
+  Light grey dots   : every sensor scandot at the current robot pose
+  Dark filled disks : scandots that became CircleObstacles (scandot-fill)
 """
 
 import os
@@ -38,10 +36,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from visualize.motion_loader import MotionDataset
 from visualize.utils.detour import (
-    ARROW_STEP,
-    compute_detour_obstacles,
     make_command_xy,
+    make_scandot_fill_obstacles,
 )
+from utils.environment_sensor import EnvironmentSensor, quat_wxyz_to_yaw
 
 
 # ---------------------------------------------------------------------------
@@ -56,91 +54,82 @@ def _draw_safe_tube(ax, xy, radius, color, alpha=0.15, label=None, step=2):
         ax.add_patch(circ)
 
 
-def plot_window(motion_idx: int, win_idx: int,
-                full_path_xy: np.ndarray, div_xy: np.ndarray,
-                obstacles: list, info: dict,
-                out_dir: str, w_start: int, w_end: int) -> str:
-    """Render one window to a PNG and return the file path."""
-    safe_r = info.get("robot_safe_radius", 0.25)
-    colors = ["orange", "royalblue", "mediumpurple", "forestgreen"]
-
+def plot_frame(motion_idx: int, frame: int,
+               full_path_xy: np.ndarray,
+               red_xy: np.ndarray, green_xy: np.ndarray,
+               past_xy: np.ndarray,
+               robot_xy: np.ndarray,
+               info: dict,
+               safe_r: float,
+               out_dir: str) -> str:
+    """Render one frame's scandot-fill picture to a PNG and return the path."""
     fig, ax = plt.subplots(figsize=(8, 8))
     ax.set_aspect("equal")
+
+    n_filled = int(info["fill_mask"].sum())
+    has_det  = info["has_detour"]
+    obs_r    = info["obstacle_radius"]
     ax.set_title(
-        f"motion={motion_idx}  window={win_idx}  frames=[{w_start},{w_end})\n"
-        f"N_div={info.get('N', len(div_xy))}  "
-        f"max_pw={info.get('max_pointwise', 0):.3f}m  "
-        f"safe_r={safe_r}m  "
-        + (f"obstacles={len(obstacles)}" if obstacles
-           else f"NO OBS ({info.get('reason', '')})")
+        f"motion={motion_idx}  frame={frame}\n"
+        f"max_pw={info['max_pointwise']:.3f}m  "
+        f"safe_r={safe_r}m  obs_r={obs_r:.3f}m  "
+        + (f"filled={n_filled}/{len(info['all_centers'])}"
+           if has_det else f"NO DETOUR ({info.get('reason', '')})")
     )
 
     # Background: full clip
     ax.plot(full_path_xy[:, 0], full_path_xy[:, 1],
             color="lightcoral", lw=0.8, alpha=0.3, label="full clip")
 
-    # Green trajectory + safe tube
-    if "green_xy" in info:
-        green_xy = info["green_xy"]
-        _draw_safe_tube(ax, green_xy, safe_r, color="limegreen", alpha=0.15,
+    # Green (command) trajectory + safe tube
+    if green_xy is not None and len(green_xy) >= 2:
+        _draw_safe_tube(ax, green_xy, safe_r, color="limegreen", alpha=0.10,
                         label=f"green safe (r={safe_r}m)")
         ax.plot(green_xy[:, 0], green_xy[:, 1],
                 color="green", lw=1.8, zorder=3, label="green (command)")
-        arrow_idx = np.arange(0, len(green_xy), ARROW_STEP)
-        ax.scatter(green_xy[arrow_idx, 0], green_xy[arrow_idx, 1],
-                   marker="x", s=40, color="green", zorder=5)
 
-    # Red trajectory + safe tube
-    _draw_safe_tube(ax, div_xy, safe_r, color="red", alpha=0.15,
-                    label=f"red safe (r={safe_r}m)")
-    ax.plot(div_xy[:, 0], div_xy[:, 1],
-            color="red", lw=1.8, zorder=3, label="red (actual)")
-    if "red_arrow_xy" in info:
-        rax = info["red_arrow_xy"]
-        ax.scatter(rax[:, 0], rax[:, 1],
-                   marker="x", s=40, color="darkred", zorder=5, label="red arrow pts")
+    # Red (actual) trajectory + safe tube
+    if red_xy is not None and len(red_xy) >= 2:
+        _draw_safe_tube(ax, red_xy, safe_r, color="red", alpha=0.12,
+                        label=f"red safe (r={safe_r}m)")
+        ax.plot(red_xy[:, 0], red_xy[:, 1],
+                color="red", lw=1.8, zorder=3, label="red (actual)")
 
-    # Seed points (only for circle 1 which has a real seed index)
-    if "seed_indices" in info and "green_xy" in info:
-        for k, si in enumerate(info["seed_indices"]):
-            if si is None:
-                continue
-            c = info["green_xy"][si]
-            ax.scatter(*c, marker="*", s=150, color=colors[k % len(colors)],
-                       zorder=6, label=f"seed #{k+1}")
+    # Past (blue) trajectory + safe tube — scandots within safe_r of this
+    # are also excluded from the fill so obstacles don't appear behind the
+    # robot.
+    if past_xy is not None and len(past_xy) >= 1:
+        _draw_safe_tube(ax, past_xy, safe_r, color="dodgerblue", alpha=0.12,
+                        label=f"past safe (r={safe_r}m)")
+        if len(past_xy) >= 2:
+            ax.plot(past_xy[:, 0], past_xy[:, 1],
+                    color="dodgerblue", lw=1.8, zorder=3, label="past (blue)")
 
-    # Obstacle circles
-    for k, obs in enumerate(obstacles):
-        col  = colors[k % len(colors)]
-        circ = plt.Circle(obs.center, obs.radius, color=col, alpha=0.35, zorder=4)
+    # Scandot grid: all dots in light grey
+    centers = info["all_centers"]
+    fill_mask = info["fill_mask"]
+    ax.scatter(centers[~fill_mask, 0], centers[~fill_mask, 1],
+               s=6, color="0.75", zorder=2, label="scandot (free)")
+
+    # Filled scandots: dark disks of obstacle_radius (so the figure matches
+    # what the sensor actually sees)
+    for c in centers[fill_mask]:
+        circ = plt.Circle(c, obs_r, color="midnightblue", alpha=0.55, zorder=4)
         ax.add_patch(circ)
-        ax.scatter(*obs.center, s=40, color=col, zorder=7)
-        ax.annotate(
-            f"#{k+1} r={obs.radius:.2f}m",
-            xy=obs.center,
-            xytext=(obs.center[0] + obs.radius * 0.7 + 0.05,
-                    obs.center[1] + obs.radius * 0.7 + 0.05),
-            fontsize=7, color=col,
-            arrowprops=dict(arrowstyle="->", color=col, lw=0.8),
-        )
+    if n_filled > 0:
+        ax.scatter(centers[fill_mask, 0], centers[fill_mask, 1],
+                   s=10, color="midnightblue", zorder=5,
+                   label=f"scandot (filled, r={obs_r:.2f}m)")
 
-    # Start / end markers
-    ax.scatter(*div_xy[0],  marker="^", s=80, color="blue",   zorder=6, label="start")
-    ax.scatter(*div_xy[-1], marker="s", s=80, color="purple", zorder=6, label="end")
-
-    # Excluded margin region
-    if "green_xy" in info and "margin" in info:
-        m   = info["margin"]
-        gxy = info["green_xy"]
-        ax.scatter(gxy[:m, 0],  gxy[:m, 1],  s=8, color="gray", alpha=0.5)
-        ax.scatter(gxy[-m:, 0], gxy[-m:, 1], s=8, color="gray", alpha=0.5,
-                   label=f"excl. margin ±{m}")
+    # Robot position
+    ax.scatter(*robot_xy, marker="*", s=180, color="gold",
+               edgecolor="black", linewidth=0.6, zorder=7, label="robot")
 
     ax.legend(fontsize=7, loc="upper right")
     ax.grid(True, alpha=0.3)
 
-    tag   = "OBS" if obstacles else "skip"
-    fname = os.path.join(out_dir, f"m{motion_idx:03d}_w{win_idx:03d}_{tag}.png")
+    tag   = "FILL" if has_det else "skip"
+    fname = os.path.join(out_dir, f"m{motion_idx:03d}_f{frame:05d}_{tag}.png")
     fig.savefig(fname, dpi=120, bbox_inches="tight")
     plt.close(fig)
     return fname
@@ -152,31 +141,31 @@ def plot_window(motion_idx: int, win_idx: int,
 
 def get_args():
     p = argparse.ArgumentParser(
-        description="2-D debug: root trajectory + divergence obstacle visualiser"
+        description="2-D debug visualiser for scandot-fill obstacle augmentation"
     )
     p.add_argument("--dataset",            default="lafan1_g1_motion23")
     p.add_argument("--motion",             type=int,   default=0,
                    help="Motion clip index (0-based)")
-    p.add_argument("--obstacle-interval",  type=int,   default=30)
+    p.add_argument("--obstacle-interval",  type=int,   default=30,
+                   help="PNG sampling stride in frames "
+                        "(scandot-fill itself is computed per frame)")
     p.add_argument("--future-frames",      type=int,   default=45)
     p.add_argument("--past-frames",        type=int,   default=10,
-                   help="Past frames used for past_extrap command (default: 10)")
+                   help="Past frames used by --cmd-aug")
     p.add_argument("--cmd-aug", default="linear",
                    choices=["linear", "extrap_pos", "extrap_pos_noyaw",
                             "extrap_pos_preserve_len", "extrap_hfte"],
-                   help="Command trajectory used for detour placement "
-                        "(see visualize/utils/detour.md): "
-                        "linear=straight start→end (default), "
-                        "extrap_pos=constant-velocity extrapolation of past, "
-                        "extrap_pos_noyaw=same XY as extrap_pos (visualiser-only yaw differs), "
-                        "extrap_pos_preserve_len=past direction with gt step lengths, "
-                        "extrap_hfte=HFTE central-symmetry extension of past")
+                   help="Command trajectory builder (see visualize/utils/detour.md)")
     p.add_argument("--cmd-aug-weight", type=float, default=1.0,
-                   help="Linear blend weight w between cmd_aug and ground truth: "
-                        "command = w*extrap + (1-w)*gt. "
+                   help="Blend weight w: command = w*extrap + (1-w)*gt. "
                         "1.0=pure extrap (default), 0.0=pure gt.")
+    p.add_argument("--max-range",          type=float, default=2.0,
+                   help="Sensor max range in metres (default: 2.0)")
+    p.add_argument("--resolution",         type=int,   default=9,
+                   help="Sensor radial-ring count (default: 9)")
     p.add_argument("--all-windows",        action="store_true",
-                   help="Save a PNG for every window, not just those with obstacles")
+                   help="Save a PNG for every sampled frame, not just those "
+                        "with at least one filled scandot")
     p.add_argument("--robot-safe-radius",  type=float, default=0.25)
     p.add_argument("--out-dir",            default="debug_2d")
     return p.parse_args()
@@ -194,38 +183,57 @@ def main():
     motion  = dataset[args.motion % len(dataset)]
     print(f"Motion {args.motion}: style={motion.style}  frames={motion.num_frames}")
 
-    all_qpos     = motion.get_all_qpos()   # (T, 36)
+    all_qpos     = motion.get_all_qpos()    # (T, 36)
     full_path_xy = all_qpos[:, :2]
     T            = motion.num_frames
+
+    sensor = EnvironmentSensor(
+        max_range=args.max_range, resolution=args.resolution
+    )
+    obs_r = 0.5 * sensor.max_adjacent_distance
+    print(f"Sensor: feature_dim={sensor.feature_dim}  "
+          f"max_adj_dist={sensor.max_adjacent_distance:.3f}m  "
+          f"obstacle_radius={obs_r:.3f}m")
 
     os.makedirs(args.out_dir, exist_ok=True)
 
     saved = skipped = 0
-    for win_idx, w_start in enumerate(range(0, T, args.obstacle_interval)):
-        w_end   = min(w_start + args.obstacle_interval, T)
-        div_end = min(w_end   + args.future_frames,     T)
-        div_xy  = all_qpos[w_start:div_end, :2]
-        past_xy = all_qpos[max(0, w_start - args.past_frames):w_start, :2]
+    sample_frames = list(range(0, T, args.obstacle_interval))
+    for f in sample_frames:
+        red_xy  = all_qpos[f : f + args.future_frames, :2]
+        past_xy = all_qpos[max(0, f - args.past_frames):f, :2]
+        if len(red_xy) < 2:
+            skipped += 1
+            continue
 
-        command_xy = make_command_xy(div_xy, args.cmd_aug, past_xy,
-                                     weight=args.cmd_aug_weight)
-        obs_list, info = compute_detour_obstacles(
-            div_xy, command_xy=command_xy, robot_safe_radius=args.robot_safe_radius
+        green_xy = make_command_xy(
+            red_xy, args.cmd_aug, past_xy, weight=args.cmd_aug_weight
+        )
+        qpos      = all_qpos[f]
+        robot_pos = qpos[:2]
+        robot_yaw = quat_wxyz_to_yaw(qpos[3:7])
+
+        _, info = make_scandot_fill_obstacles(
+            sensor, robot_pos, robot_yaw, green_xy, red_xy,
+            past_xy=past_xy,
+            robot_safe_radius=args.robot_safe_radius,
         )
 
-        status = (
-            f"PLACED {len(obs_list)} obs  " +
-            "  ".join(f"r={o.radius:.2f}" for o in obs_list)
-        ) if obs_list else f"skip ({info.get('reason', '')})"
-        print(f"  window {win_idx:3d}  [{w_start:4d},{w_end:4d})  "
-              f"N_div={len(div_xy):3d}  {status}")
+        n_filled = int(info["fill_mask"].sum())
+        status = (f"FILL {n_filled} dots" if info["has_detour"]
+                  else f"skip ({info.get('reason', '')})")
+        print(f"  frame {f:5d}  max_pw={info['max_pointwise']:.3f}m  {status}")
 
-        if obs_list or args.all_windows:
-            fname = plot_window(
-                motion_idx=args.motion, win_idx=win_idx,
-                full_path_xy=full_path_xy, div_xy=div_xy,
-                obstacles=obs_list, info=info,
-                out_dir=args.out_dir, w_start=w_start, w_end=w_end,
+        if info["has_detour"] or args.all_windows:
+            fname = plot_frame(
+                motion_idx=args.motion, frame=f,
+                full_path_xy=full_path_xy,
+                red_xy=red_xy, green_xy=green_xy,
+                past_xy=past_xy,
+                robot_xy=robot_pos,
+                info=info,
+                safe_r=args.robot_safe_radius,
+                out_dir=args.out_dir,
             )
             print(f"    → saved {fname}")
             saved += 1

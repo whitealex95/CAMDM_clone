@@ -58,7 +58,7 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from visualize.motion_loader import MotionDataset
-from visualize.utils.detour import compute_detour_obstacles, make_command_xy
+from visualize.utils.detour import make_command_xy, make_scandot_fill_obstacles
 from visualize.utils.trajectory import extend_future_traj_heusristic
 from visualize.utils.geometry import (
     draw_trajectory,
@@ -72,7 +72,6 @@ from utils.environment_sensor import (
     compute_clip_sensor_readings,
     CircleObstacle,
     BoxObstacle,
-    Obstacle2D,
     quat_wxyz_to_yaw,
 )
 
@@ -127,12 +126,15 @@ class SensorMotionPlayer:
         self.generator = make_generator(random_modes, robot_safe_radius=robot_safe_radius)
 
         self.obstacles = []
+        self._random_obstacles       = []   # cached per obstacle_interval
+        self._scandot_fill_obstacles = []   # refreshed every frame
+        self._scandot_fill_info      = None
         self.readings = np.zeros(self.sensor.feature_dim, dtype=np.float32)
         self.sphere_centers = np.zeros((self.sensor.feature_dim, 2), dtype=np.float64)
 
         self.obstacle_interval = obstacle_interval
-        self._last_obstacle_window = -1   # window index that was last generated
-        self._has_detour = False           # True when detour obstacles exist in current window
+        self._last_obstacle_window = -1   # window index of last cached random obstacles
+        self._has_detour = False          # True when scandot-fill produced any obstacles
 
         # display flags
         self.show_trajectory = show_trajectory
@@ -219,88 +221,100 @@ class SensorMotionPlayer:
     def _current_window_idx(self) -> int:
         return self.current_frame // self.obstacle_interval
 
-    def _maybe_regenerate_obstacles(self):
-        """Regenerate obstacles when entering a new window."""
+    def _maybe_regenerate_random_obstacles(self):
+        """Regenerate cached random obstacles when entering a new window."""
         win_idx = self._current_window_idx()
         if win_idx == self._last_obstacle_window:
-            return  # still in same window
-        self._regenerate_obstacles(win_idx)
+            return
+        self._regenerate_random_obstacles(win_idx)
 
-    def _regenerate_obstacles(self, win_idx: int = None):
-        """Generate a fresh set of obstacles for the current window."""
+    def _regenerate_random_obstacles(self, win_idx: int = None,
+                                     reseed_random: bool = False):
+        """Pick a fresh set of random environment obstacles for the window.
+        Detour-style obstacles come from `_regenerate_scandot_fill`, which
+        runs every frame independently."""
         if win_idx is None:
             win_idx = self._current_window_idx()
 
-        w_start  = win_idx * self.obstacle_interval
-        w_end    = min(w_start + self.obstacle_interval, self.current_motion.num_frames)
-        # Lookahead covers the full future trajectory window so random obstacles
-        # cannot block the path even at the end of the future horizon.
-        la_end   = min(w_end + self.future_frames, self.current_motion.num_frames)
-        div_end  = la_end  # detour check uses the same range
+        w_start = win_idx * self.obstacle_interval
+        w_end   = min(w_start + self.obstacle_interval, self.current_motion.num_frames)
+        # Lookahead covers the full future trajectory window so random
+        # obstacles cannot block the path even at the end of the future
+        # horizon.
+        la_end  = min(w_end + self.future_frames, self.current_motion.num_frames)
 
-        # Collect robot XY for current + lookahead window
-        all_qpos = self.current_motion.get_all_qpos()
+        all_qpos     = self.current_motion.get_all_qpos()
         window_xy    = all_qpos[w_start:w_end, :2]
         lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
-        div_xy       = all_qpos[w_start:div_end, :2]   # window + future_frames
-        past_xy      = all_qpos[max(0, w_start - self.past_frames):w_start, :2]
 
-        # Deterministic seed: (motion_idx * 1000 + win_idx)
-        self.generator.seed(self.current_motion_idx * 1000 + win_idx)
-        self.obstacles = self.generator.generate_for_window(window_xy, lookahead_xy)
-        use_detour = self._detour_flags[win_idx % len(self._detour_flags)]
-        div_obs = self._detour_obstacles(div_xy, past_xy) if use_detour else []
-        self._has_detour = len(div_obs) > 0
-        self.obstacles.extend(div_obs)
+        if reseed_random:
+            self.generator.seed(int(time.time() * 1000) % 1_000_000)
+        else:
+            self.generator.seed(self.current_motion_idx * 1000 + win_idx)
+        self._random_obstacles = self.generator.generate_for_window(
+            window_xy, lookahead_xy
+        )
         self._last_obstacle_window = win_idx
 
     def force_new_obstacles(self):
-        """Manually regenerate obstacles (N key)."""
-        # Use a random seed to get a different placement
-        self.generator.seed(int(time.time() * 1000) % 1_000_000)
+        """Manually regenerate random obstacles (N key). Scandot-fill
+        obstacles refresh on the next frame anyway."""
+        self._regenerate_random_obstacles(reseed_random=True)
+        print(f"Regenerated {len(self._random_obstacles)} random obstacles")
+
+    # ------------------------------------------------------------------
+    # Scandot-fill obstacle placement (per-frame; window=1)
+    # ------------------------------------------------------------------
+
+    def _regenerate_scandot_fill(self):
+        """Per-frame: fill scandots near the command (yellow) trajectory but
+        not within ``robot_safe_radius`` of the actual (red) trajectory.
+        Each filled scandot becomes a CircleObstacle whose radius equals
+        half the sensor's max nearest-neighbour distance (so a fully-filled
+        region has no gaps)."""
         win_idx = self._current_window_idx()
-        w_start  = win_idx * self.obstacle_interval
-        w_end    = min(w_start + self.obstacle_interval, self.current_motion.num_frames)
-        la_end   = min(w_end + self.future_frames, self.current_motion.num_frames)
-        div_end  = la_end
-        all_qpos = self.current_motion.get_all_qpos()
-        window_xy    = all_qpos[w_start:w_end, :2]
-        lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
-        div_xy       = all_qpos[w_start:div_end, :2]
-        past_xy      = all_qpos[max(0, w_start - self.past_frames):w_start, :2]
-        self.obstacles = self.generator.generate_for_window(window_xy, lookahead_xy)
         use_detour = self._detour_flags[win_idx % len(self._detour_flags)]
-        div_obs = self._detour_obstacles(div_xy, past_xy) if use_detour else []
-        self._has_detour = len(div_obs) > 0
-        self.obstacles.extend(div_obs)
-        print(f"Regenerated {len(self.obstacles)} obstacles "
-              f"({len(div_obs)} from trajectory detour)")
+        if not use_detour:
+            self._scandot_fill_obstacles = []
+            self._scandot_fill_info      = None
+            self._has_detour             = False
+            return
 
-    # ------------------------------------------------------------------
-    # Divergence obstacle placement
-    # ------------------------------------------------------------------
+        all_qpos = self.current_motion.get_all_qpos()
+        f        = self.current_frame
+        red_xy   = all_qpos[f : f + self.future_frames, :2]
+        past_xy  = all_qpos[max(0, f - self.past_frames):f, :2]
+        if len(red_xy) < 2:
+            self._scandot_fill_obstacles = []
+            self._scandot_fill_info      = None
+            self._has_detour             = False
+            return
 
-    def _detour_obstacles(self, path_xy: np.ndarray,
-                          past_xy: np.ndarray = None) -> List[Obstacle2D]:
-        """Delegate to the shared compute_detour_obstacles utility."""
-        command_xy = make_command_xy(
-            path_xy, self.cmd_aug, past_xy, weight=self.cmd_aug_weight
+        yellow_xy = make_command_xy(
+            red_xy, self.cmd_aug, past_xy, weight=self.cmd_aug_weight
         )
-        obstacles, _ = compute_detour_obstacles(
-            path_xy, command_xy=command_xy, robot_safe_radius=self.robot_safe_radius
+        qpos      = all_qpos[f]
+        robot_pos = qpos[:2]
+        robot_yaw = quat_wxyz_to_yaw(qpos[3:7])
+
+        obstacles, info = make_scandot_fill_obstacles(
+            self.sensor, robot_pos, robot_yaw,
+            yellow_xy, red_xy, past_xy=past_xy,
+            robot_safe_radius=self.robot_safe_radius,
         )
-        for k, obs in enumerate(obstacles):
-            tag = "off-green" if k == 0 else "on-green"
-            print(f"  [div #{k+1} {tag}] r={obs.radius:.2f}m  center={obs.center.round(3)}")
-        return obstacles
+        self._scandot_fill_obstacles = obstacles
+        self._scandot_fill_info      = info
+        self._has_detour             = info["has_detour"]
 
     def update_pose(self):
         qpos = self.current_motion.get_qpos(self.current_frame)
         self.data.qpos[:] = qpos
         mujoco.mj_forward(self.model, self.data)
 
-        # Update obstacles if entering new window
-        self._maybe_regenerate_obstacles()
+        # Random obstacles cached per window; scandot-fill regenerates per frame.
+        self._maybe_regenerate_random_obstacles()
+        self._regenerate_scandot_fill()
+        self.obstacles = list(self._random_obstacles) + list(self._scandot_fill_obstacles)
 
         # Compute sensor readings
         robot_pos = qpos[:3]
@@ -659,6 +673,10 @@ def create_env_dataset(
     lookahead_frames: int = 45,
     seed: int = 0,
     mode: Union[str, List[str]] = 'sparse',
+    cmd_aug: str = 'linear',
+    cmd_aug_weight: float = 1.0,
+    past_frames: int = 10,
+    future_frames: int = 45,
 ):
     """
     Build an obstacle-augmented dataset with NSM Cylindrical sensor readings.
@@ -713,10 +731,6 @@ def create_env_dataset(
         random_mode = _MODE_TO_RANDOM[mode_str]
         generator   = make_generator(random_mode, robot_safe_radius=robot_safe_radius,
                                      seed=seed)
-        detour_fn = (
-            (lambda xy: compute_detour_obstacles(xy, robot_safe_radius=robot_safe_radius)[0])
-            if use_detour else None
-        )
         print(f"\n[{m_idx+1}/{len(modes)}] mode='{mode_str}'  "
               f"(random={random_mode}, detour={'yes' if use_detour else 'no'}) …")
         for clip_idx, motion in enumerate(tqdm(source_motions)):
@@ -737,7 +751,12 @@ def create_env_dataset(
                 generator,
                 obstacle_interval=obstacle_interval,
                 lookahead_frames=lookahead_frames,
-                detour_fn=detour_fn,
+                use_detour=use_detour,
+                cmd_aug=cmd_aug,
+                cmd_aug_weight=cmd_aug_weight,
+                robot_safe_radius=robot_safe_radius,
+                past_frames=past_frames,
+                future_frames=future_frames,
             )
             new_motion = dict(motion)
             new_motion["sensor_readings"]      = readings.astype(np.float32)
@@ -920,6 +939,10 @@ def main():
             lookahead_frames=args.lookahead_frames,
             seed=args.seed,
             mode=modes,
+            cmd_aug=args.cmd_aug,
+            cmd_aug_weight=args.cmd_aug_weight,
+            past_frames=args.past_frames,
+            future_frames=args.future_frames,
         )
         return
 

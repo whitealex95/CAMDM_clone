@@ -1,15 +1,18 @@
 # Detour Obstacle Placement & Command Trajectory Modes
 
-`compute_detour_obstacles` places circular obstacles in the gap between two
-trajectories:
+Two obstacle-placement strategies live in `visualize/utils/detour.py`:
 
-- **Red** (`path_xy`) — the actual robot trajectory across the obstacle window.
-- **Green** (`command_xy`) — the *command* trajectory the policy is told to
-  follow.
+1. **`make_scandot_fill_obstacles`** *(used by step2)* — per-frame; fills
+   sensor scandots that lie close to the command (yellow) trajectory but
+   outside the safety zone of the actual (red) trajectory. See the
+   "Scandot-fill obstacle augmentation" section below.
 
-The placement geometry is unchanged across modes; only how the green
-trajectory is built differs. `make_command_xy(actual_xy, cmd_aug, past_xy)`
-is the single dispatcher.
+2. **`compute_detour_obstacles`** *(used by step3 demos)* — per-window;
+   places up to two circular obstacles in the gap between yellow and red
+   so the model has to navigate around them. Documented further down.
+
+Both strategies receive the *yellow* command trajectory from the same
+builder, `make_command_xy(actual_xy, cmd_aug, past_xy, weight)`.
 
 ## Common notation
 
@@ -284,3 +287,91 @@ $$
 $$
 
 so the lerp doesn't flip direction when the cmd crosses $\pm\pi$.
+
+
+# Scandot-fill obstacle augmentation
+
+Used by `step2_visualize_data_env2d.py` and `step2_debug_2d.py`. Replaces
+the legacy two-circle detour with a per-frame, sensor-aligned filling
+scheme.
+
+## Inputs (per frame)
+
+- `sensor` — `EnvironmentSensor`. Provides scandot positions and
+  `sensor.max_adjacent_distance` (precomputed at construction).
+- `robot_pos`, `robot_yaw` — current robot pose. Scandots are placed
+  relative to this pose; obstacles regenerate every frame
+  ($\text{window} = 1$).
+- `command_xy` — yellow trajectory over the future horizon
+  ($N$ frames), built from `make_command_xy(actual, cmd_aug, past)`.
+- `actual_xy` — red (gt) trajectory, $N$ frames.
+- `robot_safe_radius` — single threshold reused for both the
+  "close to yellow" inclusion and the "safe distance from red"
+  exclusion.
+
+## Filter
+
+For every scandot $s$ in the sensor pattern (rotated to world
+coordinates by `robot_pos`, `robot_yaw`):
+
+$$
+\text{fill}(s) \;=\;
+  d(s,\,\text{yellow}) < r_{\text{safe}}
+  \;\land\;
+  d(s,\,\text{red}) \geq r_{\text{safe}}
+$$
+
+where $d(\cdot, \text{polyline})$ is the minimum point-to-segment
+distance over the polyline.
+
+A "no detour" early-out runs first: if
+$\max_i \lVert \text{yellow}_i - \text{red}_i \rVert$ is below
+`_DETOUR_DEVIATION_MIN` (= 0.10 m) the function returns no obstacles
+and `info["has_detour"] = False`.
+
+## Obstacle radius
+
+Each filled scandot becomes a `CircleObstacle(s, r_{\text{obs}})` with
+
+$$
+r_{\text{obs}} = \tfrac{1}{2}\,d_{\text{adj}}^{\max}
+$$
+
+where $d_{\text{adj}}^{\max}$ is the precomputed max nearest-neighbour
+distance between any two scandots. With this radius, two scandots that
+are at the maximum nearest-neighbour distance produce circles that just
+touch — so a fully-filled region has no gaps between adjacent
+obstacles.
+
+For the cylindrical sensor with `max_range=2.0m`, `resolution=9`, this
+gives $d_{\text{adj}}^{\max} \approx 0.253$ m, hence
+$r_{\text{obs}} \approx 0.126$ m. Inner rings have heavy overlap (their
+neighbours are much closer than the outer rings); outer-ring obstacles
+just touch their neighbours. Sensor occupancy is unchanged by overlap,
+so the redundancy is harmless.
+
+## Per-frame regeneration
+
+Unlike the legacy two-circle detour (which was per `obstacle_interval`),
+scandot-fill regenerates every frame because:
+
+- The robot pose changes every frame, so its scandot grid moves.
+- The yellow / red trajectories also slide forward by one frame.
+
+Random environment obstacles (`sparse` / `dense` / `compact`) are still
+cached per `obstacle_interval`. The visualiser combines them as
+`obstacles = random_obstacles + scandot_fill_obstacles` per frame.
+
+## What gets stored in the dataset
+
+`compute_clip_sensor_readings` (in `utils/environment_sensor.py`) calls
+`make_scandot_fill_obstacles` per frame and stores
+
+- `sensor_readings`: $(T, \text{feature\_dim})$ occupancy from the
+  combined obstacle set;
+- `command_detour_flags`: $(T,)$ boolean = `info["has_detour"]` per
+  frame.
+
+Per-frame scandot-fill obstacle lists are **not** stored in the pkl —
+they would dominate file size and they are reproducible from
+`(qpos, cmd_aug, robot_safe_radius, sensor)` anyway.

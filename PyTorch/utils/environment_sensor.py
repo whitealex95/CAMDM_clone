@@ -239,6 +239,18 @@ class EnvironmentSensor:
         self._centers_local = np.array(points, dtype=np.float64)  # (N, 2)
         self.ring_slices    = ring_slices   # per-ring index ranges in _centers_local
 
+        # Maximum nearest-neighbour distance over all scandots. Used by
+        # scandot-fill obstacle augmentation: a CircleObstacle of half this
+        # radius placed on every scandot guarantees that a fully-filled
+        # region has no gaps between adjacent obstacles.
+        if len(self._centers_local) > 1:
+            diffs = self._centers_local[:, None, :] - self._centers_local[None, :, :]
+            dists = np.linalg.norm(diffs, axis=-1)
+            np.fill_diagonal(dists, np.inf)
+            self.max_adjacent_distance = float(dists.min(axis=1).max())
+        else:
+            self.max_adjacent_distance = 0.0
+
     # ------------------------------------------------------------------
     # Core API
     # ------------------------------------------------------------------
@@ -652,56 +664,77 @@ def compute_clip_sensor_readings(
     generator: Union[ObstacleGenerator, CyclingObstacleGenerator],
     obstacle_interval: int = 30,
     lookahead_frames: int = 30,
-    detour_fn=None,
-) -> Tuple[np.ndarray, List]:
+    use_detour: bool = False,
+    cmd_aug: str = "linear",
+    cmd_aug_weight: float = 1.0,
+    robot_safe_radius: float = 0.25,
+    past_frames: int = 10,
+    future_frames: int = 45,
+) -> Tuple[np.ndarray, List, np.ndarray]:
     """
-    Compute sensor readings for an entire motion clip with time-varying obstacles.
+    Compute sensor readings for an entire motion clip with time-varying
+    obstacles.
 
-    Obstacles are regenerated every ``obstacle_interval`` frames.
-    Each window's obstacles are checked against the robot path in that window
-    plus ``lookahead_frames`` into the future so the obstacles don't block the
-    immediately upcoming path.
+    Random obstacles are regenerated every ``obstacle_interval`` frames
+    (lookahead = ``lookahead_frames``) so they cannot block the upcoming
+    path. When ``use_detour`` is True, an additional set of *scandot-fill*
+    obstacles is generated **per frame** from the current robot pose:
+    sensor scandots within ``robot_safe_radius`` of the command (yellow)
+    trajectory, but at least ``robot_safe_radius`` from the actual (red)
+    trajectory, become CircleObstacles. The yellow trajectory is built
+    from ``cmd_aug`` / ``cmd_aug_weight`` (see ``visualize/utils/detour.md``).
 
-    Args:
-        all_qpos:          (T, 36) qpos sequence for the full clip.
-        sensor:            EnvironmentSensor instance.
-        generator:         ObstacleGenerator instance.
-        obstacle_interval: Frames between obstacle regeneration.
-        lookahead_frames:  Future frames included in collision check.
-        detour_fn:         Optional callable ``(path_xy: ndarray) -> List[Obstacle2D]``.
-                           When provided, its output is appended to the random obstacles
-                           for each window.  Pass a lambda wrapping
-                           ``compute_detour_obstacles`` to add detour obstacles.
-
-    Returns:
-        readings:          (T, feature_dim) float32 continuous occupancy readings.
-        window_obstacles:  List of (start, end, List[Obstacle2D]) for visualisation.
+    Returns
+    -------
+    readings        : (T, feature_dim) float32 occupancy readings.
+    window_obstacles: list of ``(w_start, w_end, random_obstacles)`` for
+                      visualisation. Scandot-fill obstacles are not stored
+                      here because they are per-frame and would dominate
+                      the pkl size.
+    detour_flags    : (T,) bool, True at frames whose yellow↔red max
+                      pointwise deviation crosses the detour threshold.
     """
+    # Late import to avoid a circular dependency between
+    # `utils.environment_sensor` and `visualize.utils.detour`.
+    from visualize.utils.detour import (
+        make_command_xy,
+        make_scandot_fill_obstacles,
+    )
+
     T = all_qpos.shape[0]
     readings = np.zeros((T, sensor.feature_dim), dtype=np.float32)
     detour_flags = np.zeros(T, dtype=bool)
     window_obstacles = []
 
-    starts = list(range(0, T, obstacle_interval))
-    for w_start in starts:
-        w_end = min(w_start + obstacle_interval, T)
+    for w_start in range(0, T, obstacle_interval):
+        w_end  = min(w_start + obstacle_interval, T)
         la_end = min(w_end + lookahead_frames, T)
 
-        window_xy = all_qpos[w_start:w_end, :2]
+        window_xy    = all_qpos[w_start:w_end, :2]
         lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
-
-        obstacles = generator.generate_for_window(window_xy, lookahead_xy)
-        if detour_fn is not None:
-            div_xy = all_qpos[w_start:la_end, :2]
-            det_obs = list(detour_fn(div_xy))
-            if det_obs:
-                detour_flags[w_start:w_end] = True
-            obstacles = obstacles + det_obs
-        window_obstacles.append((w_start, w_end, obstacles))
+        random_obs   = generator.generate_for_window(window_xy, lookahead_xy)
+        window_obstacles.append((w_start, w_end, random_obs))
 
         for t in range(w_start, w_end):
             pos = all_qpos[t, :3]
             yaw = quat_wxyz_to_yaw(all_qpos[t, 3:7])
+
+            obstacles = list(random_obs)
+            if use_detour:
+                red_xy  = all_qpos[t : t + future_frames, :2]
+                past_xy = all_qpos[max(0, t - past_frames):t, :2]
+                if len(red_xy) >= 2:
+                    yellow_xy = make_command_xy(
+                        red_xy, cmd_aug, past_xy, weight=cmd_aug_weight
+                    )
+                    fill_obs, info = make_scandot_fill_obstacles(
+                        sensor, pos[:2], yaw, yellow_xy, red_xy,
+                        past_xy=past_xy,
+                        robot_safe_radius=robot_safe_radius,
+                    )
+                    obstacles += fill_obs
+                    detour_flags[t] = info["has_detour"]
+
             occ, _ = sensor.compute(pos, yaw, obstacles)
             readings[t] = occ
 
