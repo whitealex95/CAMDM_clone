@@ -91,6 +91,5 @@ def config_parse(args):
     config.trainer.wandb_run_name = args.wandb_run_name if args.wandb_run_name is not None else getattr(config.trainer, 'wandb_run_name', None)
     config.trainer.wandb_tags = args.wandb_tags if args.wandb_tags is not None else getattr(config.trainer, 'wandb_tags', None)
 
-    data_prefix = args.data.split('/')[-1].split('.')[0]
-    config.save = '%s/%s_%s' % (args.save, args.name, data_prefix) if 'debug' not in config.name else '%s/%s' % (args.save, args.name)
+    config.save = '%s/%s' % (args.save, args.name)
     return config
