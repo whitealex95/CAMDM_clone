@@ -6,17 +6,24 @@ produced by ``visualize/step2_visualize_data_env2d.py --create-dataset``.
 
 Each motion in the pkl must carry:
 
-* ``sensor_readings``      : (T, env_sensor_dim) float32 occupancy values.
-* ``traj_trans_per_frame`` : (T, future_frame, 2) float32 — at detour frames
-                             the yellow command, at non-detour frames the
-                             gt (red) trajectory.
-* ``traj_pose_per_frame``  : (T, future_frame, 4) wxyz quaternion, same
-                             detour/non-detour split as ``traj_trans_per_frame``.
+* ``sensor_readings``      : (T, env_sensor_dim) float32 occupancy values
+                             on a robot-local polar grid (index 0 of each
+                             ring = robot's forward direction).
+* ``traj_trans_per_frame`` : (T, future_frame, 2) float32 in the **robot-
+                             local (yaw-frame)** at frame t — the current
+                             frame is at the origin facing ``+x``. Detour
+                             frames store the yellow command; non-detour
+                             frames store the gt (red) trajectory.
+* ``traj_pose_per_frame``  : (T, future_frame, 4) wxyz quaternion, yaw-only,
+                             relative to ``yaw_t``. Same detour/non-detour
+                             split as ``traj_trans_per_frame``.
 
 ``__getitem__`` returns the future window of motion plus a condition dict
 containing past motion, the per-frame trajectory condition, the current
-frame's sensor snapshot, and the style index. Sensor readings and the
-trajectory are co-rotated by the same global heading augmentation.
+frame's sensor snapshot, and the style index. Because ``traj_*`` are
+already canonicalised at the robot's heading, they are heading-invariant
+and are NOT rotated by the global augmentation; the sensor reading is
+cyclically shifted per ring to match the augmented heading.
 """
 
 import sys
@@ -104,22 +111,27 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
 
         current_frame = int(frame_ids[self.reference_frame_idx - 1])
 
-        # Per-frame command trajectory (yellow at detour frames, gt at
-        # non-detour). Stored in world frame, so centre at the current
-        # frame's world XY before passing it on.
+        # Per-frame command trajectory in the robot-local (yaw-frame) at
+        # the current frame. Yellow at detour frames, gt (red) elsewhere.
+        # Already canonicalised at dataset-build time, so no centring or
+        # rotation is needed here — they are heading-invariant.
         traj_pos = self.traj_trans_per_frame_list[motion_idx][current_frame].copy()
         traj_rot = self.traj_pose_per_frame_list[motion_idx][current_frame].copy()
-        ref_xy   = self.root_pos_list[motion_idx][current_frame, :2].astype(traj_pos.dtype)
-        traj_pos = traj_pos - ref_xy                                     # (TF, 2)
 
         sensor_current = self.sensor_readings_list[motion_idx][current_frame].copy()
 
         # ----------------------------------------------------------
-        # GLOBAL ROTATION AUGMENTATION (same as base class)
+        # GLOBAL ROTATION AUGMENTATION
         # ----------------------------------------------------------
+        # past/future poses live in world frame (centred at the current
+        # frame) and rotate with theta. traj_pos / traj_rot are already
+        # in the robot-local frame and so are invariant under heading
+        # rotation — they do not need to be rotated. The sensor's
+        # occupancy values are robot-local in content but each angular
+        # index is bound to the augmented robot heading, so a per-ring
+        # cyclic shift is still required.
         if self.rotation_aug:
-            rot_xyzw     = rotations[..., [1, 2, 3, 0]]
-            trajrot_xyzw = traj_rot[..., [1, 2, 3, 0]]
+            rot_xyzw = rotations[..., [1, 2, 3, 0]]
 
             theta = np.random.uniform(0, 2 * np.pi)
             theta_arr = np.full(rotations.shape[0], theta)
@@ -129,22 +141,11 @@ class HumanoidEnvMotionDataset(HumanoidMotionDataset):
                 rot_vec * R.from_quat(rot_xyzw[:, 0])
             ).as_quat()[..., [3, 0, 1, 2]]
 
-            traj_rot = (
-                rot_vec[self.reference_frame_idx:] * R.from_quat(trajrot_xyzw)
-            ).as_quat()[..., [3, 0, 1, 2]]
-
             root_pos = rot_vec.apply(root_pos)
 
-            # traj_pos is world-frame XY so it must rotate with everything else.
-            if not self.legacy_rotation_aug:
-                cos_t, sin_t = np.cos(theta), np.sin(theta)
-                R2 = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=traj_pos.dtype)
-                traj_pos = (R2 @ traj_pos.T).T
-
-            # Rotate the sensor reading to match the new heading.
-            # Each ring z has count_z = round(2π*z) spheres uniformly
-            # distributed over 2π. A heading rotation of theta shifts ring z's
-            # angular index by k_z = -round(theta * count_z / (2π)).
+            # Cyclic-shift sensor: ring z (count_z = round(2π*z) spheres
+            # uniformly distributed over 2π) shifts by
+            #   k_z = -round(theta * count_z / (2π))
             rotated = sensor_current.copy()
             for (start, end) in self._ring_slices:
                 count = end - start

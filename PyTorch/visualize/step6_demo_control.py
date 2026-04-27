@@ -47,7 +47,11 @@ from diffusion.create_diffusion import create_gaussian_diffusion
 from visualize.utils.geometry import draw_trajectory, draw_sensor_readings
 from visualize.utils.transition_manager import create_transition_manager
 from visualize.utils.trajectory import blend_trajectory, extend_future_traj_heusristic
-from utils.environment_sensor import EnvironmentSensor, quat_wxyz_to_yaw
+from utils.environment_sensor import (
+    EnvironmentSensor,
+    quat_wxyz_to_yaw,
+    world_traj_to_local,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -267,24 +271,29 @@ class SensorMotionGenerator:
         obstacles: list,
         cfg_scale: float = None,
     ) -> np.ndarray:
-        curr_xy = past_qpos[-1, :2].copy()
+        curr_xy  = past_qpos[-1, :2].copy()
+        curr_yaw = quat_wxyz_to_yaw(past_qpos[-1, 3:7])
 
         pq = past_qpos.copy()
         pq[:, :2] -= curr_xy
         past_t = torch.from_numpy(qpos_to_model_format(pq)).float() \
             .unsqueeze(0).permute(0, 2, 3, 1).to(self.device)
 
-        traj_tr_t = torch.from_numpy((traj_trans - curr_xy).astype(np.float32)).float() \
+        # Canonicalise traj into robot-local (yaw-frame) at the current
+        # frame to match the dataset's per-frame storage.
+        traj_local_xy, traj_local_pose = world_traj_to_local(
+            traj_trans, traj_pose, curr_xy, curr_yaw
+        )
+        traj_tr_t = torch.from_numpy(traj_local_xy).float() \
             .unsqueeze(0).permute(0, 2, 1).to(self.device)
         traj_repr = nn_transforms.get_rotation(
-            torch.from_numpy(traj_pose).float(), self.rot_req
+            torch.from_numpy(traj_local_pose).float(), self.rot_req
         ).numpy()
         traj_po_t = torch.from_numpy(traj_repr).float() \
             .unsqueeze(0).permute(0, 2, 1).to(self.device)
 
         if obstacles:
-            yaw = quat_wxyz_to_yaw(past_qpos[-1, 3:7])
-            readings, _ = self.sensor.compute(past_qpos[-1, :3], yaw, obstacles)
+            readings, _ = self.sensor.compute(past_qpos[-1, :3], curr_yaw, obstacles)
         else:
             readings = np.zeros(self.sensor.feature_dim, dtype=np.float32)
         sensor_t = torch.from_numpy(readings).float().unsqueeze(0).to(self.device)

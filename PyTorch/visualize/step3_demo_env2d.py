@@ -73,6 +73,7 @@ from utils.environment_sensor import (
     CircleObstacle,
     BoxObstacle,
     quat_wxyz_to_yaw,
+    world_traj_to_local,
 )
 from visualize.utils.detour import compute_detour_obstacles
 
@@ -179,6 +180,7 @@ class SensorMotionGenerator:
             (future_frames, 36)
         """
         curr_root_XY = past_qpos[-1, :2].copy()
+        curr_yaw     = quat_wxyz_to_yaw(past_qpos[-1, 3:7])
 
         # ── Past motion ──────────────────────────────────────────────────
         pq = past_qpos.copy()
@@ -186,19 +188,20 @@ class SensorMotionGenerator:
         past_motion_t = torch.from_numpy(qpos_to_model_format(pq)).float() \
             .unsqueeze(0).permute(0, 2, 3, 1).to(self.device)  # (1, 31, 6, past)
 
-        # ── Trajectory ───────────────────────────────────────────────────
-        traj_t = traj_trans - curr_root_XY
-        traj_trans_t = torch.from_numpy(traj_t).float() \
+        # ── Trajectory (canonicalise to robot-local yaw-frame) ───────────
+        traj_local_xy, traj_local_pose = world_traj_to_local(
+            traj_trans, traj_pose, curr_root_XY, curr_yaw
+        )
+        traj_trans_t = torch.from_numpy(traj_local_xy).float() \
             .unsqueeze(0).permute(0, 2, 1).to(self.device)     # (1, 2, future)
 
         traj_pose_repr = nn_transforms.get_rotation(
-            torch.from_numpy(traj_pose).float(), self.rot_req
+            torch.from_numpy(traj_local_pose).float(), self.rot_req
         ).numpy()
         traj_pose_t = torch.from_numpy(traj_pose_repr).float() \
             .unsqueeze(0).permute(0, 2, 1).to(self.device)     # (1, 6, future)
 
         # ── Current-frame sensor reading ─────────────────────────────────
-        curr_yaw = quat_wxyz_to_yaw(past_qpos[-1, 3:7])
         sensor_readings, _ = self.sensor.compute(
             past_qpos[-1, :3], curr_yaw, obstacles
         )  # (env_sensor_dim,)

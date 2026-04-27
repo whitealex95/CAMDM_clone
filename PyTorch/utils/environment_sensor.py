@@ -63,6 +63,50 @@ def quat_wxyz_to_yaw(quat_wxyz: np.ndarray) -> float:
     return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
 
 
+def world_traj_to_local(
+    traj_xy_world: np.ndarray,
+    traj_pose_world_wxyz: np.ndarray,
+    curr_xy: np.ndarray,
+    curr_yaw: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Convert a future trajectory from world frame into the robot-local
+    (yaw-frame) at the current frame. This matches the canonical storage
+    used by the env2d dataset.
+
+    Args:
+        traj_xy_world:        (F, 2) future world XY.
+        traj_pose_world_wxyz: (F, 4) future world wxyz quaternions
+                              (yaw-only — pitch/roll are dropped).
+        curr_xy:              (2,)   current world XY.
+        curr_yaw:             current world yaw (radians).
+
+    Returns:
+        traj_xy_local:        (F, 2) float32, robot-local XY.
+        traj_pose_local_wxyz: (F, 4) float32, yaw-only wxyz relative to
+                              ``curr_yaw`` (current frame is identity).
+    """
+    cos_y, sin_y = np.cos(curr_yaw), np.sin(curr_yaw)
+    R_inv = np.array([[cos_y, sin_y], [-sin_y, cos_y]], dtype=np.float64)
+
+    dxy = np.asarray(traj_xy_world, dtype=np.float64) - np.asarray(curr_xy, dtype=np.float64)
+    traj_xy_local = (R_inv @ dxy.T).T.astype(np.float32)
+
+    yaws = np.array(
+        [quat_wxyz_to_yaw(np.asarray(q, dtype=np.float64))
+         for q in traj_pose_world_wxyz],
+        dtype=np.float64,
+    ) - float(curr_yaw)
+    traj_pose_local_wxyz = np.stack([
+        np.cos(yaws / 2.0),
+        np.zeros_like(yaws),
+        np.zeros_like(yaws),
+        np.sin(yaws / 2.0),
+    ], axis=1).astype(np.float32)
+
+    return traj_xy_local, traj_pose_local_wxyz
+
+
 # ---------------------------------------------------------------------------
 # Obstacle base class and implementations
 # ---------------------------------------------------------------------------
@@ -693,13 +737,18 @@ def compute_clip_sensor_readings(
                       here because they are per-frame and would dominate
                       the pkl size.
     traj_trans_per_frame : (T, future_frames, 2) float32. For each frame
-                      t, the world XY trajectory the policy should be
-                      conditioned on for the next ``future_frames`` steps.
-                      Detour frames store the yellow command; non-detour
-                      frames store the gt (red) trajectory. Padded with
-                      the last available value at the tail of the motion.
-    traj_pose_per_frame  : (T, future_frames, 4) float32 wxyz quaternion.
-                      Same layout as ``traj_trans_per_frame``.
+                      t, the future trajectory the policy should be
+                      conditioned on, expressed in the **robot-local
+                      (yaw-frame)** at frame t — translated by ``-p_t``
+                      and rotated by ``R(-yaw_t)`` so that frame t sits
+                      at the origin facing ``+x``. Detour frames store
+                      the yellow command; non-detour frames store the
+                      gt (red) trajectory. Padded with the last available
+                      value at the tail of the motion.
+    traj_pose_per_frame  : (T, future_frames, 4) float32 wxyz quaternion,
+                      yaw-only, **relative to ``yaw_t``** (so the current
+                      frame's pose is identity). Same yellow/red layout
+                      as ``traj_trans_per_frame``.
     """
     # Late import to avoid a circular dependency between
     # `utils.environment_sensor` and `visualize.utils.detour`.
@@ -745,34 +794,43 @@ def compute_clip_sensor_readings(
             pos = all_qpos[t, :3]
             yaw = quat_wxyz_to_yaw(all_qpos[t, 3:7])
 
+            # Inverse heading rotation R(-yaw_t): converts world XY into
+            # robot-local (yaw-frame) coords at frame t.
+            cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+            R_inv = np.array(
+                [[cos_y, sin_y], [-sin_y, cos_y]], dtype=np.float64,
+            )
+
             obstacles = list(random_obs)
 
-            # gt (red) trajectory for the future horizon, padded to
-            # ``future_frames`` so per-frame storage has a consistent shape.
-            # Match the legacy ``motion["traj_pose"]`` convention: store a
-            # *yaw-only* world-frame quaternion (the forward heading) rather
-            # than the full root quaternion, so the model sees the same
-            # representation for both detour and non-detour frames.
-            red_xy   = all_qpos[t : t + future_frames, :2]
-            red_yaws = np.array(
+            # gt (red) trajectory for the future horizon. The polyline
+            # is computed in world frame (because obstacle generation
+            # below operates in world coordinates), then converted to
+            # robot-local at frame t for storage.
+            red_xy_world   = all_qpos[t : t + future_frames, :2]
+            red_yaws_world = np.array(
                 [quat_wxyz_to_yaw(q) for q in all_qpos[t : t + future_frames, 3:7]],
                 dtype=np.float64,
             )
-            red_quat        = _yaws_to_wxyz(red_yaws)
-            red_xy_padded   = _pad_to_future(red_xy,   future_frames)
-            red_quat_padded = _pad_to_future(red_quat, future_frames)
+
+            red_xy_local   = (R_inv @ (red_xy_world - pos[:2]).T).T
+            red_yaws_local = red_yaws_world - yaw
+            red_quat_local = _yaws_to_wxyz(red_yaws_local)
+
+            red_xy_padded   = _pad_to_future(red_xy_local,   future_frames)
+            red_quat_padded = _pad_to_future(red_quat_local, future_frames)
             if len(red_xy_padded) == future_frames:
                 traj_trans_per_frame[t] = red_xy_padded.astype(np.float32)
                 traj_pose_per_frame[t]  = red_quat_padded.astype(np.float32)
 
             if use_detour:
                 past_xy = all_qpos[max(0, t - past_frames):t, :2]
-                if len(red_xy) >= 2:
-                    yellow_xy = make_command_xy(
-                        red_xy, cmd_aug, past_xy, weight=cmd_aug_weight
+                if len(red_xy_world) >= 2:
+                    yellow_xy_world = make_command_xy(
+                        red_xy_world, cmd_aug, past_xy, weight=cmd_aug_weight
                     )
                     fill_obs, info = make_scandot_fill_obstacles(
-                        sensor, pos[:2], yaw, yellow_xy, red_xy,
+                        sensor, pos[:2], yaw, yellow_xy_world, red_xy_world,
                         past_xy=past_xy,
                         robot_safe_radius=robot_safe_radius,
                         fill_method=fill_method,
@@ -788,19 +846,22 @@ def compute_clip_sensor_readings(
                              for q in all_qpos[max(0, t - past_frames):t, 3:7]],
                             dtype=np.float64,
                         )
-                        yellow_yaws = make_command_yaws(
-                            red_yaws, cmd_aug,
+                        yellow_yaws_world = make_command_yaws(
+                            red_yaws_world, cmd_aug,
                             past_xy=past_xy, past_yaws=past_yaws,
                             current_yaw=float(yaw),
                             weight=cmd_aug_weight,
                         )
-                        yellow_quat = _yaws_to_wxyz(yellow_yaws)
+
+                        yellow_xy_local   = (R_inv @ (yellow_xy_world - pos[:2]).T).T
+                        yellow_yaws_local = yellow_yaws_world - yaw
+                        yellow_quat_local = _yaws_to_wxyz(yellow_yaws_local)
 
                         yellow_xy_padded   = _pad_to_future(
-                            yellow_xy.astype(np.float32), future_frames
+                            yellow_xy_local.astype(np.float32), future_frames
                         )
                         yellow_quat_padded = _pad_to_future(
-                            yellow_quat, future_frames
+                            yellow_quat_local, future_frames
                         )
                         if len(yellow_xy_padded) == future_frames:
                             traj_trans_per_frame[t] = yellow_xy_padded
