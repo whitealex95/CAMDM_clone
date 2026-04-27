@@ -13,7 +13,7 @@ Usage
 Legend
 ------
   Light coral line  : full clip root trajectory (background reference)
-  Green line        : linear command trajectory (A → B) for the window
+  Green line        : command trajectory for the window (--cmd-aug)
   Green × markers  : arrow sample points (every 5th frame)
   Green shading     : robot safe-radius tube around green trajectory
   Red line          : actual root trajectory for the window
@@ -40,6 +40,7 @@ from visualize.motion_loader import MotionDataset
 from visualize.utils.detour import (
     ARROW_STEP,
     compute_detour_obstacles,
+    make_command_xy,
 )
 
 
@@ -84,7 +85,7 @@ def plot_window(motion_idx: int, win_idx: int,
         _draw_safe_tube(ax, green_xy, safe_r, color="limegreen", alpha=0.15,
                         label=f"green safe (r={safe_r}m)")
         ax.plot(green_xy[:, 0], green_xy[:, 1],
-                color="green", lw=1.8, zorder=3, label="green (linear cmd)")
+                color="green", lw=1.8, zorder=3, label="green (command)")
         arrow_idx = np.arange(0, len(green_xy), ARROW_STEP)
         ax.scatter(green_xy[arrow_idx, 0], green_xy[arrow_idx, 1],
                    marker="x", s=40, color="green", zorder=5)
@@ -158,6 +159,22 @@ def get_args():
                    help="Motion clip index (0-based)")
     p.add_argument("--obstacle-interval",  type=int,   default=30)
     p.add_argument("--future-frames",      type=int,   default=45)
+    p.add_argument("--past-frames",        type=int,   default=10,
+                   help="Past frames used for past_extrap command (default: 10)")
+    p.add_argument("--cmd-aug", default="linear",
+                   choices=["linear", "extrap_pos", "extrap_pos_noyaw",
+                            "extrap_pos_preserve_len", "extrap_hfte"],
+                   help="Command trajectory used for detour placement "
+                        "(see visualize/utils/detour.md): "
+                        "linear=straight start→end (default), "
+                        "extrap_pos=constant-velocity extrapolation of past, "
+                        "extrap_pos_noyaw=same XY as extrap_pos (visualiser-only yaw differs), "
+                        "extrap_pos_preserve_len=past direction with gt step lengths, "
+                        "extrap_hfte=HFTE central-symmetry extension of past")
+    p.add_argument("--cmd-aug-weight", type=float, default=1.0,
+                   help="Linear blend weight w between cmd_aug and ground truth: "
+                        "command = w*extrap + (1-w)*gt. "
+                        "1.0=pure extrap (default), 0.0=pure gt.")
     p.add_argument("--all-windows",        action="store_true",
                    help="Save a PNG for every window, not just those with obstacles")
     p.add_argument("--robot-safe-radius",  type=float, default=0.25)
@@ -188,9 +205,12 @@ def main():
         w_end   = min(w_start + args.obstacle_interval, T)
         div_end = min(w_end   + args.future_frames,     T)
         div_xy  = all_qpos[w_start:div_end, :2]
+        past_xy = all_qpos[max(0, w_start - args.past_frames):w_start, :2]
 
+        command_xy = make_command_xy(div_xy, args.cmd_aug, past_xy,
+                                     weight=args.cmd_aug_weight)
         obs_list, info = compute_detour_obstacles(
-            div_xy, robot_safe_radius=args.robot_safe_radius
+            div_xy, command_xy=command_xy, robot_safe_radius=args.robot_safe_radius
         )
 
         status = (

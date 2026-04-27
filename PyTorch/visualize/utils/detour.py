@@ -22,6 +22,7 @@ robot_safe_radius (detour too shallow to be useful).
 
 import numpy as np
 from utils.environment_sensor import CircleObstacle
+from visualize.utils.trajectory import extend_future_traj_heusristic
 
 # Every 5th frame – matches draw_trajectory_arrows in geometry.py
 ARROW_STEP = 5
@@ -118,10 +119,85 @@ def find_onpath_circle(green_xy: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Command trajectory builder
+# ---------------------------------------------------------------------------
+
+def make_command_xy(actual_xy: np.ndarray,
+                    cmd_aug: str = "linear",
+                    past_xy: np.ndarray = None,
+                    weight: float = 1.0) -> np.ndarray:
+    """
+    Build the command (green) trajectory used for detour-obstacle placement.
+
+    Parameters
+    ----------
+    actual_xy : (N, 2) actual robot positions across the obstacle window.
+    cmd_aug   : "linear"      → straight line actual_xy[0] → actual_xy[-1].
+                "extrap_pos"  → constant-velocity extrapolation of past trend.
+                "extrap_pos_noyaw" → identical XY to extrap_pos (yaw handling
+                                differs only in the visualiser).
+                "extrap_pos_preserve_len" → straight line in past direction,
+                                but per-frame step lengths are taken from
+                                the actual trajectory (so total path length
+                                matches gt).
+                "extrap_hfte" → HFTE (heuristic central-symmetry) extension
+                                seeded with past + current frame. See detour.md.
+    past_xy   : (P, 2) past positions (oldest first). Required for extrap_pos*,
+                extrap_hfte; falls back to "linear" when too few frames.
+    weight    : in [0, 1]. Linear blend
+                ``w * extrap + (1 - w) * actual``. 1.0 = pure extrap (default),
+                0.0 = pure ground truth.
+
+    Returns
+    -------
+    command_xy : (N, 2) command trajectory starting at actual_xy[0].
+    """
+    actual_xy = np.asarray(actual_xy, dtype=np.float64)
+    N = len(actual_xy)
+
+    if cmd_aug in ("extrap_pos", "extrap_pos_noyaw") \
+            and past_xy is not None and len(past_xy) >= 2:
+        past_xy = np.asarray(past_xy, dtype=np.float64)
+        v = (past_xy[-1] - past_xy[0]) / (len(past_xy) - 1)   # per-frame velocity
+        steps = np.arange(N)
+        extrap = actual_xy[0][None] + steps[:, None] * v[None]
+    elif cmd_aug == "extrap_pos_preserve_len" and past_xy is not None and len(past_xy) >= 2:
+        past_xy = np.asarray(past_xy, dtype=np.float64)
+        v = (past_xy[-1] - past_xy[0]) / (len(past_xy) - 1)
+        v_norm = float(np.linalg.norm(v))
+        if v_norm < 1e-9:
+            # Stationary past — fall through to linear
+            t = np.linspace(0.0, 1.0, N)
+            extrap = actual_xy[0][None] + t[:, None] * (actual_xy[-1] - actual_xy[0])[None]
+        else:
+            direction = v / v_norm                                       # (2,)
+            seg_lens  = np.linalg.norm(np.diff(actual_xy, axis=0), axis=1)
+            arc       = np.concatenate([[0.0], np.cumsum(seg_lens)])     # (N,)
+            extrap    = actual_xy[0][None] + arc[:, None] * direction[None]
+    elif cmd_aug == "extrap_hfte" and past_xy is not None and len(past_xy) >= 1:
+        past_xy = np.asarray(past_xy, dtype=np.float64)
+        seed = np.vstack([past_xy, actual_xy[0][None]])       # (P+1, 2)
+        total = len(seed) + (N - 1)
+        dummy_orient = np.tile([1.0, 0.0, 0.0, 0.0], (len(seed), 1))
+        ext_traj, _ = extend_future_traj_heusristic(seed, dummy_orient, total)
+        extrap = ext_traj[-N:]                                # starts at a_0
+    else:
+        # Default / fallback: linear interpolation
+        t = np.linspace(0.0, 1.0, N)
+        extrap = actual_xy[0][None] + t[:, None] * (actual_xy[-1] - actual_xy[0])[None]
+
+    if weight == 1.0:
+        return extrap
+    return weight * extrap + (1.0 - weight) * actual_xy
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def compute_detour_obstacles(path_xy: np.ndarray, robot_safe_radius: float = 0.25):
+def compute_detour_obstacles(path_xy: np.ndarray,
+                             command_xy: np.ndarray = None,
+                             robot_safe_radius: float = 0.25):
     """
     Place up to two detour obstacles for one trajectory window.
 
@@ -129,6 +205,10 @@ def compute_detour_obstacles(path_xy: np.ndarray, robot_safe_radius: float = 0.2
     ----------
     path_xy : (N, 2) float array
         Root XY positions for the window (red / actual trajectory).
+    command_xy : (N, 2) optional
+        Command (green) trajectory the policy is told to follow. Must be the
+        same length as path_xy. When None, falls back to linear interpolation
+        from path_xy[0] to path_xy[-1] (legacy behaviour).
     robot_safe_radius : float
         Body clearance subtracted from raw segment distance when
         computing obstacle radius.
@@ -142,10 +222,15 @@ def compute_detour_obstacles(path_xy: np.ndarray, robot_safe_radius: float = 0.2
     if N < 4:
         return [], {"reason": "N<4"}
 
-    t_param     = np.linspace(0.0, 1.0, N)
-    green_start = path_xy[0].copy()
-    green_end   = path_xy[-1].copy()
-    green_xy    = green_start + t_param[:, None] * (green_end - green_start)
+    if command_xy is None:
+        t_param  = np.linspace(0.0, 1.0, N)
+        green_xy = path_xy[0][None] + t_param[:, None] * (path_xy[-1] - path_xy[0])[None]
+    else:
+        green_xy = np.asarray(command_xy, dtype=np.float64)
+        assert len(green_xy) == N, \
+            f"command_xy length {len(green_xy)} != path_xy length {N}"
+    green_start = green_xy[0].copy()
+    green_end   = green_xy[-1].copy()
 
     pointwise = np.linalg.norm(green_xy - path_xy, axis=1)
     if float(pointwise.max()) < 0.10:

@@ -58,7 +58,8 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from visualize.motion_loader import MotionDataset
-from visualize.utils.detour import compute_detour_obstacles
+from visualize.utils.detour import compute_detour_obstacles, make_command_xy
+from visualize.utils.trajectory import extend_future_traj_heusristic
 from visualize.utils.geometry import (
     draw_trajectory,
     draw_sensor_readings,
@@ -106,6 +107,8 @@ class SensorMotionPlayer:
         min_start_velocity: float = None,
         robot_safe_radius: float = 0.25,
         max_div_obstacles: int = 3,
+        cmd_aug: str = 'linear',
+        cmd_aug_weight: float = 1.0,
     ):
         self.model = model
         self.data = data
@@ -150,6 +153,9 @@ class SensorMotionPlayer:
         self.past_frames = past_frames
         self.future_frames = future_frames
         self.min_start_velocity = min_start_velocity
+
+        self.cmd_aug        = cmd_aug
+        self.cmd_aug_weight = float(cmd_aug_weight)
 
         self.load_motion(0)
 
@@ -237,12 +243,13 @@ class SensorMotionPlayer:
         window_xy    = all_qpos[w_start:w_end, :2]
         lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
         div_xy       = all_qpos[w_start:div_end, :2]   # window + future_frames
+        past_xy      = all_qpos[max(0, w_start - self.past_frames):w_start, :2]
 
         # Deterministic seed: (motion_idx * 1000 + win_idx)
         self.generator.seed(self.current_motion_idx * 1000 + win_idx)
         self.obstacles = self.generator.generate_for_window(window_xy, lookahead_xy)
         use_detour = self._detour_flags[win_idx % len(self._detour_flags)]
-        div_obs = self._detour_obstacles(div_xy) if use_detour else []
+        div_obs = self._detour_obstacles(div_xy, past_xy) if use_detour else []
         self._has_detour = len(div_obs) > 0
         self.obstacles.extend(div_obs)
         self._last_obstacle_window = win_idx
@@ -260,9 +267,10 @@ class SensorMotionPlayer:
         window_xy    = all_qpos[w_start:w_end, :2]
         lookahead_xy = all_qpos[w_end:la_end, :2] if la_end > w_end else None
         div_xy       = all_qpos[w_start:div_end, :2]
+        past_xy      = all_qpos[max(0, w_start - self.past_frames):w_start, :2]
         self.obstacles = self.generator.generate_for_window(window_xy, lookahead_xy)
         use_detour = self._detour_flags[win_idx % len(self._detour_flags)]
-        div_obs = self._detour_obstacles(div_xy) if use_detour else []
+        div_obs = self._detour_obstacles(div_xy, past_xy) if use_detour else []
         self._has_detour = len(div_obs) > 0
         self.obstacles.extend(div_obs)
         print(f"Regenerated {len(self.obstacles)} obstacles "
@@ -272,10 +280,14 @@ class SensorMotionPlayer:
     # Divergence obstacle placement
     # ------------------------------------------------------------------
 
-    def _detour_obstacles(self, path_xy: np.ndarray) -> List[Obstacle2D]:
+    def _detour_obstacles(self, path_xy: np.ndarray,
+                          past_xy: np.ndarray = None) -> List[Obstacle2D]:
         """Delegate to the shared compute_detour_obstacles utility."""
+        command_xy = make_command_xy(
+            path_xy, self.cmd_aug, past_xy, weight=self.cmd_aug_weight
+        )
         obstacles, _ = compute_detour_obstacles(
-            path_xy, robot_safe_radius=self.robot_safe_radius
+            path_xy, command_xy=command_xy, robot_safe_radius=self.robot_safe_radius
         )
         for k, obs in enumerate(obstacles):
             tag = "off-green" if k == 0 else "on-green"
@@ -322,26 +334,200 @@ class SensorMotionPlayer:
             self.future_traj, self.future_orient
         )
 
+    # ------------------------------------------------------------------
+    # Yaw helpers (used by every cmd_aug branch + the gt blend)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _quats_to_yaws(quats: np.ndarray) -> np.ndarray:
+        """(N, 4) wxyz → (N,) yaw in radians."""
+        return np.array([quat_wxyz_to_yaw(q) for q in quats], dtype=np.float64)
+
+    @staticmethod
+    def _yaws_to_quats(yaws: np.ndarray) -> np.ndarray:
+        """(N,) yaw → (N, 4) wxyz quaternions (yaw-only rotation about Z)."""
+        N = len(yaws)
+        out = np.zeros((N, 4), dtype=np.float32)
+        out[:, 0] = np.cos(yaws / 2.0)
+        out[:, 3] = np.sin(yaws / 2.0)
+        return out
+
+    def _extrap_past_yaw_rate(self, N: int) -> np.ndarray:
+        """Constant-rate extrapolation of unwrapped past yaws over N frames,
+        starting one frame after past[-1] (mirrors the position formula)."""
+        past_yaws = np.unwrap(self._quats_to_yaws(self.past_orient))
+        P = len(past_yaws)
+        yaw_rate  = (past_yaws[-1] - past_yaws[0]) / (P - 1)
+        return past_yaws[-1] + np.arange(1, N + 1) * yaw_rate
+
+    # ------------------------------------------------------------------
+    # Command trajectory dispatch + per-mode implementations
+    # ------------------------------------------------------------------
     def _compute_command_trajectory(self, future_traj, future_orient):
         """
-        Command trajectory:
-          - No detour this window → same as dataset target (future_traj as-is).
-          - Detour detected       → linear interpolation start→end (forces robot
-                                    to navigate past the detour obstacle).
-        Orientation is always taken from the dataset.
+        Command trajectory (see ``visualize/utils/detour.md``):
+          linear                  : straight start→end interpolation, gt yaw.
+          extrap_pos              : past velocity extrapolation + past yaw rate.
+          extrap_pos_noyaw        : same XY as extrap_pos; yaw lerps from
+                                    current heading to arctan2(v) (no past
+                                    yaw rate).
+          extrap_pos_preserve_len : past direction with gt step lengths;
+                                    same yaw rate as extrap_pos.
+          extrap_hfte             : HFTE on past XY + HFTE on past yaws.
+
+        The final command is then linearly blended with the dataset (gt)
+        values using ``self.cmd_aug_weight``:
+            blended = w * extrap + (1 - w) * gt
         """
         if future_traj is None or len(future_traj) < 2:
             return None, None
 
-        if not self._has_detour:
+        if self.cmd_aug == 'extrap_pos':
+            cmd_traj, cmd_orient = self._cmd_aug_extrap_pos(future_traj, future_orient)
+        elif self.cmd_aug == 'extrap_pos_noyaw':
+            cmd_traj, cmd_orient = self._cmd_aug_extrap_pos_noyaw(future_traj, future_orient)
+        elif self.cmd_aug == 'extrap_pos_preserve_len':
+            cmd_traj, cmd_orient = self._cmd_aug_extrap_pos_preserve_len(future_traj, future_orient)
+        elif self.cmd_aug == 'extrap_hfte':
+            cmd_traj, cmd_orient = self._cmd_aug_extrap_hfte(future_traj, future_orient)
+        else:  # 'linear' (default)
+            N = len(future_traj)
+            t = np.linspace(0.0, 1.0, N)
+            cmd_traj = future_traj[0][None] + t[:, None] * (future_traj[-1] - future_traj[0])[None]
+            cmd_orient = future_orient
+
+        return self._blend_with_gt(cmd_traj, cmd_orient, future_traj, future_orient)
+
+    def _blend_with_gt(self, cmd_traj, cmd_orient, gt_traj, gt_orient):
+        """Linearly blend command with ground truth via ``self.cmd_aug_weight``."""
+        w = self.cmd_aug_weight
+        if w >= 1.0:
+            return cmd_traj, cmd_orient
+        if w <= 0.0:
+            return gt_traj.copy(), gt_orient.copy()
+
+        # Position
+        blended_traj = (w * cmd_traj + (1.0 - w) * gt_traj).astype(gt_traj.dtype)
+
+        # Orientation: yaw lerp. Per-frame shortest signed path can flip
+        # direction at the ±π boundary (e.g. cmd rotates past π while gt
+        # stays near 0 → delta jumps from +π to -π+ε between consecutive
+        # frames). Wrapping each delta to [-π, π] then `np.unwrap`-ing the
+        # delta sequence keeps the blend smooth across the horizon.
+        yaw_gt  = self._quats_to_yaws(gt_orient)
+        yaw_cmd = self._quats_to_yaws(cmd_orient)
+        delta   = (yaw_cmd - yaw_gt + np.pi) % (2.0 * np.pi) - np.pi
+        delta   = np.unwrap(delta)
+        return blended_traj, self._yaws_to_quats(yaw_gt + w * delta)
+
+    def _cmd_aug_extrap_pos(self, future_traj, future_orient):
+        """
+        Position    : extrapolate past-frame velocity forward.
+        Orientation : extrapolate past yaw rate forward (independent of
+                      position direction; no assumption that the robot faces
+                      its motion direction).
+        """
+        if self.past_traj is None or len(self.past_traj) < 2:
             return future_traj, future_orient
 
-        N = len(future_traj)
-        t = np.linspace(0.0, 1.0, N)
-        start_pos    = future_traj[0]
-        end_pos      = future_traj[-1]
-        command_traj = start_pos[None] + t[:, None] * (end_pos - start_pos)[None]  # (N, 3)
-        return command_traj, future_orient
+        past_xy = self.past_traj[:, :2]
+        P = len(past_xy)
+        v = (past_xy[-1] - past_xy[0]) / (P - 1)             # per-frame velocity
+
+        N      = len(future_traj)
+        steps  = np.arange(1, N + 1)
+        cmd_xy = past_xy[-1][None] + steps[:, None] * v[None]
+
+        new_traj        = future_traj.copy()
+        new_traj[:, :2] = cmd_xy
+        return new_traj, self._yaws_to_quats(self._extrap_past_yaw_rate(N))
+
+    def _cmd_aug_extrap_pos_noyaw(self, future_traj, future_orient):
+        """
+        Position    : same as extrap_pos (constant past velocity).
+        Orientation : lerp yaw from current heading at frame 0 to the
+                      extrapolated direction arctan2(v) at frame N-1
+                      (linear interpolation, shortest signed path). Does NOT
+                      use past yaw rate; the robot is assumed to face its
+                      motion direction by the end of the horizon.
+        """
+        if self.past_traj is None or len(self.past_traj) < 2:
+            return future_traj, future_orient
+
+        past_xy = self.past_traj[:, :2]
+        P = len(past_xy)
+        v = (past_xy[-1] - past_xy[0]) / (P - 1)
+
+        N      = len(future_traj)
+        steps  = np.arange(1, N + 1)
+        cmd_xy = past_xy[-1][None] + steps[:, None] * v[None]
+
+        new_traj        = future_traj.copy()
+        new_traj[:, :2] = cmd_xy
+
+        yaw_now    = float(quat_wxyz_to_yaw(future_orient[0]))
+        yaw_target = float(np.arctan2(v[1], v[0]))
+        delta      = (yaw_target - yaw_now + np.pi) % (2.0 * np.pi) - np.pi
+        ts         = np.linspace(0.0, 1.0, N)
+        return new_traj, self._yaws_to_quats(yaw_now + ts * delta)
+
+    def _cmd_aug_extrap_pos_preserve_len(self, future_traj, future_orient):
+        """
+        Position    : straight line in past velocity direction, but per-frame
+                      step lengths taken from gt (so total path length matches
+                      future_traj exactly).
+        Orientation : same constant-rate yaw extrapolation as extrap_pos.
+        """
+        if self.past_traj is None or len(self.past_traj) < 2:
+            return future_traj, future_orient
+
+        past_xy = self.past_traj[:, :2]
+        P = len(past_xy)
+        v = (past_xy[-1] - past_xy[0]) / (P - 1)
+        v_norm = float(np.linalg.norm(v))
+        if v_norm < 1e-9:
+            # Stationary past — no direction to extrapolate
+            return future_traj.copy(), future_orient.copy()
+        direction = v / v_norm                                          # (2,)
+
+        N        = len(future_traj)
+        seg_lens = np.linalg.norm(np.diff(future_traj[:, :2], axis=0), axis=1)
+        arc      = np.concatenate([[0.0], np.cumsum(seg_lens)])         # (N,)
+        cmd_xy   = future_traj[0, :2][None] + arc[:, None] * direction[None]
+
+        new_traj        = future_traj.copy()
+        new_traj[:, :2] = cmd_xy
+        return new_traj, self._yaws_to_quats(self._extrap_past_yaw_rate(N))
+
+    def _cmd_aug_extrap_hfte(self, future_traj, future_orient):
+        """
+        Position    : HFTE central-symmetry extension of past XY trend.
+        Orientation : HFTE extension of the past yaw sequence (independent of
+                      position direction; no assumption that the robot faces
+                      its motion direction).
+        """
+        if self.past_traj is None or len(self.past_traj) < 1:
+            return future_traj, future_orient
+
+        past_xy = self.past_traj[:, :2]
+        N       = len(future_traj)
+        cmd_xy  = make_command_xy(future_traj[:, :2], "extrap_hfte", past_xy)
+
+        new_traj        = future_traj.copy()
+        new_traj[:, :2] = cmd_xy
+
+        # Yaw via HFTE on past_yaws + current yaw. Stack with a zero second
+        # column to reuse the 2-D HFTE helper; reflections preserve each
+        # column independently, so the yaw column comes back extrapolated.
+        past_yaws = self._quats_to_yaws(self.past_orient)
+        yaw_now   = float(quat_wxyz_to_yaw(future_orient[0]))
+        seed_yaws = np.unwrap(np.concatenate([past_yaws, [yaw_now]]))    # (P+1,)
+        seed_2d   = np.stack([seed_yaws, np.zeros_like(seed_yaws)], axis=1)
+
+        total = len(seed_2d) + (N - 1)
+        dummy = np.tile([1.0, 0.0, 0.0, 0.0], (len(seed_2d), 1))
+        ext_2d, _ = extend_future_traj_heusristic(seed_2d, dummy, total)
+        yaws = ext_2d[-N:, 0]                                            # (N,)
+        return new_traj, self._yaws_to_quats(yaws)
 
     # ------------------------------------------------------------------
     # Rendering
@@ -643,6 +829,19 @@ def get_args():
                    help="Disable MP4 recording (visualisation mode only)")
     p.add_argument("--video-width",  type=int, default=1280)
     p.add_argument("--video-height", type=int, default=720)
+    p.add_argument("--cmd-aug", default="linear",
+                   choices=["linear", "extrap_pos", "extrap_pos_noyaw",
+                            "extrap_pos_preserve_len", "extrap_hfte"],
+                   help="Command trajectory augmentation (see visualize/utils/detour.md): "
+                        "linear=straight start→end (default), "
+                        "extrap_pos=constant-velocity extrapolation of past, "
+                        "extrap_pos_noyaw=extrap_pos XY with yaw lerping toward arctan2(v), "
+                        "extrap_pos_preserve_len=past direction with gt step lengths, "
+                        "extrap_hfte=HFTE central-symmetry extension of past")
+    p.add_argument("--cmd-aug-weight", type=float, default=1.0,
+                   help="Linear blend weight w between cmd_aug and ground truth: "
+                        "command = w*extrap + (1-w)*gt. "
+                        "1.0=pure extrap (default), 0.0=pure gt.")
     return p.parse_args()
 
 
@@ -655,7 +854,7 @@ def print_instructions():
     print("  UP/DOWN     : Prev / Next motion clip")
     print("  R           : Reset to first frame")
     print("  T           : Toggle trajectory")
-    print("  C           : Toggle command trajectory (yellow linear interp)")
+    print("  C           : Toggle command trajectory (yellow)")
     print("  E           : Toggle sensor overlay")
     print("  L           : Toggle ray lines (dots only ↔ lines+dots)")
     print("  O           : Toggle obstacle display")
@@ -767,6 +966,8 @@ def main():
         future_frames=args.future_frames,
         min_start_velocity=args.min_start_velocity if args.min_start_velocity > 0 else None,
         robot_safe_radius=args.robot_safe_radius,
+        cmd_aug=args.cmd_aug,
+        cmd_aug_weight=args.cmd_aug_weight,
     )
 
     if args.motion > 0:
