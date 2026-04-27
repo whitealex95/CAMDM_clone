@@ -667,6 +667,7 @@ def compute_clip_sensor_readings(
     use_detour: bool = False,
     cmd_aug: str = "linear",
     cmd_aug_weight: float = 1.0,
+    fill_method: str = "band",
     robot_safe_radius: float = 0.25,
     past_frames: int = 10,
     future_frames: int = 45,
@@ -731,6 +732,7 @@ def compute_clip_sensor_readings(
                         sensor, pos[:2], yaw, yellow_xy, red_xy,
                         past_xy=past_xy,
                         robot_safe_radius=robot_safe_radius,
+                        fill_method=fill_method,
                     )
                     obstacles += fill_obs
                     detour_flags[t] = info["has_detour"]

@@ -108,6 +108,7 @@ class SensorMotionPlayer:
         max_div_obstacles: int = 3,
         cmd_aug: str = 'linear',
         cmd_aug_weight: float = 1.0,
+        fill_method: str = 'band',
     ):
         self.model = model
         self.data = data
@@ -158,6 +159,7 @@ class SensorMotionPlayer:
 
         self.cmd_aug        = cmd_aug
         self.cmd_aug_weight = float(cmd_aug_weight)
+        self.fill_method    = fill_method
 
         self.load_motion(0)
 
@@ -301,6 +303,7 @@ class SensorMotionPlayer:
             self.sensor, robot_pos, robot_yaw,
             yellow_xy, red_xy, past_xy=past_xy,
             robot_safe_radius=self.robot_safe_radius,
+            fill_method=self.fill_method,
         )
         self._scandot_fill_obstacles = obstacles
         self._scandot_fill_info      = info
@@ -675,6 +678,7 @@ def create_env_dataset(
     mode: Union[str, List[str]] = 'sparse',
     cmd_aug: str = 'linear',
     cmd_aug_weight: float = 1.0,
+    fill_method: str = 'band',
     past_frames: int = 10,
     future_frames: int = 45,
 ):
@@ -754,6 +758,7 @@ def create_env_dataset(
                 use_detour=use_detour,
                 cmd_aug=cmd_aug,
                 cmd_aug_weight=cmd_aug_weight,
+                fill_method=fill_method,
                 robot_safe_radius=robot_safe_radius,
                 past_frames=past_frames,
                 future_frames=future_frames,
@@ -861,6 +866,13 @@ def get_args():
                    help="Linear blend weight w between cmd_aug and ground truth: "
                         "command = w*extrap + (1-w)*gt. "
                         "1.0=pure extrap (default), 0.0=pure gt.")
+    p.add_argument("--fill-method", default="band",
+                   choices=["band", "band_yellow", "yellow_circle"],
+                   help="Obstacle-fill strategy (see visualize/utils/detour.md): "
+                        "band=scandot-based, keep scandots outside red safety "
+                        "zone (default); "
+                        "yellow_circle=one uniform-radius CircleObstacle per "
+                        "yellow arrow point, max radius bounded by red safety.")
     return p.parse_args()
 
 
@@ -941,6 +953,7 @@ def main():
             mode=modes,
             cmd_aug=args.cmd_aug,
             cmd_aug_weight=args.cmd_aug_weight,
+            fill_method=args.fill_method,
             past_frames=args.past_frames,
             future_frames=args.future_frames,
         )
@@ -991,6 +1004,7 @@ def main():
         robot_safe_radius=args.robot_safe_radius,
         cmd_aug=args.cmd_aug,
         cmd_aug_weight=args.cmd_aug_weight,
+        fill_method=args.fill_method,
     )
 
     if args.motion > 0:

@@ -311,18 +311,58 @@ scheme.
 
 ## Filter
 
-For every scandot $s$ in the sensor pattern (rotated to world
-coordinates by `robot_pos`, `robot_yaw`):
+Two strategies are selectable via `fill_method`. In both cases
+$d(\cdot, \text{polyline})$ is the minimum point-to-segment distance
+over the polyline.
+
+### `band` (default)
+
+A per-scandot distance band — currently the red-safety constraint only,
+since the historical "close to yellow" inclusion has been disabled
+experimentally:
 
 $$
 \text{fill}(s) \;=\;
-  d(s,\,\text{yellow}) < r_{\text{safe}}
-  \;\land\;
   d(s,\,\text{red}) \geq r_{\text{safe}}
 $$
 
-where $d(\cdot, \text{polyline})$ is the minimum point-to-segment
-distance over the polyline.
+(Re-enable the yellow constraint by uncommenting the
+`d(s, yellow) < r_safe` line in `make_scandot_fill_obstacles`.)
+
+This produces dense fill: every scandot outside the red safety zone
+becomes an obstacle.
+
+### `yellow_circle`
+
+Not scandot-based: place one ``CircleObstacle`` *at every yellow arrow
+point*, each with its own *largest* radius such that the circle stays
+at least $r_{\text{safe}}$ away from the red polyline.
+
+Per-point radius (variable across the trajectory):
+
+$$
+r_i = \max\!\big(d(\mathbf{y}_i,\,\text{red}) - r_{\text{safe}},\; 0\big)
+$$
+
+Yellow points whose $r_i$ falls below `min_radius` (= 0.05 m) are
+dropped. This naturally trims the boundary points: linear and
+`extrap_pos*` trajectories share endpoints with red, so
+$d(\mathbf{y}_i, \text{red}) = 0$ near the start/end and the resulting
+$r_i$ is below the threshold there. If *every* point fails the test,
+no obstacles are produced at all.
+
+Past exclusion uses the geometrically correct check
+$d(\mathbf{c}, \text{past}) - r \geq r_{\text{safe}}$ so a circle's
+*outer edge* — not just its centre — stays clear of the past safety
+zone. (The scandot `band` method uses the simpler centre-only check
+because each scandot obstacle is small.)
+
+### Past exclusion (both methods)
+
+When `past_xy` (blue) is supplied, scandots within $r_{\text{safe}}$
+of the past polyline are removed from the fill mask regardless of
+method, so obstacles never appear behind the robot where it has just
+walked.
 
 A "no detour" early-out runs first: if
 $\max_i \lVert \text{yellow}_i - \text{red}_i \rVert$ is below

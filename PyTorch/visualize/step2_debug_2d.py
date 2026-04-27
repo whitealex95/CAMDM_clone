@@ -59,22 +59,31 @@ def plot_frame(motion_idx: int, frame: int,
                red_xy: np.ndarray, green_xy: np.ndarray,
                past_xy: np.ndarray,
                robot_xy: np.ndarray,
+               obstacles: list,
                info: dict,
                safe_r: float,
                out_dir: str) -> str:
-    """Render one frame's scandot-fill picture to a PNG and return the path."""
+    """Render one frame's obstacle-augmentation picture to a PNG."""
     fig, ax = plt.subplots(figsize=(8, 8))
     ax.set_aspect("equal")
 
-    n_filled = int(info["fill_mask"].sum())
-    has_det  = info["has_detour"]
-    obs_r    = info["obstacle_radius"]
+    fill_mask = info.get("fill_mask")
+    n_filled  = int(fill_mask.sum()) if fill_mask is not None else 0
+    has_det   = info["has_detour"]
+    obs_r     = info["obstacle_radius"]
+    method    = info.get("fill_method", "?")
+    if method == "yellow_circle":
+        status = (f"{len(obstacles)} circles  r={obs_r:.2f}m"
+                  if has_det and obstacles
+                  else f"NO DETOUR ({info.get('reason', '')})"
+                  if not has_det else "skip (uniform radius infeasible)")
+    else:
+        status = (f"filled={n_filled}/{len(info['all_centers'])}"
+                  if has_det else f"NO DETOUR ({info.get('reason', '')})")
     ax.set_title(
-        f"motion={motion_idx}  frame={frame}\n"
+        f"motion={motion_idx}  frame={frame}  method={method}\n"
         f"max_pw={info['max_pointwise']:.3f}m  "
-        f"safe_r={safe_r}m  obs_r={obs_r:.3f}m  "
-        + (f"filled={n_filled}/{len(info['all_centers'])}"
-           if has_det else f"NO DETOUR ({info.get('reason', '')})")
+        f"safe_r={safe_r}m  obs_r={obs_r:.3f}m  {status}"
     )
 
     # Background: full clip
@@ -105,21 +114,26 @@ def plot_frame(motion_idx: int, frame: int,
             ax.plot(past_xy[:, 0], past_xy[:, 1],
                     color="dodgerblue", lw=1.8, zorder=3, label="past (blue)")
 
-    # Scandot grid: all dots in light grey
+    # Scandot grid as background context (light grey)
     centers = info["all_centers"]
-    fill_mask = info["fill_mask"]
-    ax.scatter(centers[~fill_mask, 0], centers[~fill_mask, 1],
-               s=6, color="0.75", zorder=2, label="scandot (free)")
+    if fill_mask is not None:
+        ax.scatter(centers[~fill_mask, 0], centers[~fill_mask, 1],
+                   s=6, color="0.75", zorder=2, label="scandot")
+        if n_filled > 0:
+            ax.scatter(centers[fill_mask, 0], centers[fill_mask, 1],
+                       s=10, color="midnightblue", zorder=5,
+                       label=f"scandot (filled)")
+    else:
+        ax.scatter(centers[:, 0], centers[:, 1],
+                   s=6, color="0.75", zorder=2, label="scandot")
 
-    # Filled scandots: dark disks of obstacle_radius (so the figure matches
-    # what the sensor actually sees)
-    for c in centers[fill_mask]:
-        circ = plt.Circle(c, obs_r, color="midnightblue", alpha=0.55, zorder=4)
+    # Actual obstacles drawn from the returned list (works for any method)
+    for k, obs in enumerate(obstacles):
+        circ = plt.Circle(obs.center, obs.radius,
+                          color="midnightblue", alpha=0.55, zorder=4,
+                          label=f"obstacle (r={obs.radius:.2f}m)" if k == 0 else None)
         ax.add_patch(circ)
-    if n_filled > 0:
-        ax.scatter(centers[fill_mask, 0], centers[fill_mask, 1],
-                   s=10, color="midnightblue", zorder=5,
-                   label=f"scandot (filled, r={obs_r:.2f}m)")
+        ax.scatter(*obs.center, s=10, color="midnightblue", zorder=5)
 
     # Robot position
     ax.scatter(*robot_xy, marker="*", s=180, color="gold",
@@ -159,6 +173,13 @@ def get_args():
     p.add_argument("--cmd-aug-weight", type=float, default=1.0,
                    help="Blend weight w: command = w*extrap + (1-w)*gt. "
                         "1.0=pure extrap (default), 0.0=pure gt.")
+    p.add_argument("--fill-method", default="band",
+                   choices=["band", "band_yellow", "yellow_circle"],
+                   help="Obstacle-fill strategy (see visualize/utils/detour.md): "
+                        "band=scandot-based, keep scandots outside red safety "
+                        "zone (default); "
+                        "yellow_circle=one uniform-radius CircleObstacle per "
+                        "yellow arrow point, max radius bounded by red safety.")
     p.add_argument("--max-range",          type=float, default=2.0,
                    help="Sensor max range in metres (default: 2.0)")
     p.add_argument("--resolution",         type=int,   default=9,
@@ -213,24 +234,30 @@ def main():
         robot_pos = qpos[:2]
         robot_yaw = quat_wxyz_to_yaw(qpos[3:7])
 
-        _, info = make_scandot_fill_obstacles(
+        obstacles, info = make_scandot_fill_obstacles(
             sensor, robot_pos, robot_yaw, green_xy, red_xy,
             past_xy=past_xy,
             robot_safe_radius=args.robot_safe_radius,
+            fill_method=args.fill_method,
         )
 
-        n_filled = int(info["fill_mask"].sum())
-        status = (f"FILL {n_filled} dots" if info["has_detour"]
-                  else f"skip ({info.get('reason', '')})")
+        if args.fill_method == "yellow_circle":
+            status = (f"{len(obstacles)} circles  r={info['obstacle_radius']:.2f}m"
+                      if obstacles else f"skip ({info.get('reason', 'no valid radius')})")
+        else:
+            n_filled = int(info["fill_mask"].sum()) if info.get("fill_mask") is not None else 0
+            status = (f"FILL {n_filled} dots" if info["has_detour"]
+                      else f"skip ({info.get('reason', '')})")
         print(f"  frame {f:5d}  max_pw={info['max_pointwise']:.3f}m  {status}")
 
-        if info["has_detour"] or args.all_windows:
+        if (obstacles or info["has_detour"]) or args.all_windows:
             fname = plot_frame(
                 motion_idx=args.motion, frame=f,
                 full_path_xy=full_path_xy,
                 red_xy=red_xy, green_xy=green_xy,
                 past_xy=past_xy,
                 robot_xy=robot_pos,
+                obstacles=obstacles,
                 info=info,
                 safe_r=args.robot_safe_radius,
                 out_dir=args.out_dir,

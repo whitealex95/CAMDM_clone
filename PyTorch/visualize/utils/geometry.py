@@ -187,7 +187,10 @@ def draw_obstacle_circle(
         color = [0.9, 0.25, 0.15, 0.55]
 
     pos  = np.array([center_xy[0], center_xy[1], height * 0.5], dtype=np.float64)
-    size = np.array([radius, radius, height * 0.5], dtype=np.float64)
+    # MuJoCo cylinder size = (radius, half_length, _). The previous
+    # (radius, radius, half_height) layout misread radius as the cylinder's
+    # half-length, making tall obstacles that scaled with the radius.
+    size = np.array([radius, height * 0.5, 0.0], dtype=np.float64)
 
     mujoco.mjv_initGeom(
         scene.geoms[scene.ngeom],

@@ -222,6 +222,53 @@ def make_command_xy(actual_xy: np.ndarray,
 _DETOUR_DEVIATION_MIN = 0.10
 
 
+def _make_yellow_circle_obstacles(
+    command_xy: np.ndarray,
+    actual_xy: np.ndarray,
+    safe_distance: float,
+    min_radius: float = 0.05,
+) -> Tuple[List[CircleObstacle], float]:
+    """
+    Place one ``CircleObstacle`` at every yellow (command) arrow point.
+    Each circle gets its own *largest* radius such that it stays at least
+    ``safe_distance`` away from the red (actual) polyline.
+
+    Per-point radius (uses the polyline distance to red so a circle never
+    reaches into red anywhere on the future horizon):
+
+        r_i = max( d(yellow_i, red_polyline) − safe_distance, 0 )
+
+    Yellow points whose r_i falls below ``min_radius`` are dropped — this
+    naturally drops the boundary points where yellow coincides with red
+    (linear / extrap_pos* trajectories share endpoints with red, giving
+    polyline distance 0). If *no* point is left, no obstacles are
+    produced at all.
+
+    Note: very oscillatory motion (e.g. running with hip swing) brings
+    red close to the yellow chord even when the trajectory clearly
+    deviates, so the polyline metric will report tiny distances and few
+    obstacles will be placed. That's the price of guaranteeing no
+    obstacle ever overlaps red.
+
+    Returns ``(obstacles, mean_radius)``. ``mean_radius`` is 0.0 when
+    no obstacles can be placed.
+    """
+    if len(command_xy) < 1:
+        return [], 0.0
+
+    d_red_per_yellow = batch_polyline_dist(command_xy, actual_xy)
+    radii_per_yellow = d_red_per_yellow - safe_distance
+
+    valid = radii_per_yellow >= min_radius
+    if not valid.any():
+        return [], 0.0
+
+    obstacles = [CircleObstacle(p.copy(), float(r))
+                 for p, r, ok in zip(command_xy, radii_per_yellow, valid) if ok]
+    mean_r = float(radii_per_yellow[valid].mean())
+    return obstacles, mean_r
+
+
 def make_scandot_fill_obstacles(
     sensor: EnvironmentSensor,
     robot_pos: np.ndarray,
@@ -232,18 +279,35 @@ def make_scandot_fill_obstacles(
     robot_safe_radius: float = 0.25,
     obstacle_radius: float = None,
     deviation_min: float = _DETOUR_DEVIATION_MIN,
+    fill_method: str = "band",
 ) -> Tuple[List[CircleObstacle], dict]:
     """
-    Per-step augmentation: fill sensor scandots that lie close to the command
-    (yellow) trajectory but stay outside the safety zone of the actual (red)
-    trajectory and the past (blue) trajectory. Each filled scandot becomes a
-    CircleObstacle so the sensor reads occupancy ≈ 1 there.
+    Per-step augmentation: fill sensor scandots between the command (yellow)
+    and actual (red) trajectories, while keeping the past (blue) trajectory
+    clear. Each filled scandot becomes a CircleObstacle so the sensor reads
+    occupancy ≈ 1 there.
 
-    Filter
-    ------
-        keep scandot ⇔  d(s, command) < robot_safe_radius
-                       ∧ d(s, actual)  ≥ robot_safe_radius
-                       ∧ d(s, past)    ≥ robot_safe_radius   (if past_xy given)
+    Two fill strategies (selected by ``fill_method``):
+
+      "band" (default) — scandot-based, band around yellow:
+          keep scandot ⇔  d(s, actual) ≥ r_safe
+          (the historical d(s, command) < r_safe inclusion was disabled
+          experimentally; see the comment in the body to re-enable.)
+
+      "yellow_circle" — one CircleObstacle per yellow arrow point:
+          obstacles are not placed at scandots; instead, every yellow
+          (command) point hosts a CircleObstacle. Each circle gets its
+          own largest radius such that it stays at least ``r_safe`` away
+          from the red polyline:
+              r_i = max(d(yellow_i, red) − r_safe, 0)
+          Points where r_i falls below 0.05 m are skipped; this naturally
+          drops boundary points where yellow coincides with red (the
+          linear / extrap_pos* trajectories share endpoints with red so
+          the polyline distance there is 0). If every point fails the
+          test, no obstacles are produced.
+
+    Past-trajectory exclusion (centre within r_safe of past_xy) is applied
+    to both methods when ``past_xy`` is provided.
 
     Parameters
     ----------
@@ -266,6 +330,7 @@ def make_scandot_fill_obstacles(
     deviation_min     : min max-pointwise(yellow, red) below which the
                         window is treated as no-detour and no obstacles
                         are produced.
+    fill_method       : "band" or "ring_arc" (see above).
 
     Returns
     -------
@@ -277,7 +342,10 @@ def make_scandot_fill_obstacles(
                                    (d_past is None when no past_xy was given)
         obstacle_radius          : the radius used
         max_pointwise            : max |yellow_i − red_i| over the horizon
-        has_detour               : bool, True iff max_pointwise ≥ deviation_min
+        has_detour               : bool, True iff at least one obstacle was
+                                   actually produced (use this as the
+                                   per-frame ``command_detour_flags`` flag).
+        fill_method              : echoed back for downstream debugging
     """
     command_xy = np.asarray(command_xy, dtype=np.float64)
     actual_xy  = np.asarray(actual_xy,  dtype=np.float64)
@@ -285,9 +353,7 @@ def make_scandot_fill_obstacles(
     if obstacle_radius is None:
         obstacle_radius = 0.5 * sensor.max_adjacent_distance
 
-    # Detour check
     max_pw = float(np.linalg.norm(command_xy - actual_xy, axis=1).max())
-    has_detour = max_pw >= deviation_min
 
     # Get scandot world positions (occupancy is irrelevant here)
     _, centers = sensor.compute(robot_pos, robot_yaw, [])
@@ -300,28 +366,74 @@ def make_scandot_fill_obstacles(
         "d_past":          None,
         "obstacle_radius": obstacle_radius,
         "max_pointwise":   max_pw,
-        "has_detour":      has_detour,
+        "has_detour":      False,    # set to len(obstacles) > 0 at the end
+        "fill_method":     fill_method,
     }
-    if not has_detour or len(command_xy) < 2 or len(actual_xy) < 2:
-        info["reason"] = "no detour" if not has_detour else "trajectory too short"
+    # Cheap deviation-based early-out: if yellow barely deviates from red
+    # there's nothing to augment.
+    if max_pw < deviation_min or len(command_xy) < 2 or len(actual_xy) < 2:
+        info["reason"] = ("no detour" if max_pw < deviation_min
+                          else "trajectory too short")
         return [], info
 
     d_yellow = batch_polyline_dist(centers, command_xy)
     d_red    = batch_polyline_dist(centers, actual_xy)
-    # fill_mask = (d_yellow < robot_safe_radius) & (d_red >= robot_safe_radius)
-    fill_mask = (d_red >= robot_safe_radius)
+    info["d_yellow"] = d_yellow
+    info["d_red"]    = d_red
 
     if past_xy is not None and len(past_xy) >= 1:
-        d_past = batch_polyline_dist(centers, np.asarray(past_xy, dtype=np.float64))
-        fill_mask &= (d_past >= robot_safe_radius)
-        info["d_past"] = d_past
+        past_xy_arr = np.asarray(past_xy, dtype=np.float64)
+        info["d_past"] = batch_polyline_dist(centers, past_xy_arr)
+    else:
+        past_xy_arr = None
 
-    info["d_yellow"]  = d_yellow
-    info["d_red"]     = d_red
+    if fill_method == "yellow_circle":
+        # Place a circle AT each interior yellow point. Each circle's
+        # radius is the largest value that stays r_safe away from red.
+        # If even one interior point can't host a non-trivial circle the
+        # augmentation falls back to the existing min-radius drop logic
+        # (point-wise, not whole-augmentation).
+        obstacles, mean_r = _make_yellow_circle_obstacles(
+            command_xy, actual_xy, robot_safe_radius
+        )
+        info["obstacle_radius"] = mean_r
+        # Past exclusion: drop circles whose extent enters the past
+        # safety zone, i.e. d(centre, past) − radius < r_safe.
+        if obstacles and past_xy_arr is not None:
+            centers_arr = np.array([o.center for o in obstacles])
+            radii_arr   = np.array([o.radius for o in obstacles])
+            d_past_obs  = batch_polyline_dist(centers_arr, past_xy_arr)
+            obstacles = [o for o, d, r in zip(obstacles, d_past_obs, radii_arr)
+                         if d - r >= robot_safe_radius]
+        info["has_detour"] = len(obstacles) > 0
+        return obstacles, info
+
+    # Scandot-based methods: each filled scandot becomes one obstacle
+    # of radius `obstacle_radius`.
+    if fill_method == "band":
+        band_center = robot_pos
+        fill_mask = (d_red >= robot_safe_radius)
+        fill_mask &= (np.linalg.norm(centers-band_center, axis=1) < np.maximum(
+            np.max(np.linalg.norm(command_xy-band_center, axis=1)), 
+            np.max(np.linalg.norm(actual_xy-band_center, axis=1))
+        ))
+    elif fill_method == "band_yellow":
+        band_center = command_xy.mean(axis=0)
+        fill_mask = (d_red >= robot_safe_radius)
+        fill_mask &= (np.linalg.norm(centers-band_center, axis=1) < np.maximum(
+            np.max(np.linalg.norm(command_xy-band_center, axis=1)), 
+            np.max(np.linalg.norm(actual_xy-band_center, axis=1))
+        ))
+    else:
+        raise ValueError(f"Unknown fill_method: {fill_method!r}")
+
+    if past_xy_arr is not None:
+        fill_mask &= (info["d_past"] >= robot_safe_radius)
+
     info["fill_mask"] = fill_mask
-
     obstacles = [CircleObstacle(centers[i].copy(), obstacle_radius)
                  for i in np.where(fill_mask)[0]]
+    info["has_detour"] = len(obstacles) > 0
     return obstacles, info
 
 
