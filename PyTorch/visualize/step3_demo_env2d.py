@@ -75,7 +75,11 @@ from utils.environment_sensor import (
     quat_wxyz_to_yaw,
     world_traj_to_local,
 )
-from visualize.utils.detour import compute_detour_obstacles
+from visualize.utils.detour import (
+    make_command_xy,
+    make_command_yaws,
+    make_scandot_fill_obstacles,
+)
 
 # Maps new-style mode names to underlying ObstacleGenerator modes
 _MODE_TO_RANDOM = {
@@ -287,6 +291,9 @@ class DemoPlayerEnv:
         obstacle_interval=30, obstacle_mode='sparse',
         robot_safe_radius=0.25,
         command_orient_mode='target',
+        cmd_aug='linear',
+        cmd_aug_weight=1.0,
+        fill_method='band',
     ):
         self.model   = mj_model
         self.data    = mj_data
@@ -296,6 +303,9 @@ class DemoPlayerEnv:
         self.sensor = generator.sensor
         self.robot_safe_radius = float(robot_safe_radius)
         self.command_orient_mode = str(command_orient_mode)  # target | interp | forward
+        self.cmd_aug        = str(cmd_aug)
+        self.cmd_aug_weight = float(cmd_aug_weight)
+        self.fill_method    = str(fill_method)
 
         # Decompose new-style mode names into detour flags + random modes
         if isinstance(obstacle_mode, str):
@@ -308,6 +318,8 @@ class DemoPlayerEnv:
         self.obstacle_mode = obstacle_mode
 
         self.obstacles = []
+        self._random_obstacles       = []  # cached per obstacle_interval window
+        self._scandot_fill_obstacles = []  # refreshed every frame (detour modes)
         self._last_obs_window = -1
         self._has_detour = False
 
@@ -407,54 +419,68 @@ class DemoPlayerEnv:
     def _window_idx(self) -> int:
         return self.current_frame // self.obstacle_interval
 
-    def _detour_obstacles_from_dataset(self, win_idx: int):
-        """Compute detour obstacles using actual robot trajectory + aligned future path.
-
-        step2 uses raw dataset world-XY which matches because the robot always follows
-        the dataset exactly.  In step3 the model can drift, so we build div_xy from:
-          - qpos_history  : actual past robot positions (world XY)
-          - future_traj_dataset : dataset trajectory aligned to the current robot pose
-        This ensures obstacles are placed near where the robot actually is.
-        """
-        past_xy   = np.array(self.qpos_history)[:, :2]
-        future_xy = (self.future_traj_dataset[:, :2]
-                     if getattr(self, 'future_traj_dataset', None) is not None
-                     else np.empty((0, 2), dtype=np.float32))
-        div_xy = np.concatenate([past_xy, future_xy], axis=0)
-        obs, _   = compute_detour_obstacles(div_xy, robot_safe_radius=self.robot_safe_radius)
-        for k, o in enumerate(obs):
-            tag = "off-line" if k == 0 else "on-line"
-            print(f"  [detour #{k+1} {tag}] r={o.radius:.2f}m  center={o.center.round(3)}")
-        return obs
-
-    def _maybe_regenerate(self):
+    def _maybe_regenerate_random(self):
+        """Random environment obstacles: cached per obstacle_interval window."""
         w = self._window_idx()
         if w == self._last_obs_window:
             return
-        # Random obstacles: use actual robot positions as safe zone (step3 advantage)
         win_xy = np.array(self.qpos_history)[:, :2]
         la_xy  = self.future_traj[:, :2] if hasattr(self, 'future_traj') and self.future_traj is not None else None
         self.generator_obs.seed(self.current_motion_idx * 1000 + w)
-        self.obstacles = self.generator_obs.generate_for_window(win_xy, la_xy)
-        # Detour obstacles: use dataset target trajectory (same as step2)
+        self._random_obstacles = self.generator_obs.generate_for_window(win_xy, la_xy)
+        self._last_obs_window = w
+
+    def _regenerate_scandot_fill(self):
+        """Per-frame scandot-fill detour obstacles, mirroring step2's pipeline.
+
+        Uses the aligned future trajectory (option b) as red, the
+        ``cmd_aug``-derived command as yellow, and the actual past as blue.
+        """
+        w = self._window_idx()
         use_detour = self._detour_flags[w % len(self._detour_flags)]
         self._has_detour = use_detour
-        if use_detour:
-            self.obstacles.extend(self._detour_obstacles_from_dataset(w))
-        self._last_obs_window = w
+        if not use_detour:
+            self._scandot_fill_obstacles = []
+            return
+
+        red_xy = (self.future_traj_dataset[:, :2]
+                  if getattr(self, 'future_traj_dataset', None) is not None
+                  else None)
+        if red_xy is None or len(red_xy) < 2:
+            self._scandot_fill_obstacles = []
+            return
+
+        past_xy = (self.past_traj[:, :2]
+                   if getattr(self, 'past_traj', None) is not None else None)
+        yellow_xy = make_command_xy(
+            red_xy, self.cmd_aug, past_xy, weight=self.cmd_aug_weight
+        )
+
+        qpos      = self.data.qpos
+        robot_pos = qpos[:2]
+        robot_yaw = quat_wxyz_to_yaw(qpos[3:7])
+        obstacles, _ = make_scandot_fill_obstacles(
+            self.sensor, robot_pos, robot_yaw,
+            yellow_xy, red_xy, past_xy=past_xy,
+            robot_safe_radius=self.robot_safe_radius,
+            fill_method=self.fill_method,
+        )
+        self._scandot_fill_obstacles = obstacles
+
+    def _refresh_obstacles(self):
+        self._maybe_regenerate_random()
+        self._regenerate_scandot_fill()
+        self.obstacles = list(self._random_obstacles) + list(self._scandot_fill_obstacles)
 
     def force_new_obstacles(self):
         self.generator_obs.seed(int(time.time() * 1000) % 1_000_000)
         win_xy = np.array(self.qpos_history)[:, :2]
         la_xy  = self.future_traj[:, :2] if hasattr(self, 'future_traj') and self.future_traj is not None else None
-        self.obstacles = self.generator_obs.generate_for_window(win_xy, la_xy)
-        w = self._window_idx()
-        use_detour = self._detour_flags[w % len(self._detour_flags)]
-        self._has_detour = use_detour
-        det_obs = self._detour_obstacles_from_dataset(w) if use_detour else []
-        self.obstacles.extend(det_obs)
+        self._random_obstacles = self.generator_obs.generate_for_window(win_xy, la_xy)
+        self._regenerate_scandot_fill()
+        self.obstacles = list(self._random_obstacles) + list(self._scandot_fill_obstacles)
         print(f"Regenerated {len(self.obstacles)} obstacles  "
-              f"({len(det_obs)} detour, mode={self.obstacle_mode})")
+              f"({len(self._scandot_fill_obstacles)} scandot-fill, mode={self.obstacle_mode})")
 
     # ------------------------------------------------------------------
     # Pose update (mirrors step3_demo.py)
@@ -536,8 +562,9 @@ class DemoPlayerEnv:
             self.current_frame += 1
             if self.current_frame >= self.current_motion_data.num_frames:
                 self.current_frame = 0
-            # Obstacle regeneration before generating motion
-            self._maybe_regenerate()
+            # Refresh red+yellow before scandot-fill so obstacles see them.
+            self._update_dataset_and_command()
+            self._refresh_obstacles()
             # Update sensor at current position
             qpos = self.data.qpos
             self.readings, self.sphere_centers = self.sensor.compute(
@@ -562,49 +589,51 @@ class DemoPlayerEnv:
         return pt[:, :2], ft[:, :2], po, fo
 
     def _compute_command_trajectory(self):
-        """Yellow trajectory: linear interp to endpoint when detour, else same as target.
+        """Yellow command trajectory built via step2's helpers.
 
-        Orientation modes (command_orient_mode):
-          target  : copy future_orient_dataset (default)
-          interp  : slerp from current robot orientation to endpoint orientation
-          forward : align each frame's yaw to the direction of movement
+        red_xy is the dataset future trajectory aligned to the current robot
+        pose (option b). Yellow XY/yaws come from ``make_command_xy`` /
+        ``make_command_yaws`` parameterised by ``cmd_aug`` + ``cmd_aug_weight``.
         """
-        if self.future_traj_dataset is None:
+        if self.future_traj_dataset is None or len(self.future_traj_dataset) < 2:
             return None, None
-        if not self._has_detour:
-            return self.future_traj_dataset.copy(), self.future_orient_dataset.copy()
-        curr_xy  = self.data.qpos[:2].copy()
-        endpoint = self.future_traj_dataset[-1]
-        TF = len(self.future_traj_dataset)
-        t  = np.arange(1, TF + 1, dtype=np.float32) / TF
-        command_pos = curr_xy + t[:, None] * (endpoint - curr_xy)
 
-        if self.command_orient_mode == "target":
-            command_orient = self.future_orient_dataset.copy()
+        red_xy  = self.future_traj_dataset[:, :2]
+        past_xy = (self.past_traj[:, :2]
+                   if getattr(self, 'past_traj', None) is not None else None)
 
-        elif self.command_orient_mode == "interp":
-            from scipy.spatial.transform import Rotation as ScipyR, Slerp
-            curr_wxyz = self.data.qpos[3:7].astype(np.float32)
-            end_wxyz  = self.future_orient_dataset[-1]
-            r0 = ScipyR.from_quat(curr_wxyz[[1, 2, 3, 0]])
-            r1 = ScipyR.from_quat(end_wxyz[[1, 2, 3, 0]])
-            slerp = Slerp([0.0, 1.0], ScipyR.concatenate([r0, r1]))
-            xyzw  = slerp(t).as_quat()                          # (TF, 4) xyzw
-            command_orient = xyzw[:, [3, 0, 1, 2]].astype(np.float32)  # → wxyz
+        yellow_xy = make_command_xy(
+            red_xy, self.cmd_aug, past_xy, weight=self.cmd_aug_weight
+        )
 
-        elif self.command_orient_mode == "forward":
-            # Direction of movement: straight line → constant yaw from curr to endpoint
-            dx, dy = float(endpoint[0] - curr_xy[0]), float(endpoint[1] - curr_xy[1])
-            yaw    = np.arctan2(dy, dx)
-            quat   = np.array([np.cos(yaw / 2), 0., 0., np.sin(yaw / 2)], np.float32)
-            command_orient = np.tile(quat, (TF, 1))
+        actual_yaws = np.array(
+            [quat_wxyz_to_yaw(q) for q in self.future_orient_dataset],
+            dtype=np.float64,
+        )
+        past_yaws = (np.array(
+                        [quat_wxyz_to_yaw(q) for q in self.past_orient],
+                        dtype=np.float64,
+                     )
+                     if getattr(self, 'past_orient', None) is not None else None)
+        current_yaw = float(quat_wxyz_to_yaw(self.data.qpos[3:7]))
 
-        else:
-            raise ValueError(f"Unknown command_orient_mode: {self.command_orient_mode!r}")
+        yellow_yaws = make_command_yaws(
+            actual_yaws, self.cmd_aug,
+            past_xy=past_xy, past_yaws=past_yaws,
+            current_yaw=current_yaw,
+            weight=self.cmd_aug_weight,
+        )
 
-        return command_pos, command_orient
+        N = len(yellow_yaws)
+        yellow_quat = np.zeros((N, 4), dtype=np.float32)
+        yellow_quat[:, 0] = np.cos(yellow_yaws / 2.0)
+        yellow_quat[:, 3] = np.sin(yellow_yaws / 2.0)
 
-    def _update_future_trajectory(self):
+        return yellow_xy.astype(np.float32), yellow_quat
+
+    def _update_dataset_and_command(self):
+        """Refresh red (aligned dataset future) and yellow (command) trajectories
+        based on the current frame index and robot qpos."""
         _, ft_d, _, fo_d = self._load_traj_from_dataset()
         ref_q  = self.current_motion_data.get_qpos(self.current_frame)
         curr_q = self.data.qpos.copy()
@@ -613,6 +642,9 @@ class DemoPlayerEnv:
             aligned_t, aligned_o, self.future_frames
         )
         self.command_traj, self.command_orient = self._compute_command_trajectory()
+
+    def _update_future_trajectory(self):
+        self._update_dataset_and_command()
 
         if self.generated_qpos is not None:
             gft  = self.generated_qpos[:, :3]
@@ -756,10 +788,20 @@ def get_args():
     p.add_argument("--robot-safe-radius", type=float, default=0.25)
     p.add_argument("--command-orient-mode", default="target",
                    choices=["target", "interp", "forward"],
-                   help="Yellow trajectory orientation: "
-                        "target=copy dataset orient, "
-                        "interp=slerp curr→endpoint, "
-                        "forward=align to movement direction")
+                   help="(Deprecated) kept for back-compat; the command trajectory "
+                        "now follows --cmd-aug.")
+    p.add_argument("--cmd-aug", default="linear",
+                   choices=["linear", "extrap_pos", "extrap_pos_noyaw",
+                            "extrap_pos_preserve_len", "extrap_hfte"],
+                   help="Command trajectory augmentation matching step2 "
+                        "(see visualize/utils/detour.md).")
+    p.add_argument("--cmd-aug-weight", type=float, default=1.0,
+                   help="Linear blend w between cmd_aug and gt: "
+                        "command = w*extrap + (1-w)*gt.")
+    p.add_argument("--fill-method", default="band",
+                   choices=["band", "band_yellow", "yellow_circle"],
+                   help="Detour obstacle fill strategy (matches step2's "
+                        "make_scandot_fill_obstacles).")
     p.add_argument("--resolution", type=int,   default=9)
     p.add_argument("--max-range",  type=float, default=2.0)
     p.add_argument("--traj-bias-pos",  type=float, default=0.4)
@@ -886,6 +928,9 @@ def main():
         obstacle_mode=[m.strip() for m in args.mode.split("|") if m.strip()],
         robot_safe_radius=args.robot_safe_radius,
         command_orient_mode=args.command_orient_mode,
+        cmd_aug=args.cmd_aug,
+        cmd_aug_weight=args.cmd_aug_weight,
+        fill_method=args.fill_method,
     )
 
     if args.motion > 0:

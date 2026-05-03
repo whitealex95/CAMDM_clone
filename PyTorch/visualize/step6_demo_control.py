@@ -44,11 +44,16 @@ import utils.nn_transforms as nn_transforms
 from network.models_env2d import MotionDiffusionEnv
 from diffusion.create_diffusion import create_gaussian_diffusion
 
-from visualize.utils.geometry import draw_trajectory, draw_sensor_readings
+from visualize.utils.geometry import (
+    draw_trajectory,
+    draw_sensor_readings,
+    draw_obstacle_circle,
+)
 from visualize.utils.transition_manager import create_transition_manager
 from visualize.utils.trajectory import blend_trajectory, extend_future_traj_heusristic
 from utils.environment_sensor import (
     EnvironmentSensor,
+    CircleObstacle,
     quat_wxyz_to_yaw,
     world_traj_to_local,
 )
@@ -377,6 +382,7 @@ class ControlPlayer:
         inertial_quat_end: int = 7,
         show_trajectory: bool = True,
         show_sensor: bool = True,
+        show_obstacle: bool = True,
     ):
         self.mj_model   = mj_model
         self.mj_data    = mj_data
@@ -405,6 +411,7 @@ class ControlPlayer:
 
         self.show_trajectory = show_trajectory
         self.show_sensor     = show_sensor
+        self.show_obstacle   = show_obstacle
         self.camera_follow   = True
 
         self.inertialize          = bool(inertialize)
@@ -570,6 +577,10 @@ class ControlPlayer:
                 draw_trajectory(scene, ft3, self.future_orient,
                                 color=[0.2, 1.0, 0.2, 1.0])  # green: blended NN input
 
+        if self.show_obstacle:
+            for ob in self.obstacles:
+                draw_obstacle_circle(scene, ob.center, ob.radius, height=1.2)
+
         if self.show_sensor and self.obstacles:
             draw_sensor_readings(
                 scene, self.mj_data.qpos[:3], self.readings, self.sphere_centers,
@@ -587,6 +598,9 @@ class ControlPlayer:
     def toggle_trajectory(self):
         self.show_trajectory = not self.show_trajectory
 
+    def toggle_obstacle(self):
+        self.show_obstacle = not self.show_obstacle
+
     def toggle_camera_follow(self):
         self.camera_follow = not self.camera_follow
 
@@ -601,13 +615,19 @@ def get_args():
     p.add_argument("--dataset",       default=None,
                    help="Optional pkl for initial pose & style (e.g. lafan1_g1_motion30)")
     p.add_argument("--motion",        type=int,   default=0)
-    p.add_argument("--move-speed",    type=float, default=2.0,  help="Translation speed (m/s)")
+    p.add_argument("--move-speed",    type=float, default=1.0,  help="Translation speed (m/s)")
     p.add_argument("--turn-speed",    type=float, default=1.2,  help="Rotation speed (rad/s)")
     p.add_argument("--traj-bias-pos", type=float, default=0.1,
                    help="Blend toward model prediction (low=follow user closely)")
     p.add_argument("--traj-bias-rot", type=float, default=0.5)
     p.add_argument("--cfg-scale",     type=float, default=1.0)
     p.add_argument("--cfg-count",     type=int,   default=-1)
+    p.add_argument("--obstacle-x",    type=float, default=None,
+                   help="Cylinder X position (omit to disable obstacle)")
+    p.add_argument("--obstacle-y",    type=float, default=0.0,
+                   help="Cylinder Y position")
+    p.add_argument("--obstacle-radius", type=float, default=1.0,
+                   help="Cylinder radius in metres")
     p.add_argument("--resolution",    type=int,   default=9)
     p.add_argument("--max-range",     type=float, default=2.0)
     p.add_argument("--past-frames",   type=int,   default=10)
@@ -633,6 +653,7 @@ def print_instructions():
     print("  SPACE   : Pause / Resume")
     print("  R       : Reset")
     print("  T       : Toggle trajectory")
+    print("  O       : Toggle obstacle")
     print("  C       : Toggle camera follow")
     print("  ESC     : Exit")
     print("=" * 50 + "\n")
@@ -712,10 +733,18 @@ def main():
         turn_speed=args.turn_speed,
     )
 
+    obstacles = []
+    if args.obstacle_x is not None:
+        obstacles.append(CircleObstacle(
+            center=np.array([args.obstacle_x, args.obstacle_y], dtype=np.float64),
+            radius=float(args.obstacle_radius),
+        ))
+        print(f"Obstacle: ({args.obstacle_x}, {args.obstacle_y})  r={args.obstacle_radius} m")
+
     player = ControlPlayer(
         mj_model, mj_data, generator, controller, keys, init_qpos,
         style_idx=style_idx,
-        obstacles=[],
+        obstacles=obstacles,
         past_frames=args.past_frames,
         future_frames=args.future_frames,
         traj_bias_pos=args.traj_bias_pos,
@@ -748,6 +777,8 @@ def main():
             player.reset()
         elif keycode in (ord('t'), ord('T')):
             player.toggle_trajectory()
+        elif keycode in (ord('o'), ord('O')):
+            player.toggle_obstacle()
         elif keycode in (ord('c'), ord('C')):
             player.toggle_camera_follow()
 

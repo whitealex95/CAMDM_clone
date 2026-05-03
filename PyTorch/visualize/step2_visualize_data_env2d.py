@@ -125,7 +125,7 @@ class SensorMotionPlayer:
         # Decompose new-style mode names into (detour_flags, random_modes)
         if isinstance(obstacle_mode, str):
             obstacle_mode = [obstacle_mode]
-        self._detour_flags = [m != "none" for m in obstacle_mode]
+        self._detour_flags = [m.startswith("detour_") for m in obstacle_mode]
         random_modes = [_MODE_TO_RANDOM[m] for m in obstacle_mode]
         self.generator = make_generator(random_modes, robot_safe_radius=robot_safe_radius)
 
@@ -725,7 +725,7 @@ def create_env_dataset(
 
     output_motions = []
     for m_idx, mode_str in enumerate(modes):
-        use_detour  = mode_str != "none"
+        use_detour  = mode_str.startswith("detour_")
         random_mode = _MODE_TO_RANDOM[mode_str]
         generator   = make_generator(random_mode, robot_safe_radius=robot_safe_radius,
                                      seed=seed)
@@ -813,11 +813,15 @@ def get_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--mode", default="detour_only|detour_sparse|detour_dense|detour_packed|none",
                    help="Obstacle mode(s), separated by '|'. "
-                        "Choices: detour_only, detour_sparse, detour_dense, detour_packed, none. "
+                        "Choices: "
+                        "detour_only, detour_sparse, detour_dense, detour_packed "
+                        "(detour scandot-fill + random of given density), "
+                        "sparse, dense, compact "
+                        "(random only, no detour augmentation), "
+                        "none (no obstacles at all). "
                         "Modes prefixed with 'detour_' add trajectory-detour obstacles; "
                         "the suffix selects additional random obstacles "
                         "(detour_only=none, detour_sparse, detour_dense, detour_packed). "
-                        "'none' places no obstacles at all. "
                         "Visualiser: cycles modes across obstacle windows. "
                         "Dataset creation: each clip is duplicated once per mode. "
                         "Default: 'detour_only|detour_sparse|detour_dense|detour_packed|none'")
@@ -898,7 +902,14 @@ def print_instructions():
 # ---------------------------------------------------------------------------
 
 # User-facing mode names
-_VALID_MODES = {"detour_only", "detour_sparse", "detour_dense", "detour_packed", "none"}
+_VALID_MODES = {
+    # detour + random
+    "detour_only", "detour_sparse", "detour_dense", "detour_packed",
+    # random-only (no detour)
+    "sparse", "dense", "compact",
+    # nothing
+    "none",
+}
 
 # Maps each user-facing mode to the underlying ObstacleGenerator (random) mode
 _MODE_TO_RANDOM = {
@@ -906,6 +917,9 @@ _MODE_TO_RANDOM = {
     "detour_sparse": "sparse",
     "detour_dense":  "dense",
     "detour_packed": "compact",
+    "sparse":        "sparse",
+    "dense":         "dense",
+    "compact":       "compact",
     "none":          "none",
 }
 
