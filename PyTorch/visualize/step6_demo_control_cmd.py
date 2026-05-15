@@ -3,7 +3,7 @@ Step 6 (cmd variant): User-controlled motion demo for the DiP-Cmd model.
 -----------------------------------------------------------------------
 
 This is the command-vector counterpart of ``step6_demo_control.py``. The
-model (MotionDiffusionCmdDiP) is conditioned on a single body-frame twist
+model (MotionDiffusionDipCmd) is conditioned on a single body-frame twist
 command ``(vx, vy, omega)`` instead of a per-frame target trajectory, so
 the demo no longer builds a 45-frame future path and there is no
 "trajectory bias" blending step.
@@ -47,7 +47,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import utils.common as common
 import utils.nn_transforms as nn_transforms
-from network.models_dip2d_cmd import MotionDiffusionCmdDiP
+from network.models_dip2d_cmd import MotionDiffusionDipCmd
 from diffusion.create_diffusion import create_gaussian_diffusion
 
 from visualize.utils.geometry import (
@@ -588,7 +588,7 @@ def main():
     else:
         num_styles = 1
 
-    diffusion_model = MotionDiffusionCmdDiP(
+    diffusion_model = MotionDiffusionDipCmd(
         input_feats=31 * 6,
         nstyles=num_styles,
         njoints=31,

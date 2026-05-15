@@ -1,7 +1,8 @@
 """
-MotionDiffusionDiP – DiP-style (CLoSD diffusion_planner) motion diffusion
+MotionDiffusionDipTraj – DiP-style (CLoSD diffusion_planner) motion diffusion
 adapted for CAMDM G1 humanoid with environment-sensor conditioning instead
-of CLIP/BERT text.
+of CLIP/BERT text. This is the "per-frame traj added INTO the future motion
+tokens" variant (compact layout, single fused conditioning token).
 
 Architecture mirrors closd/diffusion_planner/model/mdm.py::MDM but:
   * Drops the text encoder branch entirely; the only "context" input is
@@ -38,7 +39,7 @@ from network.models import (
 from network.models_env2d import EnvSensorEncoder
 
 
-class MotionDiffusionDiP(nn.Module):
+class MotionDiffusionDipTraj(nn.Module):
 
     def __init__(self, input_feats, nstyles, njoints, nfeats, rot_req, clip_len,
                  env_sensor_dim: int = 226,
@@ -90,7 +91,7 @@ class MotionDiffusionDiP(nn.Module):
 
         # DiP-style backbone
         if self.arch == 'trans_enc':
-            print("DiP TRANS_ENC init")
+            print("DipTraj TRANS_ENC init")
             enc_layer = nn.TransformerEncoderLayer(
                 d_model=self.latent_dim, nhead=self.num_heads,
                 dim_feedforward=self.ff_size, dropout=self.dropout,
@@ -98,7 +99,7 @@ class MotionDiffusionDiP(nn.Module):
             )
             self.seqEncoder = nn.TransformerEncoder(enc_layer, num_layers=self.num_layers)
         elif self.arch == 'trans_dec':
-            print("DiP TRANS_DEC init")
+            print("DipTraj TRANS_DEC init")
             dec_layer = nn.TransformerDecoderLayer(
                 d_model=self.latent_dim, nhead=self.num_heads,
                 dim_feedforward=self.ff_size, dropout=self.dropout,

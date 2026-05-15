@@ -1,15 +1,16 @@
 """
-Train G1 Humanoid Motion Diffusion with DiP-style network architecture
-----------------------------------------------------------------------
-Identical to train_g1_env2d.py except the network is replaced with
-MotionDiffusionDiP (network/models_dip2d.py) — a port of the CLoSD
-diffusion_planner MDM to CAMDM, with text input dropped and the
-EnvironmentSensor used as the only "context" conditioning.
+Train G1 Humanoid Motion Diffusion with the experimental DIPTRAJ hybrid:
+per-frame traj as separate memory tokens (CAMDM-style) + concat policy
++ trans_dec backbone.
+
+Conditioning input is the same as DIPTRAJ (per-frame traj_pose, traj_trans
+are passed through unchanged), so this script can train on the same pkl
+files used for DIPTRAJ.
 
 Usage
 -----
-    python train_g1_env2d_dip.py -n my_dip_run \\
-        -c config/default_g1_env_dip.json \\
+    python train_g1_env2d_dip_traj_dec.py -n my_traj_dec_run \\
+        -c config/default_g1_env_geo_dip_traj_dec.json \\
         -i data/pkls/lafan1_g1_env2d_sparse.pkl \\
         --wandb --wandb_project CAMDM
 """
@@ -25,7 +26,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from utils.logger import Logger
-from network.models_dip2d import MotionDiffusionDiP
+from network.models_dip2d_traj_dec import MotionDiffusionDipTrajDec
 from network.training import HumanoidTrainingPortal
 from network.dataset_g1_env2d import HumanoidEnvMotionDataset
 
@@ -69,7 +70,7 @@ def train(config, resume, logger, tb_writer):
     env_sensor_dim = getattr(config.arch, "env_sensor_dim", train_data.env_sensor_dim)
     input_feats    = (train_data.joint_num + 1) * train_data.per_rot_feat
 
-    model = MotionDiffusionDiP(
+    model = MotionDiffusionDipTrajDec(
         input_feats=input_feats,
         nstyles=len(train_data.style_set),
         njoints=train_data.joint_num + 1,
@@ -83,15 +84,16 @@ def train(config, resume, logger, tb_writer):
         ff_size=config.arch.ff_size,
         num_layers=config.arch.num_layers,
         num_heads=config.arch.num_heads,
-        arch=config.arch.decoder,
+        arch=config.arch.decoder,    # forced to trans_dec internally
         cond_mask_prob=config.trainer.cond_mask_prob,
         sensor_cond_mask_prob=getattr(config.trainer, 'sensor_cond_mask_prob', 0.0),
+        traj_cond_mask_prob=getattr(config.trainer, 'traj_cond_mask_prob', 0.0),
         mask_frames=getattr(config.arch, 'mask_frames', False),
         device=config.device,
     ).to(config.device)
 
     logger.info(
-        f"MotionDiffusionDiP: env_sensor_dim={env_sensor_dim}, arch={config.arch.decoder}, "
+        f"MotionDiffusionDipTrajDec: env_sensor_dim={env_sensor_dim}, arch=trans_dec, "
         f"latent_dim={config.arch.latent_dim}, layers={config.arch.num_layers}"
     )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -112,9 +114,9 @@ def train(config, resume, logger, tb_writer):
 if __name__ == "__main__":
     start_time = time.time()
 
-    parser = argparse.ArgumentParser(description="G1 DiP Motion Diffusion Training")
-    parser.add_argument("-n", "--name",   default="debug_dip", type=str)
-    parser.add_argument("-c", "--config", default="./config/default_g1_env_dip.json", type=str)
+    parser = argparse.ArgumentParser(description="G1 DIPTRAJ-Dec Motion Diffusion Training")
+    parser.add_argument("-n", "--name",   default="debug_dip_traj_dec", type=str)
+    parser.add_argument("-c", "--config", default="./config/default_g1_env_geo_dip_traj_dec.json", type=str)
     parser.add_argument("-i", "--data",   default="data/pkls/lafan1_g1_env2d_sparse.pkl", type=str)
     parser.add_argument("-r", "--resume", default=None, type=str)
     parser.add_argument("-s", "--save",   default="./save", type=str)
@@ -160,6 +162,6 @@ if __name__ == "__main__":
     with open(f"{config.save}/config.json", "w") as f:
         f.write(str(config))
 
-    logger.info(f"\nDiP env-sensor motion training with config:\n{config}")
+    logger.info(f"\nDipTrajDec env-sensor motion training with config:\n{config}")
     train(config, args.resume, logger, tb_writer)
     logger.info(f"\nTotal training time: {(time.time() - start_time) / 60:.1f} mins")

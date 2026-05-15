@@ -1,8 +1,8 @@
 """
-MotionDiffusionCmdDiP – DiP-style motion diffusion conditioned on a single
+MotionDiffusionDipCmd – DiP-style motion diffusion conditioned on a single
 body-frame twist command (vx, vy, omega) instead of a per-frame trajectory.
 
-Differences from MotionDiffusionDiP (network/models_dip2d.py):
+Differences from MotionDiffusionDipTraj (network/models_dip2d_traj.py):
   * Drops the per-frame ``traj_pose`` and ``traj_trans`` projections and
     their additive injection into the future motion tokens.
   * Adds a small ``CommandEncoder`` MLP that maps a single command vector
@@ -18,7 +18,7 @@ Conditioning tensor at inference time (``y`` dict):
     sensor      : (bs, env_sensor_dim)  current-frame occupancy
     mask        : (bs, TF) or (TF,)     per-future-frame validity (optional)
 
-The model output is identical to MotionDiffusionDiP: predicted denoised
+The model output is identical to MotionDiffusionDipTraj: predicted denoised
 future motion of shape (bs, J, F, TF).
 """
 
@@ -55,7 +55,7 @@ class CommandEncoder(nn.Module):
         return self.net(x).unsqueeze(0)
 
 
-class MotionDiffusionCmdDiP(nn.Module):
+class MotionDiffusionDipCmd(nn.Module):
 
     def __init__(self, input_feats, nstyles, njoints, nfeats, rot_req, clip_len,
                  env_sensor_dim: int = 226,
@@ -106,7 +106,7 @@ class MotionDiffusionCmdDiP(nn.Module):
         self.embed_style          = EmbedStyle(nstyles, self.latent_dim)
 
         if self.arch == 'trans_enc':
-            print("DiP-Cmd TRANS_ENC init")
+            print("DipCmd TRANS_ENC init")
             enc_layer = nn.TransformerEncoderLayer(
                 d_model=self.latent_dim, nhead=self.num_heads,
                 dim_feedforward=self.ff_size, dropout=self.dropout,
@@ -114,7 +114,7 @@ class MotionDiffusionCmdDiP(nn.Module):
             )
             self.seqEncoder = nn.TransformerEncoder(enc_layer, num_layers=self.num_layers)
         elif self.arch == 'trans_dec':
-            print("DiP-Cmd TRANS_DEC init")
+            print("DipCmd TRANS_DEC init")
             dec_layer = nn.TransformerDecoderLayer(
                 d_model=self.latent_dim, nhead=self.num_heads,
                 dim_feedforward=self.ff_size, dropout=self.dropout,
@@ -122,7 +122,7 @@ class MotionDiffusionCmdDiP(nn.Module):
             )
             self.seqEncoder = nn.TransformerDecoder(dec_layer, num_layers=self.num_layers)
         else:
-            raise ValueError(f"DiP-Cmd supports [trans_enc, trans_dec]; got '{arch}'")
+            raise ValueError(f"DipCmd supports [trans_enc, trans_dec]; got '{arch}'")
 
         self.output_process = OutputProcess(self.input_feats, self.latent_dim,
                                             self.njoints, self.nfeats)

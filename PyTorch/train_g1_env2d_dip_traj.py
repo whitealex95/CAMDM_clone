@@ -1,18 +1,16 @@
 """
-Train G1 Humanoid Motion Diffusion with DiP-style network and a single
-body-frame twist command (vx, vy, omega) as the steering signal.
-
-Mirrors train_g1_env2d_dip_traj.py except:
-  - Network is MotionDiffusionDipCmd (network/models_dip2d_cmd.py).
-    This is the DIPCMD architectural choice.
-  - Dataset is HumanoidEnvCmdMotionDataset (drops per-frame traj,
-    replaces with a single (3,) command per clip).
+Train G1 Humanoid Motion Diffusion with DiP-style network architecture
+----------------------------------------------------------------------
+Identical to train_g1_env2d.py except the network is replaced with
+MotionDiffusionDipTraj (network/models_dip2d_traj.py) — a port of the CLoSD
+diffusion_planner MDM to CAMDM, with text input dropped and the
+EnvironmentSensor used as the only "context" conditioning.
 
 Usage
 -----
-    python train_g1_env2d_dip_cmd.py -n my_cmd_run \\
-        -c config/default_g1_env_geo_dip_cmd.json \\
-        -i data/pkls/lafan1_g1_motion30_env2d_yellow_circle_detour_only_none.pkl \\
+    python train_g1_env2d_dip_traj.py -n my_dip_traj_run \\
+        -c config/default_g1_env_geo_dip_traj.json \\
+        -i data/pkls/lafan1_g1_env2d_sparse.pkl \\
         --wandb --wandb_project CAMDM
 """
 
@@ -27,31 +25,12 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from utils.logger import Logger
-from network.models_dip2d_cmd import MotionDiffusionDipCmd
+from network.models_dip2d_traj import MotionDiffusionDipTraj
 from network.training import HumanoidTrainingPortal
-from network.dataset_g1_env2d_cmd import HumanoidEnvCmdMotionDataset
+from network.dataset_g1_env2d import HumanoidEnvMotionDataset
 
 from diffusion.create_diffusion import create_gaussian_diffusion
 from config.option import add_model_args, add_train_args, add_diffusion_args, config_parse
-
-
-# ---------------------------------------------------------------------------
-# Thin training-portal subclass: the base diffuse() permutes traj_pose /
-# traj_trans, which don't exist on the cmd dataset. Inject zero dummies so
-# the parent's loss path works unchanged; the model ignores them.
-# ---------------------------------------------------------------------------
-
-class _CmdTrainingPortal(HumanoidTrainingPortal):
-
-    def diffuse(self, x_start, t, cond, noise=None, return_loss=False):
-        bs = x_start.shape[0]
-        TF = self.config.arch.future_frame
-        device = x_start.device
-        if 'traj_pose' not in cond:
-            cond['traj_pose']  = torch.zeros(bs, TF, 6, device=device)
-        if 'traj_trans' not in cond:
-            cond['traj_trans'] = torch.zeros(bs, TF, 2, device=device)
-        return super().diffuse(x_start, t, cond, noise=noise, return_loss=return_loss)
 
 
 def train(config, resume, logger, tb_writer):
@@ -60,7 +39,7 @@ def train(config, resume, logger, tb_writer):
     np_dtype = common.select_platform(32)
 
     print("Loading dataset …")
-    train_data = HumanoidEnvCmdMotionDataset(
+    train_data = HumanoidEnvMotionDataset(
         config.data,
         config.arch.rot_req,
         config.arch.offset_frame,
@@ -71,7 +50,6 @@ def train(config, resume, logger, tb_writer):
         min_start_velocity=config.trainer.min_start_velocity,
         rotation_aug=config.trainer.rotation_aug,
         legacy_rotation_aug=config.trainer.legacy_rotation_aug,
-        frame_dt=getattr(config.arch, 'frame_dt', None),
     )
     train_dataloader = DataLoader(
         train_data,
@@ -91,7 +69,7 @@ def train(config, resume, logger, tb_writer):
     env_sensor_dim = getattr(config.arch, "env_sensor_dim", train_data.env_sensor_dim)
     input_feats    = (train_data.joint_num + 1) * train_data.per_rot_feat
 
-    model = MotionDiffusionDipCmd(
+    model = MotionDiffusionDipTraj(
         input_feats=input_feats,
         nstyles=len(train_data.style_set),
         njoints=train_data.joint_num + 1,
@@ -99,7 +77,6 @@ def train(config, resume, logger, tb_writer):
         rot_req=config.arch.rot_req,
         clip_len=config.arch.clip_len,
         env_sensor_dim=env_sensor_dim,
-        cmd_dim=getattr(config.arch, 'cmd_dim', 3),
         past_frame=config.arch.past_frame,
         future_frame=config.arch.future_frame,
         latent_dim=config.arch.latent_dim,
@@ -109,20 +86,18 @@ def train(config, resume, logger, tb_writer):
         arch=config.arch.decoder,
         cond_mask_prob=config.trainer.cond_mask_prob,
         sensor_cond_mask_prob=getattr(config.trainer, 'sensor_cond_mask_prob', 0.0),
-        cmd_cond_mask_prob=getattr(config.trainer, 'cmd_cond_mask_prob', 0.0),
         mask_frames=getattr(config.arch, 'mask_frames', False),
         device=config.device,
     ).to(config.device)
 
     logger.info(
-        f"MotionDiffusionDipCmd: env_sensor_dim={env_sensor_dim}, "
-        f"cmd_dim={getattr(config.arch, 'cmd_dim', 3)}, arch={config.arch.decoder}, "
+        f"MotionDiffusionDipTraj: env_sensor_dim={env_sensor_dim}, arch={config.arch.decoder}, "
         f"latent_dim={config.arch.latent_dim}, layers={config.arch.num_layers}"
     )
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Trainable parameters: {n_params/1e6:.2f}M")
 
-    trainer = _CmdTrainingPortal(config, model, diffusion, train_dataloader, logger, tb_writer)
+    trainer = HumanoidTrainingPortal(config, model, diffusion, train_dataloader, logger, tb_writer)
 
     if resume is not None:
         try:
@@ -137,9 +112,9 @@ def train(config, resume, logger, tb_writer):
 if __name__ == "__main__":
     start_time = time.time()
 
-    parser = argparse.ArgumentParser(description="G1 DiP-Cmd Motion Diffusion Training")
-    parser.add_argument("-n", "--name",   default="debug_dip_cmd", type=str)
-    parser.add_argument("-c", "--config", default="./config/default_g1_env_geo_dip_cmd.json", type=str)
+    parser = argparse.ArgumentParser(description="G1 DiP Motion Diffusion Training")
+    parser.add_argument("-n", "--name",   default="debug_dip_traj", type=str)
+    parser.add_argument("-c", "--config", default="./config/default_g1_env_geo_dip_traj.json", type=str)
     parser.add_argument("-i", "--data",   default="data/pkls/lafan1_g1_env2d_sparse.pkl", type=str)
     parser.add_argument("-r", "--resume", default=None, type=str)
     parser.add_argument("-s", "--save",   default="./save", type=str)
@@ -185,6 +160,6 @@ if __name__ == "__main__":
     with open(f"{config.save}/config.json", "w") as f:
         f.write(str(config))
 
-    logger.info(f"\nDiP-Cmd env-sensor motion training with config:\n{config}")
+    logger.info(f"\nDipTraj env-sensor motion training with config:\n{config}")
     train(config, args.resume, logger, tb_writer)
     logger.info(f"\nTotal training time: {(time.time() - start_time) / 60:.1f} mins")
