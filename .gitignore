@@ -89,3 +89,6 @@ venv.bak/
 ## AI
 .codex
 .claude
+
+# Local skynet run log (personal tracking; do not commit)
+skynet_runs.md

@@ -173,6 +173,29 @@ Plus one **experimental hybrid** (`dip_traj_dec_avoid2d` branch only):
 Full layout/ASCII diagrams live in `PyTorch/README_dip_variants.md`.
 
 
+## Run-log convention (gitignored)
+
+Every time you submit a skynet job from a Claude session, **append an
+entry to `skynet_runs.md`** at the repo root. That file is gitignored
+(personal tracking only) and serves as a durable record of what was
+running on sky1 at any given commit.
+
+Each entry should include:
+- timestamp
+- branch and short commit hash (the one on sky1 when the job was submitted)
+- slurm job IDs and the matching script names
+- the exact submission command used locally
+- per-job: run name, wandb group, log path
+- a "status at submission time" line, and a "status (fill in later)" stub
+
+Use the template comment at the bottom of `skynet_runs.md` to start a new
+entry. Newest entries go at the top.
+
+When a run completes (or is killed), update the "Status (fill in later)"
+line of its entry with the outcome (best_loss, total runtime, anything
+notable).
+
+
 ## Things NOT to do
 
 - Don't `ssh sky1 'sbatch …'` without the full path — it'll silently
