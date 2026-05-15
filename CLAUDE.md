@@ -117,19 +117,19 @@ ssh sky1 'tail -f ~/flash/slurm/CAMDM/logs/<job_id>_<short_name>.out'
 
 Located at `~/flash/slurm/CAMDM/` on sky1:
 
-| Script | Trains | Config |
-| --- | --- | --- |
-| `run_dip_traj.sh` | DIPTRAJ (`MotionDiffusionDipTraj`) | `default_g1_env_geo_dip_traj.json` |
-| `run_dip_cmd.sh` | DIPCMD (`MotionDiffusionDipCmd`) | `default_g1_env_geo_dip_cmd.json` |
-| `run_dip_traj_dec.sh` | DIPTRAJ-Dec hybrid (`MotionDiffusionDipTrajDec`) | `default_g1_env_geo_dip_traj_dec.json` |
-| `run_camdm.sh` | (legacy) original CAMDM env training | `default_g1_env_geo.json` |
+| Script | Trains | Class | Config |
+| --- | --- | --- | --- |
+| `run_camdm_yc.sh` | CAMDM (trans_enc, separate per-frame traj tokens) | `MotionDiffusionEnv` | `default_g1_env_geo.json` |
+| `run_dip_traj.sh` | DIPTRAJ (trans_dec, per-frame traj memory) | `MotionDiffusionDipTraj` | `default_g1_env_geo_dip_traj.json` |
+| `run_dip_cmd.sh`  | DIPCMD (trans_dec, single twist memory) | `MotionDiffusionDipCmd` | `default_g1_env_geo_dip_cmd.json` |
+| `run_camdm.sh` | (legacy band_yellow CAMDM run, do not use) | `MotionDiffusionEnv` | `default_g1_env_geo.json` |
 
-All three new scripts:
-- Live on branch `dip_traj_dec_avoid2d` (which contains the renamed file
-  layout: `models_dip2d_traj.py`, `models_dip2d_cmd.py`,
-  `models_dip2d_traj_dec.py`).
-- Train on `data/pkls/lafan1_g1_motion30_env2d_yellow_circle_detour_only_none.pkl`
-  for direct comparability with the existing local runs.
+All three current scripts:
+- Live on branch `dip_traj_dec_avoid2d` (file layout:
+  `models_env2d.py` for CAMDM, `models_dip2d_traj.py` for DIPTRAJ,
+  `models_dip2d_cmd.py` for DIPCMD).
+- Train on `data/pkls/lafan1_g1_past2_motion30_env2d_yellow_circle_detour_only_detour_sparse_detour_dense_detour_packed_dense_none.pkl`
+  with `--past_frame 2` (matching the local vEnvGeoV1 reference run).
 - 3000 epochs, lr=3e-4, batch=512, workers=8, geo losses on, wandb on.
 
 To re-run any of them after a code change:
@@ -161,14 +161,11 @@ ssh sky1 'cd ~/flash/slurm/CAMDM && /opt/slurm/Ubuntu-20.04/current/bin/sbatch r
 
 Three primary architectural choices:
 
-| Tag | Class | File |
-| --- | --- | --- |
-| **CAMDM** | `MotionDiffusion` / `MotionDiffusionEnv` | `network/models.py`, `network/models_env2d.py` |
-| **DIPTRAJ** | `MotionDiffusionDipTraj` | `network/models_dip2d_traj.py` |
-| **DIPCMD** | `MotionDiffusionDipCmd` | `network/models_dip2d_cmd.py` |
-
-Plus one **experimental hybrid** (`dip_traj_dec_avoid2d` branch only):
-`MotionDiffusionDipTrajDec` in `network/models_dip2d_traj_dec.py`.
+| Tag | Backbone | Conditioning routing | Class | File |
+| --- | --- | --- | --- | --- |
+| **CAMDM** | `trans_enc` | per-frame traj as separate tokens in one self-attended sequence | `MotionDiffusionEnv` | `network/models_env2d.py` |
+| **DIPTRAJ** | `trans_dec` | per-frame traj as cross-attention memory tokens | `MotionDiffusionDipTraj` | `network/models_dip2d_traj.py` |
+| **DIPCMD** | `trans_dec` | single `(vx, vy, ω)` cross-attention memory token | `MotionDiffusionDipCmd` | `network/models_dip2d_cmd.py` |
 
 Full layout/ASCII diagrams live in `PyTorch/README_dip_variants.md`.
 

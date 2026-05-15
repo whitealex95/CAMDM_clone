@@ -1,7 +1,7 @@
 {
     "arch": {
         "rot_req": "6d",
-        "decoder": "trans_enc",
+        "decoder": "trans_dec",
         "latent_dim": 256,
         "ff_size": 1024,
         "num_heads": 4,
@@ -9,7 +9,7 @@
         "offset_frame": 1,
         "past_frame": 10,
         "future_frame": 45,
-        "local_cond": "traj_sensor",
+        "local_cond": "traj_sensor_tokens",
         "global_cond": "style",
         "env_sensor_dim": 226,
         "mask_frames": false
@@ -25,6 +25,7 @@
         "batch_size": 512,
         "cond_mask_prob": 0.15,
         "sensor_cond_mask_prob": 0.0,
+        "traj_cond_mask_prob": 0.0,
         "loss_terms": "1010",
         "use_geometric_losses": true,
         "loss_geo_pos_weight": 1.0,

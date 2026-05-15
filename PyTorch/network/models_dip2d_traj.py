@@ -1,32 +1,31 @@
 """
-MotionDiffusionDipTraj – DiP-style (CLoSD diffusion_planner) motion diffusion
-adapted for CAMDM G1 humanoid with environment-sensor conditioning instead
-of CLIP/BERT text. This is the "per-frame traj added INTO the future motion
-tokens" variant (compact layout, single fused conditioning token).
+MotionDiffusionDipTraj – DIPTRAJ architecture: trans_dec backbone +
+per-frame trajectory tokens kept as separate cross-attention memory
+(CAMDM-style routing, DiP-style backbone).
 
-Architecture mirrors closd/diffusion_planner/model/mdm.py::MDM but:
-  * Drops the text encoder branch entirely; the only "context" input is
-    the sensor reading (current-frame snapshot, 226-D by default).
-  * Drops keyframe_cond_type, multi_target_cond, GRU branch — keeps just
-    trans_enc and trans_dec.
-  * Replaces DiP's free-running prefix mechanic with CAMDM's explicit
-    past_motion conditioning: past and noisy future are concatenated into a
-    single per-frame token sequence (DiP prefix-completion style), then the
-    model outputs only the last TF frames.
-  * Adds CAMDM's structured conditioning (style index, per-frame
-    trajectory) on top: style is folded into the single context token (DiP
-    "emb_policy=add"); traj is projected per-frame and added to the
-    future-frame motion tokens.
+Conditioning layout (``trans_dec``):
 
-Conditioning tensor at inference time (passed via the ``y`` dict that the
-training portal builds from the DataLoader batch):
+    memory  (read-only cross-attn keys/values):
+      ┌────┐ ┌─────┐ ┌──────┐ ┌────────────┐ ┌────────────┐
+      │time│ │style│ │sensor│ │ traj_trans │ │ traj_pose  │     (3 + 2*TF, bs, L)
+      │(1) │ │ (1) │ │ (1)  │ │   (TF)     │ │   (TF)     │
+      └────┘ └─────┘ └──────┘ └────────────┘ └────────────┘
 
-    past_motion : (bs, J, F, TP)       past motion frames
-    traj_pose   : (bs, 6,    TF)       per-frame yaw-frame heading
-    traj_trans  : (bs, 2,    TF)       per-frame yaw-frame XY translation
-    style_idx   : (bs,)                style/action index
-    sensor      : (bs, env_sensor_dim) current-frame occupancy snapshot
-    mask        : (bs, TF) or (TF,)    per-future-frame validity (1 valid)
+    target  (self-attn; queries memory):
+      ┌────────────┐ ┌─────────────────┐
+      │ past       │ │ noisy future    │                         (TP + TF, bs, L)
+      │ motion (TP)│ │ motion (TF)     │
+      └────────────┘ └─────────────────┘
+                     └── output sliced (last TF)
+
+The training portal passes in this ``y`` dict:
+
+    past_motion : (bs, J, F, TP)
+    traj_pose   : (bs, 6,  TF)
+    traj_trans  : (bs, 2,  TF)
+    style_idx   : (bs,)
+    sensor      : (bs, env_sensor_dim)
+    mask        : (bs, TF) or (TF,)
 """
 
 import torch
@@ -47,12 +46,18 @@ class MotionDiffusionDipTraj(nn.Module):
                  latent_dim: int = 256, ff_size: int = 1024,
                  num_layers: int = 8, num_heads: int = 4,
                  dropout: float = 0.2, activation: str = "gelu",
-                 arch: str = 'trans_enc',
                  cond_mask_prob: float = 0.0,
                  sensor_cond_mask_prob: float = 0.0,
+                 traj_cond_mask_prob: float = 0.0,
                  mask_frames: bool = False,
-                 device=None):
+                 device=None,
+                 # accept and ignore for cross-variant CLI symmetry
+                 arch: str = 'trans_dec'):
         super().__init__()
+
+        if arch != 'trans_dec':
+            print(f"[DipTraj] note: arch='{arch}' requested; this model "
+                  f"is hard-wired to trans_dec, the value will be ignored.")
 
         self.training = True
         self.rot_req = rot_req
@@ -66,48 +71,36 @@ class MotionDiffusionDipTraj(nn.Module):
         self.num_heads = num_heads
         self.dropout = dropout
         self.activation = activation
-        self.arch = arch
+        self.arch = 'trans_dec'
         self.cond_mask_prob = float(cond_mask_prob)
         self.sensor_cond_mask_prob = float(sensor_cond_mask_prob)
+        self.traj_cond_mask_prob = float(traj_cond_mask_prob)
         self.env_sensor_dim = env_sensor_dim
         self.past_frame = past_frame
         self.future_frame = future_frame
         self.mask_frames = mask_frames
 
-        # Shared per-frame motion projector for past + noisy future
+        # Motion projector (shared past + noisy future, prefix-completion)
         self.motion_process = MotionProcess(self.input_feats, self.latent_dim)
 
-        # Per-frame trajectory conditioning (added to future motion tokens)
+        # Per-frame trajectory: separate tokens at front of memory (CAMDM-style)
         self.traj_trans_process = TrajProcess(2, self.latent_dim)
         self.traj_pose_process  = TrajProcess(6, self.latent_dim)
 
-        # NSM-style scene encoder (same as MotionDiffusionEnv)
+        # Global cond encoders, each produces (1, bs, L)
         self.sensor_encoder = EnvSensorEncoder(env_sensor_dim, self.latent_dim)
 
-        # Time/style/positional embedders
         self.sequence_pos_encoder = PositionalEncoding(self.latent_dim, self.dropout)
         self.embed_timestep       = TimestepEmbedder(self.latent_dim, self.sequence_pos_encoder)
         self.embed_style          = EmbedStyle(nstyles, self.latent_dim)
 
-        # DiP-style backbone
-        if self.arch == 'trans_enc':
-            print("DipTraj TRANS_ENC init")
-            enc_layer = nn.TransformerEncoderLayer(
-                d_model=self.latent_dim, nhead=self.num_heads,
-                dim_feedforward=self.ff_size, dropout=self.dropout,
-                activation=self.activation,
-            )
-            self.seqEncoder = nn.TransformerEncoder(enc_layer, num_layers=self.num_layers)
-        elif self.arch == 'trans_dec':
-            print("DipTraj TRANS_DEC init")
-            dec_layer = nn.TransformerDecoderLayer(
-                d_model=self.latent_dim, nhead=self.num_heads,
-                dim_feedforward=self.ff_size, dropout=self.dropout,
-                activation=self.activation,
-            )
-            self.seqEncoder = nn.TransformerDecoder(dec_layer, num_layers=self.num_layers)
-        else:
-            raise ValueError(f"DiP model supports [trans_enc, trans_dec]; got '{arch}'")
+        print("DipTraj TRANS_DEC + CONCAT init")
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=self.latent_dim, nhead=self.num_heads,
+            dim_feedforward=self.ff_size, dropout=self.dropout,
+            activation=self.activation,
+        )
+        self.seqDecoder = nn.TransformerDecoder(dec_layer, num_layers=self.num_layers)
 
         self.output_process = OutputProcess(self.input_feats, self.latent_dim,
                                             self.njoints, self.nfeats)
@@ -119,23 +112,23 @@ class MotionDiffusionDipTraj(nn.Module):
     def forward(self, x, timesteps, past_motion, traj_pose, traj_trans, style_idx,
                 sensor=None, frames_mask=None):
         """
-        Args:
-            x:           (bs, J, F, TF) noisy future motion
-            timesteps:   (bs,) int
-            past_motion: (bs, J, F, TP)
-            traj_pose:   (bs, 6, TF)
-            traj_trans:  (bs, 2, TF)
-            style_idx:   (bs,)
-            sensor:      (bs, env_sensor_dim) or None
-            frames_mask: (bs, TP+TF) bool, True = pad. Optional.
-
-        Returns:
-            (bs, J, F, TF) predicted denoised future motion
+        x:           (bs, J, F, TF)
+        past_motion: (bs, J, F, TP)
+        traj_pose:   (bs, 6, TF)
+        traj_trans:  (bs, 2, TF)
+        style_idx:   (bs,)
+        sensor:      (bs, env_sensor_dim) or None
+        frames_mask: (bs, TP+TF) bool padding mask, True = pad. Optional.
+        Returns:     (bs, J, F, TF) predicted denoised future motion
         """
         bs, njoints, nfeats, nframes = x.shape
         TP = past_motion.shape[-1]
+        TF = nframes
 
-        # ---------- single context token: time + style + sensor ----------
+        combined   = torch.cat([past_motion, x], dim=-1)        # (bs, J, F, TP+TF)
+        motion_seq = self.motion_process(combined)              # (TP+TF, bs, L)
+        tgt        = self.sequence_pos_encoder(motion_seq)
+
         time_emb  = self.embed_timestep(timesteps)              # (1, bs, L)
         style_emb = self.embed_style(style_idx).unsqueeze(0)    # (1, bs, L)
         if sensor is not None:
@@ -144,45 +137,24 @@ class MotionDiffusionDipTraj(nn.Module):
             sensor_emb = torch.zeros(
                 1, bs, self.latent_dim, device=x.device, dtype=x.dtype
             )
-        cond_emb = time_emb + style_emb + sensor_emb            # (1, bs, L)
-
-        # ---------- prefix-completion: past + noisy future as one seq ----
-        combined = torch.cat([past_motion, x], dim=-1)          # (bs, J, F, TP+TF)
-        motion_seq = self.motion_process(combined)              # (TP+TF, bs, L)
-
-        # Per-frame trajectory added to the *future* portion only
         traj_trans_emb = self.traj_trans_process(traj_trans)    # (TF, bs, L)
         traj_pose_emb  = self.traj_pose_process(traj_pose)      # (TF, bs, L)
-        traj_emb       = traj_trans_emb + traj_pose_emb         # (TF, bs, L)
 
-        past_emb   = motion_seq[:TP]                            # (TP, bs, L)
-        future_emb = motion_seq[TP:] + traj_emb                 # (TF, bs, L)
-        motion_seq = torch.cat([past_emb, future_emb], dim=0)   # (TP+TF, bs, L)
+        memory = torch.cat([
+            time_emb, style_emb, sensor_emb,
+            traj_trans_emb, traj_pose_emb,
+        ], dim=0)                                               # (3 + 2*TF, bs, L)
 
-        # ---------- transformer ----------
-        if self.arch == 'trans_enc':
-            xseq = torch.cat([cond_emb, motion_seq], dim=0)     # (1+TP+TF, bs, L)
-            xseq = self.sequence_pos_encoder(xseq)
-
-            kp_mask = None
-            if frames_mask is not None:
-                step_pad = torch.zeros((bs, 1), dtype=torch.bool, device=xseq.device)
-                kp_mask  = torch.cat([step_pad, frames_mask], dim=1)
-
-            output = self.seqEncoder(xseq, src_key_padding_mask=kp_mask)
-            output = output[-nframes:]                          # only future
-        else:  # trans_dec
-            tgt = self.sequence_pos_encoder(motion_seq)
-            output = self.seqEncoder(
-                tgt=tgt, memory=cond_emb,
-                tgt_key_padding_mask=frames_mask,
-            )
-            output = output[-nframes:]
+        output = self.seqDecoder(
+            tgt=tgt, memory=memory,
+            tgt_key_padding_mask=frames_mask,
+        )
+        output = output[-nframes:]
 
         return self.output_process(output)
 
     # ------------------------------------------------------------------
-    # Interface (called by HumanoidTrainingPortal.diffuse)
+    # Interface
     # ------------------------------------------------------------------
 
     def interface(self, x, timesteps, y=None):
@@ -194,17 +166,19 @@ class MotionDiffusionDipTraj(nn.Module):
         traj_trans  = y['traj_trans']
         sensor      = y.get('sensor', None)
 
-        # CFG: mask past_motion to null (DiP/MotionDiffusion style)
         if self.cond_mask_prob > 0:
             keep = torch.rand(bs, device=past_motion.device) < (1.0 - self.cond_mask_prob)
             past_motion = past_motion * keep.view(bs, 1, 1, 1)
 
-        # CFG: mask sensor to null
         if sensor is not None and self.sensor_cond_mask_prob > 0:
             keep_s = torch.rand(bs, device=sensor.device) < (1.0 - self.sensor_cond_mask_prob)
             sensor = sensor * keep_s.view(bs, 1)
 
-        # Optional per-frame padding mask (True = pad), DiP-style
+        if self.traj_cond_mask_prob > 0:
+            keep_t = torch.rand(bs, device=traj_trans.device) < (1.0 - self.traj_cond_mask_prob)
+            traj_trans = traj_trans * keep_t.view(bs, 1, 1)
+            traj_pose  = traj_pose  * keep_t.view(bs, 1, 1)
+
         frames_mask = None
         if self.mask_frames and 'mask' in y and torch.is_tensor(y['mask']):
             m = y['mask']

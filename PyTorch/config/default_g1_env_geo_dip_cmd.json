@@ -1,7 +1,7 @@
 {
     "arch": {
         "rot_req": "6d",
-        "decoder": "trans_enc",
+        "decoder": "trans_dec",
         "latent_dim": 256,
         "ff_size": 1024,
         "num_heads": 4,

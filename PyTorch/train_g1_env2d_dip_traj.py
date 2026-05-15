@@ -86,6 +86,7 @@ def train(config, resume, logger, tb_writer):
         arch=config.arch.decoder,
         cond_mask_prob=config.trainer.cond_mask_prob,
         sensor_cond_mask_prob=getattr(config.trainer, 'sensor_cond_mask_prob', 0.0),
+        traj_cond_mask_prob=getattr(config.trainer, 'traj_cond_mask_prob', 0.0),
         mask_frames=getattr(config.arch, 'mask_frames', False),
         device=config.device,
     ).to(config.device)
