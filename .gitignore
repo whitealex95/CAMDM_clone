@@ -92,3 +92,8 @@ venv.bak/
 
 # Local skynet run log (personal tracking; do not commit)
 skynet_runs.md
+
+# Local mirror of skynet logs + the sync daemon's own log
+PyTorch/save/_skynet_logs/
+PyTorch/save/_skynet_log_sync.log
+PyTorch/save/_skynet_log_sync.sh
