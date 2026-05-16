@@ -5,7 +5,7 @@
         "latent_dim": 256,
         "ff_size": 1024,
         "num_heads": 4,
-        "num_layers": 4,
+        "num_layers": 8,
         "offset_frame": 1,
         "past_frame": 10,
         "future_frame": 45,
