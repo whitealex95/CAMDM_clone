@@ -50,7 +50,7 @@ class MotionDiffusionDipTraj(nn.Module):
                  sensor_cond_mask_prob: float = 0.0,
                  traj_cond_mask_prob: float = 0.0,
                  mask_frames: bool = False,
-                 memory_pe: bool = False,
+                 memory_pe: bool = True,
                  device=None,
                  # accept and ignore for cross-variant CLI symmetry
                  arch: str = 'trans_dec'):

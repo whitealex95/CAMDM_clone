@@ -12,7 +12,8 @@
         "local_cond": "traj_sensor_tokens",
         "global_cond": "style",
         "env_sensor_dim": 226,
-        "mask_frames": false
+        "mask_frames": false,
+        "memory_pe": true
     },
     "diff": {
         "noise_schedule": "cosine",
