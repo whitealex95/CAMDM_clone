@@ -1,25 +1,30 @@
 """
 Build a source motion pkl that combines:
-  - lafan motion30 (data/Lafan1_g1/raw/walk1_subject5.csv)  -> style='walk'
-  - three new jump motions in data/Lafan1_g1/raw_jump/*.csv -> style='jump'
+  - lafan motion30 (data/Lafan1_g1/raw/walk1_subject5.csv)   -> style='walk'
+  - three jump motions in data/Lafan1_g1/raw_jump/*.csv      -> style='jump'
+  - door-opening motion in data/Lafan1_g1/raw_jump/*.csv     -> style='door'
 
 The output pkl matches the schema produced by make_pose_data_g1.py so it can be
 fed directly to ``visualize/step2_visualize_data_env2d.py --create-dataset``.
 
-Output: data/pkls/lafan1_g1_motion30_jump.pkl
+Output: data/pkls/lafan1_g1_motion30_jump_door.pkl
 """
 import os
 import pickle
 from data.make_pose_data_g1 import load_g1_csv, JOINT_NAMES
 
 
-WALK_CSV = "data/Lafan1_g1/raw/walk1_subject5.csv"            # motion30 in sorted listing
-JUMP_CSVS = [
-    "data/Lafan1_g1/raw_jump/walk_jump_walk.csv",
-    "data/Lafan1_g1/raw_jump/walk_jump_walk2.csv",
-    "data/Lafan1_g1/raw_jump/walk_jump_stop.csv",
+# (csv_path, style) groups assembled into the output pkl, in order.
+STYLE_GROUPS = [
+    ("walk", ["data/Lafan1_g1/raw/walk1_subject5.csv"]),     # motion30 in sorted listing
+    ("jump", [
+        "data/Lafan1_g1/raw_jump/walk_jump_walk.csv",
+        "data/Lafan1_g1/raw_jump/walk_jump_walk2.csv",
+        "data/Lafan1_g1/raw_jump/walk_jump_stop.csv",
+    ]),
+    ("door", ["data/Lafan1_g1/raw_jump/open_door_push_walk.csv"]),
 ]
-OUTPUT_PKL = "data/pkls/lafan1_g1_motion30_jump.pkl"
+OUTPUT_PKL = "data/pkls/lafan1_g1_motion30_jump_door.pkl"
 
 
 def build_motion(csv_path: str, style: str) -> dict:
@@ -38,11 +43,10 @@ def build_motion(csv_path: str, style: str) -> dict:
 
 def main():
     motions = []
-    print(f"[walk] {WALK_CSV}")
-    motions.append(build_motion(WALK_CSV, "walk"))
-    for csv in JUMP_CSVS:
-        print(f"[jump] {csv}")
-        motions.append(build_motion(csv, "jump"))
+    for style, csvs in STYLE_GROUPS:
+        for csv in csvs:
+            print(f"[{style}] {csv}")
+            motions.append(build_motion(csv, style))
 
     data = {"parents": None, "offsets": None, "names": None, "motions": motions}
     os.makedirs(os.path.dirname(OUTPUT_PKL) or ".", exist_ok=True)
