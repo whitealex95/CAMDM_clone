@@ -50,6 +50,7 @@ class MotionDiffusionDipTraj(nn.Module):
                  sensor_cond_mask_prob: float = 0.0,
                  traj_cond_mask_prob: float = 0.0,
                  mask_frames: bool = False,
+                 memory_pe: bool = False,
                  device=None,
                  # accept and ignore for cross-variant CLI symmetry
                  arch: str = 'trans_dec'):
@@ -79,6 +80,7 @@ class MotionDiffusionDipTraj(nn.Module):
         self.past_frame = past_frame
         self.future_frame = future_frame
         self.mask_frames = mask_frames
+        self.memory_pe = bool(memory_pe)
 
         # Motion projector (shared past + noisy future, prefix-completion)
         self.motion_process = MotionProcess(self.input_feats, self.latent_dim)
@@ -139,6 +141,15 @@ class MotionDiffusionDipTraj(nn.Module):
             )
         traj_trans_emb = self.traj_trans_process(traj_trans)    # (TF, bs, L)
         traj_pose_emb  = self.traj_pose_process(traj_pose)      # (TF, bs, L)
+
+        # Per-frame PE on memory: add the SAME PE block that motion frames
+        # TP..TP+TF-1 receive in tgt, so cross-attention from motion frame k
+        # to traj_*_k has positional alignment. Globals (time, style, sensor)
+        # stay PE-free since they're already content-distinct.
+        if self.memory_pe:
+            pe_frames = self.sequence_pos_encoder.pe[TP : TP + TF]   # (TF, 1, L)
+            traj_trans_emb = traj_trans_emb + pe_frames
+            traj_pose_emb  = traj_pose_emb  + pe_frames
 
         memory = torch.cat([
             time_emb, style_emb, sensor_emb,
